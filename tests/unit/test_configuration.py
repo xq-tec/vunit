@@ -48,9 +48,9 @@ class TestConfiguration(unittest.TestCase):
     def test_sim_option_is_not_mutated(self):
         with _create_config() as config:
             options = ["--foo"]
-            config.set_sim_option("ghdl.sim_flags", options)
+            config.set_sim_option("risim-ghdl.sim_flags", options)
             options[0] = "--bar"
-            self.assertEqual(config.sim_options["ghdl.sim_flags"], ["--foo"])
+            self.assertEqual(config.sim_options["risim-ghdl.sim_flags"], ["--foo"])
 
     def test_does_not_add_tb_path_generic(self):
         with _create_config() as config:

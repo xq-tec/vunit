@@ -26,9 +26,7 @@ SRC_PATH = Path(__file__).parent / "src"
 
 VU.add_library("lib").add_source_files([SRC_PATH / "*.vhd", SRC_PATH / "test" / "*.vhd"])
 
-VU.set_compile_option("ghdl.a_flags", ["-frelaxed"])
-VU.set_sim_option("ghdl.elab_flags", ["-frelaxed"])
-
-VU.set_compile_option("nvc.a_flags", ["--relaxed"])
+VU.set_compile_option("risim-ghdl.a_flags", ["-frelaxed"])
+VU.set_sim_option("risim-ghdl.elab_flags", ["-frelaxed"])
 
 VU.main()

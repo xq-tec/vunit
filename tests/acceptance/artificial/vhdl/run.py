@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from glob import glob
 from vunit import VUnit, VUnitCLI
+from vunit.sim_if.common import simulator_is
 from time import sleep
 
 root = Path(__file__).parent
@@ -90,7 +91,7 @@ def configure_tb_set_generic(ui):
     libs = ui.get_libraries("lib2")
     lib2 = ui.library("lib2")
     tb = lib2.entity("tb_set_generic")
-    is_ghdl = ui._simulator_class.name == "ghdl"
+    is_ghdl = simulator_is("ghdl", "risim-ghdl")
     tb.set_generic("is_ghdl", is_ghdl)
     lib2.set_generic("true_boolean", True)
     libs.set_generic("false_boolean", False)

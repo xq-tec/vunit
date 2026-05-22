@@ -205,7 +205,7 @@ class TestExternalRunScripts(TestCase):
         self.check(ROOT / "examples/vhdl/array/run.py")
 
     @mark.xfail(
-        not simulator_is("ghdl"),
+        not simulator_is("ghdl", "risim-ghdl"),
         reason="Only simulators with PSL functionality",
     )
     def test_vhdl_array_axis_vcs_example_project(self):

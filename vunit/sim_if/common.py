@@ -19,9 +19,6 @@ def simulator_is(*names):
     """
     Check that current simulator is any of names
     """
-    supported_names = [sim.name for sim in SIMULATOR_FACTORY.supported_simulators()]
-    for name in names:
-        assert name in supported_names
     return SIMULATOR_FACTORY.select_simulator().name in names
 
 

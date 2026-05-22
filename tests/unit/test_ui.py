@@ -926,17 +926,17 @@ Listed 2 files""".splitlines()
 
         # Use methods on all types of interface objects
         for obj in [source_file, ui, lib, lib.get_source_files(file_name), ui.get_libraries("lib")]:
-            obj.set_compile_option("ghdl.a_flags", [])
-            self.assertEqual(source_file.get_compile_option("ghdl.a_flags"), [])
+            obj.set_compile_option("risim-ghdl.a_flags", [])
+            self.assertEqual(source_file.get_compile_option("risim-ghdl.a_flags"), [])
 
-            obj.add_compile_option("ghdl.a_flags", ["1"])
-            self.assertEqual(source_file.get_compile_option("ghdl.a_flags"), ["1"])
+            obj.add_compile_option("risim-ghdl.a_flags", ["1"])
+            self.assertEqual(source_file.get_compile_option("risim-ghdl.a_flags"), ["1"])
 
-            obj.add_compile_option("ghdl.a_flags", ["2"])
-            self.assertEqual(source_file.get_compile_option("ghdl.a_flags"), ["1", "2"])
+            obj.add_compile_option("risim-ghdl.a_flags", ["2"])
+            self.assertEqual(source_file.get_compile_option("risim-ghdl.a_flags"), ["1", "2"])
 
-            obj.set_compile_option("ghdl.a_flags", ["3"])
-            self.assertEqual(source_file.get_compile_option("ghdl.a_flags"), ["3"])
+            obj.set_compile_option("risim-ghdl.a_flags", ["3"])
+            self.assertEqual(source_file.get_compile_option("risim-ghdl.a_flags"), ["3"])
 
     def test_default_vhdl_standard_is_used(self):
         file_name = "foo.vhd"
@@ -1214,8 +1214,8 @@ endmodule
             ui.set_compile_option,
             ui.add_compile_option,
         ):
-            method("ghdl.elab_flags", [], allow_empty=True)
-            self.assertRaises(ValueError, method, "ghdl.elab_flags", [])
+            method("risim-ghdl.elab_flags", [], allow_empty=True)
+            self.assertRaises(ValueError, method, "risim-ghdl.elab_flags", [])
 
     def test_get_testbench_files(self):
         ui = self._create_ui()
