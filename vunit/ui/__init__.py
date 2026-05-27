@@ -157,11 +157,13 @@ class VUnit(object):  # pylint: disable=too-many-instance-attributes, too-many-p
         if self._simulator_class is None:
             simulator_class = SimulatorInterface
             self._simulator_output_path = str(Path(self._output_path) / "none")
+            self._create_output_path(args.clean)
+            self._simulator_if = None
         else:
             simulator_class = self._simulator_class
             self._simulator_output_path = str(Path(self._output_path) / simulator_class.name)
-
-        self._create_output_path(args.clean)
+            self._create_output_path(args.clean)
+            self._simulator_if = self._create_simulator_if()
 
         self._database_version = (11, sys.version)
         self._pickled_database_version = (self._database_version[0], pickle.HIGHEST_PROTOCOL)
@@ -748,12 +750,17 @@ other preprocessors. Lowest value first. The order between preprocessors with th
 
         sys.exit(0)
 
-    def _create_tests(self, simulator_if: Union[None, SimulatorInterface]):
+    def prepare_test_list(self) -> TestList:
+        if self._include_in_test_pattern or self._exclude_from_test_pattern:
+            self._update_test_filter(self._include_in_test_pattern, self._exclude_from_test_pattern)
+        return self._create_tests()
+
+    def _create_tests(self) -> TestList:
         """
         Create the test cases
         """
         self._test_bench_list.warn_when_empty()
-        test_list = self._test_bench_list.create_tests(simulator_if, self._args.seed, self._args.elaborate)
+        test_list = self._test_bench_list.create_tests(self._simulator_if, self._args.seed, self._args.elaborate)
         test_list.keep_matches(self._test_filter)
         return test_list
 
@@ -847,7 +854,7 @@ other preprocessors. Lowest value first. The order between preprocessors with th
 
         return self._simulator_class.from_args(args=self._args, output_path=self._simulator_output_path)
 
-    def _get_test_history(self, simulator_if):
+    def _get_test_history(self):
         """
         Return test history from database after removing history for removed tests.
         """
@@ -858,7 +865,7 @@ other preprocessors. Lowest value first. The order between preprocessors with th
         test_history = self._database[key]
 
         # Prune removed tests from history
-        full_test_list = self._test_bench_list.create_tests(simulator_if, self._args.seed, self._args.elaborate)
+        full_test_list = self._test_bench_list.create_tests(self._simulator_if, self._args.seed, self._args.elaborate)
         full_test_list = {test_suite.name: test_suite for test_suite in full_test_list}
 
         pruned_test_history = {
@@ -974,7 +981,7 @@ other preprocessors. Lowest value first. The order between preprocessors with th
 
             self._database[key] = pickled_database[key]
 
-    def _update_test_history(self, report, simulator_if):
+    def _update_test_history(self, report):
         """
         Update the database test history with the results from the completed test run.
         """
@@ -993,7 +1000,7 @@ other preprocessors. Lowest value first. The order between preprocessors with th
             test_suite_data[test_result.test_suite_name][test_result.name]["start_time"] = test_result.start_time
             test_suite_data[test_result.test_suite_name][test_result.name]["seed"] = test_result.seed
 
-        test_history = self._get_test_history(simulator_if)
+        test_history = self._get_test_history()
 
         for test_suite_name, data in test_suite_data.items():
             if test_suite_name not in test_history:
@@ -1011,7 +1018,7 @@ other preprocessors. Lowest value first. The order between preprocessors with th
             self._latest_dependency_updates = self._get_latest_dependency_updates()
 
         if self._test_history is None:
-            self._test_history = self._get_test_history(simulator_if=None)
+            self._test_history = self._get_test_history()
 
         def depending_on_change(test_suite):
             latest_dependency_update = self._latest_dependency_updates[test_suite.file_name]
@@ -1036,19 +1043,18 @@ other preprocessors. Lowest value first. The order between preprocessors with th
         """
         Main with running tests
         """
-        simulator_if = self._create_simulator_if()
-        test_list = self._create_tests(simulator_if)
+        test_list = self._create_tests()
         if self._args.changed:
             test_list = self._get_test_list_depending_on_change(test_list)
 
-        self._compile(simulator_if)
+        self._compile()
         print()
 
         start_time = ostools.get_time()
         report = TestReport(printer=self._printer)
 
         try:
-            self._run_test(test_list, report, simulator_if)
+            self._run_test(test_list, report)
         except KeyboardInterrupt:
             print()
             LOGGER.debug("_main: Caught Ctrl-C shutting down")
@@ -1056,13 +1062,11 @@ other preprocessors. Lowest value first. The order between preprocessors with th
             del test_list
 
         report.set_real_total_time(ostools.get_time() - start_time)
-        self._update_test_history(report, simulator_if)
+        self._update_test_history(report)
         report.print_str()
 
         if post_run is not None:
-            post_run(results=Results(self._output_path, simulator_if, report))
-
-        del simulator_if
+            post_run(results=Results(self._output_path, self._simulator_if, report))
 
         if self._args.xunit_xml is not None:
             xml = report.to_junit_xml_str(self._args.xunit_xml_format)
@@ -1074,7 +1078,7 @@ other preprocessors. Lowest value first. The order between preprocessors with th
         """
         Main function when only listing test cases
         """
-        test_list = self._create_tests(simulator_if=None)
+        test_list = self._create_tests()
         if self._args.changed:
             test_list = self._get_test_list_depending_on_change(test_list)
 
@@ -1099,7 +1103,7 @@ other preprocessors. Lowest value first. The order between preprocessors with th
             )
 
         tests = []
-        for test_suite in self._create_tests(simulator_if=None):
+        for test_suite in self._create_tests():
             test_information = test_suite.test_information
             test_configuration = test_suite.test_configuration
             for name in test_suite.test_names:
@@ -1152,8 +1156,7 @@ other preprocessors. Lowest value first. The order between preprocessors with th
         """
         Main function when only compiling
         """
-        simulator_if = self._create_simulator_if()
-        self._compile(simulator_if)
+        self._compile()
         return True
 
     def _create_output_path(self, clean: bool):
@@ -1179,35 +1182,35 @@ other preprocessors. Lowest value first. The order between preprocessors with th
     def codecs_path(self):
         return str(Path(self._output_path) / "codecs")
 
-    def _compile(self, simulator_if: SimulatorInterface):
+    def _compile(self):
         """
         Compile entire project
         """
         # get test benches
         if self._args.minimal:
-            target_files = self._get_testbench_files(simulator_if)
+            target_files = self._get_testbench_files()
         else:
             target_files = None
 
-        simulator_if.compile_project(
+        self._simulator_if.compile_project(
             self._project,
             continue_on_error=self._args.keep_compiling,
             printer=self._printer,
             target_files=target_files,
         )
 
-    def _get_testbench_files(self, simulator_if: Union[None, SimulatorInterface]):
+    def _get_testbench_files(self):
         """
         Return the list of all test bench files for the currently selected tests to run
         """
-        test_list = self._create_tests(simulator_if)
+        test_list = self._create_tests()
         tb_file_names = {test_suite.file_name for test_suite in test_list}
         return [
             self.get_source_file(file_name)._source_file  # pylint: disable=protected-access
             for file_name in tb_file_names
         ]
 
-    def _run_test(self, test_cases, report, simulator_if):
+    def _run_test(self, test_cases, report):
         """
         Run the test suites and return the report
         """
@@ -1227,7 +1230,7 @@ other preprocessors. Lowest value first. The order between preprocessors with th
             test_history = {}
         else:
             latest_dependency_updates = self._get_latest_dependency_updates()
-            test_history = self._get_test_history(simulator_if)
+            test_history = self._get_test_history()
 
         runner = TestRunner(
             report,
