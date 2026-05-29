@@ -751,9 +751,34 @@ other preprocessors. Lowest value first. The order between preprocessors with th
         sys.exit(0)
 
     def prepare_test_list(self) -> TestList:
-        if self._include_in_test_pattern or self._exclude_from_test_pattern:
-            self._update_test_filter(self._include_in_test_pattern, self._exclude_from_test_pattern)
         return self._create_tests()
+
+    def prepare_compile_commands(self, collect_commands) -> None:
+        """
+        Collect simulator compile commands into collect_commands instead of running them.
+        """
+
+        target_files = self._get_testbench_files() if self._args.minimal else None
+        self._simulator_if.compile_project(
+            self._project,
+            printer=self._printer,
+            target_files=target_files,
+            collect_commands=collect_commands,
+        )
+
+    def mark_source_file_compiled(self, source_file_name: str) -> None:
+        """
+        Mark that a source file has been successfully compiled externally.
+        """
+        source_file = self.get_source_file(source_file_name)._source_file  # pylint: disable=protected-access
+        self._project.update(source_file)
+
+    def run_tests(self):
+        test_list = self._create_tests()
+        self._compile()
+        report = TestReport(printer=self._printer)
+        self._run_test(test_list, report)
+        self._update_test_history(report)
 
     def _create_tests(self) -> TestList:
         """

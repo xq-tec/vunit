@@ -211,14 +211,22 @@ class SimulatorInterface(object):  # pylint: disable=too-many-public-methods
         printer=NO_COLOR_PRINTER,
         continue_on_error=False,
         target_files=None,
+        collect_commands=None,
     ):
         """
         Compile the project
         param: target_files: Given a list of SourceFiles only these and dependent files are compiled
+        param: collect_commands: When given, append compile commands instead of running them
         """
         self.add_simulator_specific(project)
         self.setup_library_mapping(project)
-        self.compile_source_files(project, printer, continue_on_error, target_files=target_files)
+        self.compile_source_files(
+            project,
+            printer,
+            continue_on_error,
+            target_files=target_files,
+            collect_commands=collect_commands,
+        )
 
     def simulate(self, output_path, test_suite_name, config, elaborate_only):
         """
@@ -267,10 +275,12 @@ class SimulatorInterface(object):  # pylint: disable=too-many-public-methods
         printer=NO_COLOR_PRINTER,
         continue_on_error=False,
         target_files=None,
+        collect_commands=None,
     ):
         """
         Use compile_source_file_command to compile all source_files
         param: target_files: Given a list of SourceFiles only these and dependent files are compiled
+        param: collect_commands: When given, append compile commands instead of running them
         """
         dependency_graph = project.create_dependency_graph()
         failures = []
@@ -279,6 +289,16 @@ class SimulatorInterface(object):  # pylint: disable=too-many-public-methods
             source_files = project.get_files_in_compile_order(dependency_graph=dependency_graph)
         else:
             source_files = project.get_minimal_file_set_in_compile_order(target_files)
+
+        if collect_commands is not None:
+            for source_file in source_files:
+                command = self.compile_source_file_command(source_file)
+                collect_commands.append(
+                    source_file.name,
+                    source_file.library.name,
+                    command,
+                )
+            return
 
         source_files_to_skip = set()
 

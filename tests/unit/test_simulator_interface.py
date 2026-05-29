@@ -190,6 +190,32 @@ Compile failed
             self.assertRaises(CompileError, simif.compile_source_files, project)
         self.assertEqual(project.get_files_in_compile_order(incremental=True), [source_file])
 
+    def test_compile_source_files_collect_commands(self):
+        simif = create_simulator_interface()
+        simif.compile_source_file_command.side_effect = iter([["command1"], ["command2"]])
+        project = Project()
+        project.add_library("lib", "lib_path")
+        write_file("file1.vhd", "")
+        file1 = project.add_source_file("file1.vhd", "lib", file_type="vhdl")
+        write_file("file2.vhd", "")
+        file2 = project.add_source_file("file2.vhd", "lib", file_type="vhdl")
+        project.add_manual_dependency(file2, depends_on=file1)
+
+        collect_commands = MockCollectCommands()
+
+        with mock.patch("vunit.sim_if.check_output", autospec=True) as check_output:
+            simif.compile_source_files(project, collect_commands=collect_commands)
+            check_output.assert_not_called()
+
+        self.assertEqual(
+            collect_commands.entries,
+            [
+                ("file1.vhd", "lib", ["command1"]),
+                ("file2.vhd", "lib", ["command2"]),
+            ],
+        )
+        self.assertEqual(project.get_files_in_compile_order(incremental=True), [file1, file2])
+
     @mock.patch("os.environ", autospec=True)
     def test_find_prefix(self, environ):
         class MySimulatorInterface(SimulatorInterface):  # pylint: disable=abstract-method
@@ -299,6 +325,18 @@ def create_simulator_interface():
     simif = SimulatorInterface(output_path="output_path", gui=False)
     simif.compile_source_file_command = mock.create_autospec(simif.compile_source_file_command)
     return simif
+
+
+class MockCollectCommands(object):
+    """
+    Collect compile commands like the PyO3 CompileCommands type
+    """
+
+    def __init__(self):
+        self.entries = []
+
+    def append(self, source_file, library, command):
+        self.entries.append((source_file, library, command))
 
 
 class MockPrinter(object):
