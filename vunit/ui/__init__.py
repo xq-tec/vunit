@@ -16,19 +16,19 @@ import traceback
 import logging
 import json
 import os
-import ast
 import pickle
+import string
 from typing import Optional, Set, Union, Iterable
 from pathlib import Path
 from fnmatch import fnmatch
-from glob import glob
 
 from ..database import PickledDataBase, DataBase
 from .. import ostools
+from ..hashing import hash_string
 from ..vunit_cli import VUnitCLI
 from ..sim_if.factory import SIMULATOR_FACTORY
 from ..sim_if import SimulatorInterface
-from ..color_printer import COLOR_PRINTER, NO_COLOR_PRINTER
+from ..color_printer import COLOR_PRINTER, NO_COLOR_PRINTER, NULL_PRINTER
 
 from ..project import Project
 from ..exceptions import CompileError
@@ -41,7 +41,8 @@ from ..test.bench_list import TestBenchList
 from ..test.report import TestReport
 from ..test.runner import TestRunner
 from ..test.list import TestList
-from ..dependency_graph import CircularDependencyException
+from ..test.suites import SameSimTestSuite, _full_name
+from ..test.report import FAILED, PASSED
 
 from .common import LOGGER, TEST_OUTPUT_PATH, select_vhdl_standard, check_not_empty
 from .source import SourceFile, SourceFileList
@@ -183,6 +184,7 @@ class VUnit(object):  # pylint: disable=too-many-instance-attributes, too-many-p
         self._exclude_from_test_pattern: Optional[Iterable[Union[str, Path]]] = None
         self._latest_dependency_updates = None
         self._test_history = None
+        self._external_run_state = None
 
     def _create_database(self):
         """
@@ -772,6 +774,224 @@ other preprocessors. Lowest value first. The order between preprocessors with th
         """
         source_file = self.get_source_file(source_file_name)._source_file  # pylint: disable=protected-access
         self._project.update(source_file)
+
+    # AI NOTICE: Generated, minimally reviewed.
+    def prepare_run_commands(self, test_patterns, collect_commands) -> None:
+        """
+        Collect simulator run commands into collect_commands instead of running them.
+        """
+        if not test_patterns:
+            test_patterns = ["*"]
+        self._test_filter = self._make_test_filter(self._args, test_patterns)
+
+        test_list = self._create_tests()
+        self._create_external_run_mapping_file(test_list)
+
+        num_tests = sum(len(test_suite.test_names) for test_suite in test_list)
+        start_time = ostools.get_time()
+        report = TestReport(printer=NULL_PRINTER)
+        report.set_expected_num_tests(num_tests)
+
+        run_output_path = str(Path(self._output_path) / TEST_OUTPUT_PATH)
+        run_suites = []
+        run_suites_by_name = {}
+
+        for test_suite in test_list:
+            suite_start_time = ostools.get_time()
+            output_path = self._get_external_run_output_path(run_output_path, test_suite.name)
+            output_file_name = str(Path(output_path) / "output.txt")
+            TestRunner._prepare_test_suite_output_path(output_path)  # pylint: disable=protected-access
+
+            command = self._get_test_run(test_suite).prepare(output_path, print_seed=False)
+            finished = command is None
+
+            entry = {
+                "test_suite": test_suite,
+                "output_path": output_path,
+                "output_file_name": output_file_name,
+                "start_time": suite_start_time,
+                "finished": finished,
+            }
+            run_suites.append(entry)
+            run_suites_by_name[test_suite.name] = entry
+
+            if finished:
+                self._add_failed_run_entry_results(report, entry)
+            else:
+                collect_commands.append(test_suite.name, output_path, output_file_name, command)
+
+        self._external_run_state = {
+            "run_suites": run_suites,
+            "run_suites_by_name": run_suites_by_name,
+            "report": report,
+            "start_time": start_time,
+            "num_tests": num_tests,
+        }
+
+    # AI NOTICE: Generated, minimally reviewed.
+    def finish_run_command(self, test_suite_name, sim_ok) -> bool:
+        """
+        Finish one externally executed test suite simulation.
+        """
+        state = self._external_run_state
+        if state is None:
+            raise RuntimeError("No external run state; call prepare_run_commands first")
+
+        entry = state["run_suites_by_name"].get(test_suite_name)
+        if entry is None:
+            raise ValueError(f"unknown test suite: {test_suite_name}")
+        if entry["finished"]:
+            raise RuntimeError(f"test suite already finished: {test_suite_name}")
+
+        suite_passed = self._finish_run_entry(state["report"], entry, sim_ok)
+        entry["finished"] = True
+        return suite_passed
+
+    # AI NOTICE: Generated, minimally reviewed.
+    def finalize_run_commands(self) -> bool:
+        """
+        Complete an external run after all test suite simulations have finished.
+        """
+        state = self._external_run_state
+        if state is None:
+            raise RuntimeError("No external run state; call prepare_run_commands first")
+
+        report = state["report"]
+        for entry in state["run_suites"]:
+            if not entry["finished"]:
+                self._add_failed_run_entry_results(report, entry)
+                entry["finished"] = True
+
+        report.set_real_total_time(ostools.get_time() - state["start_time"])
+        self._update_test_history(report)
+        self._external_run_state = None
+        return report.all_ok()
+
+    # AI NOTICE: Generated, minimally reviewed.
+    def abort_run_commands(self) -> None:
+        """
+        Discard external run state without updating test history.
+        """
+        self._external_run_state = None
+
+    # AI NOTICE: Generated, minimally reviewed.
+    def _finish_run_entry(self, report, entry, sim_ok):
+        test_suite = entry["test_suite"]
+        output_path = entry["output_path"]
+        output_file_name = entry["output_file_name"]
+        start_time = entry["start_time"]
+
+        def read_output(output_file_name=output_file_name):
+            output_file = Path(output_file_name)
+            if not output_file.exists():
+                return ""
+            return output_file.read_text(encoding="utf-8")
+
+        raw_results = self._get_test_run(test_suite).finish(output_path, sim_ok, read_output)
+        results = self._external_run_named_results(test_suite, raw_results)
+
+        runtime = ostools.get_time() - start_time
+        time_per_test = runtime / len(results) if results else runtime
+        seed = test_suite.get_seed()
+
+        for test_name, status in results.items():
+            report.add_result(
+                test_name,
+                status,
+                time_per_test,
+                output_file_name,
+                test_suite_name=test_suite.name,
+                start_time=start_time,
+                seed=seed,
+            )
+
+        return all(status == PASSED for status in results.values())
+
+    # AI NOTICE: Generated, minimally reviewed.
+    def _add_failed_run_entry_results(self, report, entry):
+        test_suite = entry["test_suite"]
+        output_file_name = entry["output_file_name"]
+        start_time = entry["start_time"]
+        raw_results = {
+            test_name: FAILED for test_name in self._get_test_run(test_suite)._test_cases
+        }
+        results = self._external_run_named_results(test_suite, raw_results)
+
+        runtime = ostools.get_time() - start_time
+        time_per_test = runtime / len(results) if results else runtime
+        seed = test_suite.get_seed()
+
+        for test_name, status in results.items():
+            report.add_result(
+                test_name,
+                status,
+                time_per_test,
+                output_file_name,
+                test_suite_name=test_suite.name,
+                start_time=start_time,
+                seed=seed,
+            )
+
+    # AI NOTICE: Generated, minimally reviewed.
+    @staticmethod
+    def _get_test_run(test_suite):
+        if hasattr(test_suite, "_run"):
+            return test_suite._run  # pylint: disable=protected-access
+        return test_suite._test_case._run  # pylint: disable=protected-access
+
+    # AI NOTICE: Generated, minimally reviewed.
+    @staticmethod
+    def _external_run_named_results(test_suite, raw_results):
+        if isinstance(test_suite, SameSimTestSuite):
+            return {
+                _full_name(test_suite.name, test_name): status for test_name, status in raw_results.items()
+            }
+        return {test_suite.name: next(iter(raw_results.values()))}
+
+    # AI NOTICE: Generated, minimally reviewed.
+    def _create_external_run_mapping_file(self, test_suites):
+        mapping_file_name = Path(self._output_path) / "test_name_to_path_mapping.txt"
+        run_output_path = str(Path(self._output_path) / TEST_OUTPUT_PATH)
+
+        if mapping_file_name.exists():
+            with mapping_file_name.open("r", encoding="utf-8") as fptr:
+                mapping = set(fptr.read().splitlines())
+        else:
+            mapping = set()
+
+        for test_suite in test_suites:
+            test_output = self._get_external_run_output_path(run_output_path, test_suite.name)
+            mapping.add(f"{Path(test_output).name!s} {test_suite.name!s}")
+
+        mapping = sorted(mapping, key=lambda value: value[value.index(" ") :])
+
+        with mapping_file_name.open("w", encoding="utf-8") as fptr:
+            for value in mapping:
+                fptr.write(value + "\n")
+
+    # AI NOTICE: Generated, minimally reviewed.
+    @staticmethod
+    def _get_external_run_output_path(base_output_path, test_suite_name):
+        output_path = str(Path(base_output_path).resolve())
+        legal = set(string.ascii_letters + string.digits + "._")
+
+        def is_legal(char):
+            return char in legal
+
+        safe_name = "".join(char if is_legal(char) else "_" for char in test_suite_name) + "_"
+        hash_name = hash_string(test_suite_name)
+
+        if "VUNIT_SHORT_TEST_OUTPUT_PATHS" in os.environ:
+            full_name = hash_name
+        elif sys.platform == "win32":
+            max_path = 260
+            margin = int(os.environ.get("VUNIT_TEST_OUTPUT_PATH_MARGIN", "100"))
+            prefix_len = len(output_path)
+            full_name = safe_name[: min(max_path - margin - prefix_len - len(hash_name), len(safe_name))] + hash_name
+        else:
+            full_name = safe_name + hash_name
+
+        return str(Path(output_path) / full_name)
 
     def run_tests(self):
         test_list = self._create_tests()

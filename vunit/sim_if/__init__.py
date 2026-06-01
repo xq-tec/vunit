@@ -233,6 +233,12 @@ class SimulatorInterface(object):  # pylint: disable=too-many-public-methods
         Simulate
         """
 
+    def simulate_command(self, output_path, test_suite_name, config):  # pylint: disable=unused-argument
+        """
+        Return the command to simulate externally.
+        """
+        raise NotImplementedError
+
     def setup_library_mapping(self, project):
         """
         Implemented by specific simulators

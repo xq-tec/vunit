@@ -36,6 +36,15 @@ class ColorPrinter(object):
         """
 
 
+class NullPrinter(ColorPrinter):
+    """
+    Printer that discards all output.
+    """
+
+    def write(self, text, output_file=None, fg=None, bg=None):  # pylint: disable=unused-argument
+        del text, output_file, fg, bg
+
+
 class NoColorPrinter(ColorPrinter):
     """
     Dummy printer that does not print in color
@@ -218,6 +227,7 @@ class Win32ColorPrinter(ColorPrinter):
 
 
 NO_COLOR_PRINTER: ColorPrinter = NoColorPrinter()
+NULL_PRINTER: ColorPrinter = NullPrinter()
 
 # On MSYS/MINGW shells (https://www.msys2.org/) with Python installed through pacman, IS_WINDOWS_SYSTEM is true.
 # However, regular Linux color strings are supported/required, instead of 'native' windows color format.

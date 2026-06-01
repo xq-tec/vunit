@@ -3,6 +3,10 @@
 # You can obtain one at http://mozilla.org/MPL/2.0/.
 #
 # Copyright (c) 2014-2026, Lars Asplund lars.anders.asplund@gmail.com
+# Copyright (c) 2026, xq-Tec <info@xq-tec.com>
+#
+# AI NOTICE: Generated, minimally reviewed.
+
 
 """
 Test the risim-ghdl interface
@@ -102,6 +106,42 @@ class TestRisimGHDLInterface(unittest.TestCase):
                 "-Plib_path",
                 "tb_entity",
                 "arch",
+            ],
+        )
+
+    @mock.patch.object(RisimGHDLInterface, "determine_version", return_value=5.0)
+    def test_simulate_command(self, determine_version):
+        design_unit = Entity("tb_entity", file_name=str(Path("tempdir") / "file.vhd"))
+        design_unit.generic_names = ["runner_cfg"]
+
+        config = Configuration("name", design_unit, sim_options={"risim-ghdl.elab_flags": ["--flag"]})
+        config.generics["runner_cfg"] = "seed"
+
+        simif = RisimGHDLInterface(prefix="prefix", output_path="")
+        simif._vhdl_standard = VHDL.standard("2008")  # pylint: disable=protected-access
+        simif._project = Project()  # pylint: disable=protected-access
+        simif._project.add_library("lib", "lib_path")  # pylint: disable=protected-access
+
+        command = simif.simulate_command(
+            output_path=str(Path("output_path") / "suite"),
+            test_suite_name="lib.tb_entity",
+            config=config,
+        )
+
+        self.assertEqual(
+            command,
+            [
+                str(Path("prefix") / "risim-ghdl"),
+                "--elab-run",
+                "--std=08",
+                "--work=lib",
+                "--workdir=lib_path",
+                "-Plib_path",
+                "--flag",
+                "tb_entity",
+                "arch",
+                "-grunner_cfg=seed",
+                "--assert-level=error",
             ],
         )
 

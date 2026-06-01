@@ -184,6 +184,7 @@ class TestRun(object):
         self._test_suite_name = test_suite_name
         self._test_cases = test_cases
         self._seed = seed
+        self._pre_config_failed = False
 
     def get_seed(self):
         """Return externally assigned seed or generate one from system time and thread identifier."""
@@ -207,22 +208,38 @@ class TestRun(object):
 
         Returns a dictionary of test results
         """
-        results = {}
-        for name in self._test_cases:
-            results[name] = FAILED
-
-        seed = self.get_seed()
-        if not self._config.call_pre_config(output_path, self._simulator_if.output_path, seed):
-            return results
-
-        # Ensure result file exists
-        ostools.write_file(get_result_file_name(output_path), "")
+        if not self._prepare_output_path(output_path):
+            return {name: FAILED for name in self._test_cases}
 
         sim_ok = self._simulate(output_path)
-
         if self._elaborate_only:
             status = PASSED if sim_ok else FAILED
             return dict((name, status) for name in self._test_cases)
+
+        return self.finish(output_path, sim_ok, read_output)
+
+    def prepare(self, output_path, *, print_seed=True):
+        """
+        Prepare a simulation run and return the simulator command.
+
+        Returns None when pre-configuration fails.
+        """
+        if not self._prepare_output_path(output_path):
+            return None
+
+        config = self._simulation_config(output_path, print_seed=print_seed)
+        return self._simulator_if.simulate_command(
+            output_path=output_path,
+            test_suite_name=self._test_suite_name,
+            config=config,
+        )
+
+    def finish(self, output_path, sim_ok, read_output):
+        """
+        Complete a simulation run after an external runner executed the command.
+        """
+        if self._pre_config_failed:
+            return {name: FAILED for name in self._test_cases}
 
         results = self._read_test_results(file_name=get_result_file_name(output_path))
 
@@ -235,6 +252,58 @@ class TestRun(object):
                 results[name] = FAILED
 
         return results
+
+    def _prepare_output_path(self, output_path):
+        """
+        Run pre-configuration checks and create the result file.
+        """
+        self._pre_config_failed = False
+        seed = self.get_seed()
+        if not self._config.call_pre_config(output_path, self._simulator_if.output_path, seed):
+            self._pre_config_failed = True
+            return False
+
+        ostools.write_file(get_result_file_name(output_path), "")
+        return True
+
+    def _simulate(self, output_path):
+        """
+        Add runner_cfg generic values and run simulation in-process.
+        """
+        config = self._simulation_config(output_path)
+        return self._simulator_if.simulate(
+            output_path=output_path,
+            test_suite_name=self._test_suite_name,
+            config=config,
+            elaborate_only=self._elaborate_only,
+        )
+
+    def _simulation_config(self, output_path, *, print_seed=True):
+        """
+        Build the configuration used for simulation, including runner_cfg generics.
+        """
+        config = self._config.copy()
+        seed = self.get_seed()
+
+        if print_seed:
+            print(f"Seed for {self._test_suite_name}: {seed}")
+
+        if "output_path" in config.generic_names and "output_path" not in config.generics:
+            config.generics["output_path"] = str(output_path.replace("\\", "/")) + "/"
+
+        runner_cfg = {
+            "enabled_test_cases": ",".join(
+                encode_test_case(test_case) for test_case in self._test_cases if test_case is not None
+            ),
+            "use_color": self._simulator_if.use_color,
+            "output path": output_path.replace("\\", "/") + "/",
+            "active python runner": True,
+            "tb path": config.tb_path.replace("\\", "/") + "/",
+            "seed": seed,
+        }
+
+        config.generics["runner_cfg"] = encode_dict(runner_cfg)
+        return config
 
     def _check_results(self, results, sim_ok):
         """
@@ -253,40 +322,6 @@ class TestRun(object):
             )
 
         return False, results
-
-    def _simulate(self, output_path):
-        """
-        Add runner_cfg generic values and run simulation
-        """
-
-        config = self._config.copy()
-        seed = self.get_seed()
-
-        print(f"Seed for {self._test_suite_name}: {seed}")
-
-        if "output_path" in config.generic_names and "output_path" not in config.generics:
-            config.generics["output_path"] = str(output_path.replace("\\", "/")) + "/"
-
-        runner_cfg = {
-            "enabled_test_cases": ",".join(
-                encode_test_case(test_case) for test_case in self._test_cases if test_case is not None
-            ),
-            "use_color": self._simulator_if.use_color,
-            "output path": output_path.replace("\\", "/") + "/",
-            "active python runner": True,
-            "tb path": config.tb_path.replace("\\", "/") + "/",
-            "seed": seed,
-        }
-
-        # @TODO Warn if runner cfg already set?
-        config.generics["runner_cfg"] = encode_dict(runner_cfg)
-
-        return self._simulator_if.simulate(
-            output_path=output_path,
-            test_suite_name=self._test_suite_name,
-            config=config,
-            elaborate_only=self._elaborate_only,
-        )
 
     def _read_test_results(self, file_name):  # pylint: disable=too-many-branches
         """
