@@ -210,8 +210,18 @@ Compile failed
         self.assertEqual(
             collect_commands.entries,
             [
-                ("file1.vhd", "lib", ["command1"]),
-                ("file2.vhd", "lib", ["command2"]),
+                (
+                    "file1.vhd",
+                    "lib",
+                    ["command1"],
+                    str(Path(project.hash_file_name_of(file1)).parent / "compile_output.txt"),
+                ),
+                (
+                    "file2.vhd",
+                    "lib",
+                    ["command2"],
+                    str(Path(project.hash_file_name_of(file2)).parent / "compile_output.txt"),
+                ),
             ],
         )
         self.assertEqual(project.get_files_in_compile_order(incremental=True), [file1, file2])
@@ -335,8 +345,8 @@ class MockCollectCommands(object):
     def __init__(self):
         self.entries = []
 
-    def append(self, source_file, library, command):
-        self.entries.append((source_file, library, command))
+    def append(self, source_file, library, command, compile_output_file):
+        self.entries.append((source_file, library, command, compile_output_file))
 
 
 class MockPrinter(object):

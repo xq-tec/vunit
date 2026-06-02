@@ -109,6 +109,13 @@ class TestExternalRun(unittest.TestCase):
         self.assertEqual(results, {"all": FAILED})
 
 
+def run_output_path(entry):
+    """
+    Returns the per-suite output directory for a collected run command entry.
+    """
+    return str(Path(entry["output_file_name"]).parent)
+
+
 class MockRunCommands:
     """
     Collect run commands like the PyO3 RunCommands type
@@ -117,11 +124,10 @@ class MockRunCommands:
     def __init__(self):
         self.entries = []
 
-    def append(self, test_suite_name, output_path, output_file_name, command):
+    def append(self, test_suite_name, output_file_name, command):
         self.entries.append(
             {
                 "test_suite_name": test_suite_name,
-                "output_path": output_path,
                 "output_file_name": output_file_name,
                 "command": command,
             }
@@ -213,7 +219,7 @@ class TestPrepareRunCommands(unittest.TestCase):
         self.assertEqual(entry["command"][0], "mock-sim")
 
         write_file(
-            get_result_file_name(entry["output_path"]),
+            get_result_file_name(run_output_path(entry)),
             "test_start:all\ntest_suite_done\n",
         )
 
@@ -244,7 +250,7 @@ class TestPrepareRunCommands(unittest.TestCase):
 
         for entry in collect_commands.entries:
             write_file(
-                get_result_file_name(entry["output_path"]),
+                get_result_file_name(run_output_path(entry)),
                 "test_start:all\ntest_suite_done\n",
             )
 
@@ -269,11 +275,11 @@ class TestPrepareRunCommands(unittest.TestCase):
         collect_commands, _ = self._prepare(ui, test_list)
 
         write_file(
-            get_result_file_name(collect_commands.entries[0]["output_path"]),
+            get_result_file_name(run_output_path(collect_commands.entries[0])),
             "test_start:all\ntest_suite_done\n",
         )
         write_file(
-            get_result_file_name(collect_commands.entries[1]["output_path"]),
+            get_result_file_name(run_output_path(collect_commands.entries[1])),
             "test_start:all\ntest_suite_done\n",
         )
 
@@ -315,7 +321,7 @@ class TestPrepareRunCommands(unittest.TestCase):
 
         collect_commands, _ = self._prepare(ui, test_list)
         write_file(
-            get_result_file_name(collect_commands.entries[0]["output_path"]),
+            get_result_file_name(run_output_path(collect_commands.entries[0])),
             "test_start:all\ntest_suite_done\n",
         )
 
@@ -354,7 +360,7 @@ class TestPrepareRunCommands(unittest.TestCase):
 
         collect_commands, _ = self._prepare(ui, test_list)
         write_file(
-            get_result_file_name(collect_commands.entries[0]["output_path"]),
+            get_result_file_name(run_output_path(collect_commands.entries[0])),
             "test_start:all\ntest_suite_done\n",
         )
 

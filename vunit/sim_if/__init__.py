@@ -299,10 +299,13 @@ class SimulatorInterface(object):  # pylint: disable=too-many-public-methods
         if collect_commands is not None:
             for source_file in source_files:
                 command = self.compile_source_file_command(source_file)
+                hash_file = Path(project.hash_file_name_of(source_file))
+                compile_output_file = str(hash_file.parent / "compile_output.txt")
                 collect_commands.append(
                     source_file.name,
                     source_file.library.name,
                     command,
+                    compile_output_file,
                 )
             return
 

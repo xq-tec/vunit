@@ -818,7 +818,7 @@ other preprocessors. Lowest value first. The order between preprocessors with th
             if finished:
                 self._add_failed_run_entry_results(report, entry)
             else:
-                collect_commands.append(test_suite.name, output_path, output_file_name, command)
+                collect_commands.append(test_suite.name, output_file_name, command)
 
         self._external_run_state = {
             "run_suites": run_suites,
