@@ -92,11 +92,14 @@ class SimulatorFactory(object):
         self.check_compile_option_name(name)
         self._compile_options[name].validate(value)
 
-    def select_simulator(self):
+    def select_simulator(self, args=None):
         """
         Select simulator class, either from VUNIT_SIMULATOR environment variable
         or the first available
         """
+        if args is not None and getattr(args, "risim_ghdl", None) is not None:
+            return RisimGHDLInterface
+
         available_simulators = self._detect_available_simulators()
         name_mapping = {simulator_class.name: simulator_class for simulator_class in self.supported_simulators()}
         if not available_simulators:

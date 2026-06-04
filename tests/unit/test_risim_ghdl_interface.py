@@ -159,6 +159,24 @@ class TestRisimGHDLInterface(unittest.TestCase):
     def test_find_prefix_from_env(self):
         self.assertEqual(RisimGHDLInterface.find_prefix(), "/custom/risim-ghdl/bin")
 
+    @mock.patch("vunit.sim_if.risim_ghdl.check_executable")
+    @mock.patch.object(RisimGHDLInterface, "determine_version", return_value=5.0)
+    def test_from_args_explicit_path(self, determine_version, check_executable):
+        args = mock.Mock(gui=False, risim_ghdl="/custom/bin/risim-ghdl")
+        simif = RisimGHDLInterface.from_args(args, output_path="out")
+        check_executable.assert_called_once_with("RISIM_GHDL", "/custom/bin", "risim-ghdl")
+        self.assertEqual(simif._prefix, "/custom/bin")  # pylint: disable=protected-access
+        self.assertEqual(simif.executable, "risim-ghdl")
+        determine_version.assert_called_once_with("/custom/bin", "risim-ghdl")
+
+    def test_select_simulator_explicit_path(self):
+        from vunit.sim_if.factory import SimulatorFactory
+
+        args = mock.Mock(risim_ghdl="/custom/bin/risim-ghdl")
+        factory = SimulatorFactory()
+        with mock.patch.object(RisimGHDLInterface, "is_available", return_value=False):
+            self.assertIs(factory.select_simulator(args), RisimGHDLInterface)
+
     @mock.patch.object(
         RisimGHDLInterface,
         "_get_version_output",

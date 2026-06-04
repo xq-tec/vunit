@@ -152,7 +152,7 @@ class VUnit(object):  # pylint: disable=too-many-instance-attributes, too-many-p
 
         self._preprocessors = []  # type: ignore
 
-        self._simulator_class = SIMULATOR_FACTORY.select_simulator()
+        self._simulator_class = SIMULATOR_FACTORY.select_simulator(args)
 
         # Use default simulator options if no simulator was present
         if self._simulator_class is None:

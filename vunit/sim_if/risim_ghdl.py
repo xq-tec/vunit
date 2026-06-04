@@ -43,11 +43,38 @@ class RisimGHDLInterface(SimulatorInterface):  # pylint: disable=too-many-instan
         BooleanOption("risim-ghdl.elab_e"),
     ]
 
+    @staticmethod
+    def add_arguments(parser):
+        """
+        Add command line arguments
+        """
+        parser.add_argument(
+            "--risim-ghdl",
+            metavar="PATH",
+            default=None,
+            help=(
+                "Use risim-ghdl as simulator with the executable at PATH. "
+                "Ignores VUNIT_RISIM_GHDL_PATH and PATH lookup."
+            ),
+        )
+
     @classmethod
     def from_args(cls, args, output_path, **kwargs):
         """
         Create instance from args namespace
         """
+        explicit_path = getattr(args, "risim_ghdl", None)
+        if explicit_path is not None:
+            executable_path = Path(explicit_path).resolve()
+            prefix = str(executable_path.parent)
+            executable = executable_path.name
+            return cls(
+                output_path=output_path,
+                prefix=prefix,
+                gui=args.gui,
+                executable=executable,
+            )
+
         prefix = cls.find_prefix()
         check_executable("RISIM_GHDL", prefix, cls.executable)
 
@@ -74,13 +101,15 @@ class RisimGHDLInterface(SimulatorInterface):  # pylint: disable=too-many-instan
         """
         return cls.find_toolchain([cls.executable])
 
-    def __init__(self, output_path, prefix, *, gui=False):
+    def __init__(self, output_path, prefix, *, gui=False, executable=None):
         SimulatorInterface.__init__(self, output_path, gui)
 
         self._prefix = prefix
+        if executable is not None:
+            self.executable = executable
         self._project = None
         self._vhdl_standard = None
-        self._version = self.determine_version(self.find_prefix())
+        self._version = self.determine_version(self._prefix, self.executable)
 
     def has_valid_exit_code(self):  # pylint: disable=arguments-differ
         """
@@ -89,23 +118,27 @@ class RisimGHDLInterface(SimulatorInterface):  # pylint: disable=too-many-instan
         return self._vhdl_standard >= VHDL.STD_2008
 
     @classmethod
-    def _get_version_output(cls, prefix):
+    def _get_version_output(cls, prefix, executable=None):
         """
         Get the output of 'risim-ghdl --version'
         """
-        return subprocess.check_output([str(Path(prefix) / cls.executable), "--version"]).decode()
+        if executable is None:
+            executable = cls.executable
+        return subprocess.check_output([str(Path(prefix) / executable), "--version"]).decode()
 
     @classmethod
-    def determine_version(cls, prefix):
+    def determine_version(cls, prefix, executable=None):
         """
         Determine the risim-ghdl version
         """
+        if executable is None:
+            executable = cls.executable
         match = re.match(
             r"GHDL ([0-9]+\.[0-9]+).*?\[simulation adapter\]",
-            cls._get_version_output(prefix),
+            cls._get_version_output(prefix, executable),
         )
         if match is None:
-            output = cls._get_version_output(prefix)
+            output = cls._get_version_output(prefix, executable)
             raise ValueError(
                 "Could not determine risim-ghdl version from 'risim-ghdl --version' output:\n" + output
             )
