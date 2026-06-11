@@ -27,6 +27,7 @@ my_logger.csv
 /tests/acceptance/artificial/vhdl/modified_test_history/0
 /tests/acceptance/artificial/vhdl/modified_test_history/1
 /OSVVM_transcript.yml
+/tempdir
 
 # Rust build artifacts
 /target
