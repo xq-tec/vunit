@@ -1,0 +1,10 @@
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+allow-unwrap-in-tests = true
+avoid-breaking-exported-api = false
+check-inconsistent-struct-field-initializers = true
+# check-private-items = true
+doc-valid-idents = ["PyO3", "VUnit", ".."]
+allowed-idents-below-min-chars = ["f", ".."]
+lint-commented-code = true
