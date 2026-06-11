@@ -288,7 +288,7 @@ class RisimGHDLInterface(SimulatorInterface):  # pylint: disable=too-many-instan
 
         return cmd
 
-    def simulate_command(self, output_path, test_suite_name, config):  # pylint: disable=unused-argument
+    def simulate_command(self, output_path, test_suite_name, config, elaborate_only=False):
         """
         Return the command to simulate with entity as top level using generics.
         """
@@ -297,15 +297,15 @@ class RisimGHDLInterface(SimulatorInterface):  # pylint: disable=too-many-instan
         if not Path(script_path).exists():
             makedirs(script_path)
 
-        return self._get_command(config, script_path, elaborate_only=False, elab_e=False)
+        elab_e = elaborate_only and config.sim_options.get("risim-ghdl.elab_e", False)
 
-    def simulate(self, output_path, test_suite_name, config, elaborate_only):  # pylint: disable=too-many-locals,unused-argument
+        return self._get_command(config, script_path, elaborate_only, elab_e)
+
+    def simulate(self, output_path, test_suite_name, config, elaborate_only):  # pylint: disable=too-many-locals
         """
         Simulate with entity as top level using generics
-
-        The `elaborate_only` argument is ignored, because risim-ghdl doesn't support elaborate-only mode.
         """
-        cmd = self.simulate_command(output_path, test_suite_name, config)
+        cmd = self.simulate_command(output_path, test_suite_name, config, elaborate_only)
 
         status = True
 
