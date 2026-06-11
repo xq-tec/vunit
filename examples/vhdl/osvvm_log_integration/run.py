@@ -59,4 +59,5 @@ else:
     osvvm.add_source_files(root / ".." / ".." / ".." / "vunit" / "vhdl" / "osvvm" / "AlertLogPkg.vhd")
 
 
+prj.set_compile_option("rivierapro.vcom_flags", ["-dbg"])
 prj.main()

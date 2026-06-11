@@ -9,7 +9,13 @@ Create simulator instances
 """
 
 import os
+from .activehdl import ActiveHDLInterface
+from .ghdl import GHDLInterface
+from .incisive import IncisiveInterface
+from .modelsim import ModelSimInterface
+from .nvc import NVCInterface
 from .risim_ghdl import RisimGHDLInterface
+from .rivierapro import RivieraProInterface
 from . import BooleanOption, ListOfStringOption, VHDLAssertLevelOption, StringOption
 
 
@@ -25,6 +31,12 @@ class SimulatorFactory(object):
         """
         return [
             RisimGHDLInterface,
+            ModelSimInterface,
+            RivieraProInterface,
+            ActiveHDLInterface,
+            GHDLInterface,
+            IncisiveInterface,
+            NVCInterface,
         ]
 
     def _extract_compile_options(self):
