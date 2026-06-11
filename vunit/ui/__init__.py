@@ -1431,6 +1431,9 @@ other preprocessors. Lowest value first. The order between preprocessors with th
         """
         Compile entire project
         """
+        if self._simulator_if is None:
+            self._simulator_if = self._create_simulator_if()
+
         # get test benches
         if self._args.minimal:
             target_files = self._get_testbench_files()

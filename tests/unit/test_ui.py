@@ -1255,8 +1255,7 @@ end architecture;
         )
         lib.add_source_file("tb_ent.vhd")
         lib.add_source_file("tb_ent2.vhd")
-        simulator_if = ui._create_simulator_if()  # pylint: disable=protected-access
-        target_files = ui._get_testbench_files(simulator_if)  # pylint: disable=protected-access
+        target_files = ui._get_testbench_files()  # pylint: disable=protected-access
         expected = [
             lib.get_source_file(fname)._source_file  # pylint: disable=protected-access
             for fname in ["tb_ent2.vhd", "tb_ent.vhd"]
@@ -1455,7 +1454,7 @@ endmodule
         """Create an instance of the VUnit public interface class"""
         with mock.patch(
             "vunit.sim_if.factory.SIMULATOR_FACTORY.select_simulator",
-            new=lambda: MockSimulator,
+            new=lambda args=None: MockSimulator,
         ):
             return self._create_ui_real_sim(*args)
 
