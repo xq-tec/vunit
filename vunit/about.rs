@@ -6,16 +6,19 @@
 //!
 //! Copyright (c) 2014-2026, Lars Asplund lars.anders.asplund@gmail.com
 
+use core::cmp::Ordering;
+use core::error::Error;
 use core::fmt;
 use core::str::FromStr;
 
 /// Current VUnit version string.
 pub const VERSION: &str = "5.0.0.dev11";
 
-/// Returns licence text.
+/// Returns license text.
 #[must_use]
 pub const fn license_text() -> &'static str {
-    "**VUnit**, except for the projects below, is released under the terms of `Mozilla Public License, v. 2.0`_.\n\
+    "\
+**VUnit**, except for the projects below, is released under the terms of `Mozilla Public License, v. 2.0`_.\n\
 |copy| 2014-2024 Lars Asplund, lars.anders.asplund@gmail.com.\n\
 \n\
 The following library is `redistributed`_ with VUnit for convenience:\n\
@@ -34,13 +37,15 @@ The font used in VUnit's logo and illustrations is 'Tratex', the traffic sign ty
 .. _Mozilla Public License, v. 2.0: http://mozilla.org/MPL/2.0/\n\
 .. _ARTISTIC License: http://www.perlfoundation.org/artistic_license_2_0\n\
 .. _Apache License, v 2.0: http://www.apache.org/licenses/LICENSE-2.0\n\
-.. _SynthWorks Design Inc: http://www.synthworks.com"
+.. _SynthWorks Design Inc: http://www.synthworks.com\n\
+"
 }
 
 /// Returns a short introduction to VUnit.
 #[must_use]
 pub fn doc() -> String {
-    const INTRO: &str = "VUnit is an open source unit testing framework for VHDL/SystemVerilog\n\
+    const INTRO: &str = "\
+VUnit is an open source unit testing framework for VHDL/SystemVerilog\n\
 released under the terms of Mozilla Public License, v. 2.0. It\n\
 features the functionality needed to realize continuous and automated\n\
 testing of your HDL code. VUnit doesn't replace but rather complements\n\
@@ -51,11 +56,10 @@ often\" approach through automation. **Read more on our**\n\
 Contributing in the form of code, feedback, ideas or bug reports are\n\
 welcome. Read our `contribution guide\n\
 <https://vunit.github.io/contributing.html>`__ to get started.\n\
-\n";
+\n\
+";
 
-    let mut text = String::from(INTRO);
-    text.push_str(license_text());
-    text
+    format!("{INTRO}{}", license_text())
 }
 
 /// Returns the VUnit version.
@@ -70,6 +74,14 @@ pub struct VUnitVersionError {
     version_string: String,
 }
 
+impl From<&str> for VUnitVersionError {
+    fn from(value: &str) -> Self {
+        Self {
+            version_string: value.to_owned(),
+        }
+    }
+}
+
 impl fmt::Display for VUnitVersionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -80,19 +92,59 @@ impl fmt::Display for VUnitVersionError {
     }
 }
 
-impl core::error::Error for VUnitVersionError {}
+impl Error for VUnitVersionError {}
 
 /// VUnit version object which encapsulates knowledge about VUnit versions.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VUnitVersion {
     major: u32,
     minor: u32,
     patch: u32,
     /// Development releases sort before the final release.
-    dev: i32,
+    dev: Option<u32>,
+}
+
+impl PartialOrd for VUnitVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for VUnitVersion {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.major
+            .cmp(&other.major)
+            .then_with(|| self.minor.cmp(&other.minor))
+            .then_with(|| self.patch.cmp(&other.patch))
+            // make sure that dev versions are sorted before non-dev versions
+            .then_with(|| match (self.dev, other.dev) {
+                (Some(self_dev), Some(other_dev)) => self_dev.cmp(&other_dev),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            })
+    }
 }
 
 impl VUnitVersion {
+    const fn new(major: u32, minor: u32, patch: u32) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+            dev: None,
+        }
+    }
+
+    const fn new_dev(major: u32, minor: u32, patch: u32, dev: u32) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+            dev: Some(dev),
+        }
+    }
+
     /// Parses a VUnit version string.
     ///
     /// Not a full implementation of PEP 440, only what is needed for VUnit versioning.
@@ -103,40 +155,51 @@ impl VUnitVersion {
     /// `[v]MAJOR[.MINOR][.PATCH][.devN]`.
     pub fn parse(version_string: &str) -> Result<Self, VUnitVersionError> {
         let version_string = version_string.trim();
-        let rest = version_string
-            .strip_prefix('v')
-            .unwrap_or(version_string)
-            .trim();
+        let rest = version_string.strip_prefix('v').unwrap_or(version_string);
 
-        if rest.is_empty() {
-            return Err(VUnitVersionError {
-                version_string: version_string.to_owned(),
-            });
+        let mut parts = rest.split('.');
+
+        let major = parts
+            .next()
+            .ok_or(version_string)?
+            .parse::<u32>()
+            .map_err(|_error| version_string)?;
+
+        let parse_num = |part: &str| part.parse::<u32>().map_err(|_error| version_string);
+        let parse_dev = |part: &str| -> Result<_, VUnitVersionError> {
+            part.strip_prefix("dev")
+                .map(str::parse::<u32>)
+                .transpose()
+                .map_err(|_error| version_string.into())
+        };
+
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(minor), Some(patch), Some(dev), None) => {
+                let minor = parse_num(minor)?;
+                let patch = parse_num(patch)?;
+                let dev = parse_dev(dev)?.ok_or(version_string)?;
+                Ok(Self::new_dev(major, minor, patch, dev))
+            }
+            (Some(minor), Some(patch_or_dev), None, _) => {
+                let minor = parse_num(minor)?;
+                if let Some(dev) = parse_dev(patch_or_dev)? {
+                    Ok(Self::new_dev(major, minor, 0, dev))
+                } else {
+                    let patch = parse_num(patch_or_dev)?;
+                    Ok(Self::new(major, minor, patch))
+                }
+            }
+            (Some(minor_or_dev), None, _, _) => {
+                if let Some(dev) = parse_dev(minor_or_dev)? {
+                    Ok(Self::new_dev(major, 0, 0, dev))
+                } else {
+                    let minor = parse_num(minor_or_dev)?;
+                    Ok(Self::new(major, minor, 0))
+                }
+            }
+            (None, _, _, _) => Ok(Self::new(major, 0, 0)),
+            (Some(_), Some(_), Some(_), Some(_)) => Err(version_string.into()),
         }
-
-        let (major, rest) = parse_u32_component(rest).map_err(|_| VUnitVersionError {
-            version_string: version_string.to_owned(),
-        })?;
-        let (minor, rest) = parse_optional_dot_component(rest);
-        let (patch, rest) = parse_optional_dot_component(rest);
-        let (dev, rest) = parse_optional_dev(rest).map_err(|_| VUnitVersionError {
-            version_string: version_string.to_owned(),
-        })?;
-
-        if !rest.is_empty() {
-            return Err(VUnitVersionError {
-                version_string: version_string.to_owned(),
-            });
-        }
-
-        let dev = dev.map_or(0, |value| i32::try_from(value).unwrap_or(0) - 1000);
-
-        Ok(Self {
-            major,
-            minor,
-            patch,
-            dev,
-        })
     }
 }
 
@@ -150,52 +213,18 @@ impl FromStr for VUnitVersion {
 
 impl fmt::Display for VUnitVersion {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
-        if self.dev != 0 {
-            write!(f, ".dev{}", self.dev + 1000)?;
+        let Self {
+            major,
+            minor,
+            patch,
+            dev,
+        } = self;
+        if let Some(dev) = dev {
+            write!(f, "{major}.{minor}.{patch}.dev{dev}")
+        } else {
+            write!(f, "{major}.{minor}.{patch}")
         }
-        Ok(())
     }
-}
-
-fn parse_u32_component(s: &str) -> Result<(u32, &str), ()> {
-    let end = s.find('.').unwrap_or(s.len());
-    let component = &s[..end];
-    if component.is_empty() {
-        return Err(());
-    }
-    let value = component.parse().map_err(|_| ())?;
-    Ok((value, &s[end..]))
-}
-
-fn parse_optional_dot_component(s: &str) -> (u32, &str) {
-    if !s.starts_with('.') {
-        return (0, s);
-    }
-
-    let after_dot = &s[1..];
-    let end = after_dot.find('.').unwrap_or(after_dot.len());
-    let component = &after_dot[..end];
-
-    component
-        .parse::<u32>()
-        .map(|value| (value, &after_dot[end..]))
-        .unwrap_or((0, s))
-}
-
-fn parse_optional_dev(s: &str) -> Result<(Option<u32>, &str), ()> {
-    let Some(after_dev) = s.strip_prefix(".dev") else {
-        return Ok((None, s));
-    };
-
-    let end = after_dev.find('.').unwrap_or(after_dev.len());
-    let component = &after_dev[..end];
-    if component.is_empty() {
-        return Err(());
-    }
-
-    let value = component.parse().map_err(|_| ())?;
-    Ok((Some(value), &after_dev[end..]))
 }
 
 #[cfg(test)]
@@ -241,6 +270,6 @@ mod tests {
 
     #[test]
     fn rejects_invalid_version() {
-        assert!(VUnitVersion::parse("not-a-version").is_err());
+        VUnitVersion::parse("not-a-version").unwrap_err();
     }
 }
