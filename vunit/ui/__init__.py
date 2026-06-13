@@ -49,6 +49,11 @@ from .source import SourceFile, SourceFileList
 from .library import Library, LibraryList
 from .results import Results
 
+# Shared project databases keyed by resolved project_database path.
+# All VUnit instances for one workspace must use _create_database so concurrent
+# batches share one in-memory node allocator. Entries are not evicted.
+_project_databases = {}
+
 
 class VUnit(object):  # pylint: disable=too-many-instance-attributes, too-many-public-methods
     """
@@ -209,9 +214,18 @@ class VUnit(object):  # pylint: disable=too-many-instance-attributes, too-many-p
 
         if create_new:
             database = DataBase(project_database_file_name, new=True)
-        database[key] = version
+            pickled = PickledDataBase(database)
+            pickled[key] = version
+            _project_databases[project_database_file_name] = pickled
+            return pickled
 
-        return PickledDataBase(database)
+        if project_database_file_name in _project_databases:
+            return _project_databases[project_database_file_name]
+
+        pickled = PickledDataBase(database)
+        pickled[key] = version
+        _project_databases[project_database_file_name] = pickled
+        return pickled
 
     @staticmethod
     def _configure_logging(log_level):
@@ -779,6 +793,10 @@ other preprocessors. Lowest value first. The order between preprocessors with th
     def prepare_run_commands(self, test_patterns, collect_commands) -> None:
         """
         Collect simulator run commands into collect_commands instead of running them.
+
+        Each external run uses its own VUnit instance. Cross-instance state lives in
+        the shared project database and files under vunit_out, and is only touched
+        within single GIL holds.
         """
         if not test_patterns:
             test_patterns = ["*"]
@@ -797,28 +815,20 @@ other preprocessors. Lowest value first. The order between preprocessors with th
         run_suites_by_name = {}
 
         for test_suite in test_list:
-            suite_start_time = ostools.get_time()
             output_path = self._get_external_run_output_path(run_output_path, test_suite.name)
             output_file_name = str(Path(output_path) / "output.txt")
-            TestRunner._prepare_test_suite_output_path(output_path)  # pylint: disable=protected-access
-
-            command = self._get_test_run(test_suite).prepare(output_path, print_seed=False)
-            finished = command is None
 
             entry = {
                 "test_suite": test_suite,
                 "output_path": output_path,
                 "output_file_name": output_file_name,
-                "start_time": suite_start_time,
-                "finished": finished,
+                "start_time": None,
+                "started": False,
+                "finished": False,
             }
             run_suites.append(entry)
             run_suites_by_name[test_suite.name] = entry
-
-            if finished:
-                self._add_failed_run_entry_results(report, entry)
-            else:
-                collect_commands.append(test_suite.name, output_file_name, command)
+            collect_commands.append(test_suite.name, output_file_name)
 
         self._external_run_state = {
             "run_suites": run_suites,
@@ -827,6 +837,41 @@ other preprocessors. Lowest value first. The order between preprocessors with th
             "start_time": start_time,
             "num_tests": num_tests,
         }
+
+    # AI NOTICE: Generated, not reviewed.
+    def start_run_command(self, test_suite_name):
+        """
+        Prepare one test suite output directory and return its simulator command.
+
+        Called immediately before spawning the simulation subprocess, while the
+        caller holds the per-suite lock.
+        """
+        state = self._external_run_state
+        if state is None:
+            raise RuntimeError("No external run state; call prepare_run_commands first")
+
+        entry = state["run_suites_by_name"].get(test_suite_name)
+        if entry is None:
+            raise ValueError(f"unknown test suite: {test_suite_name}")
+        if entry["started"]:
+            raise RuntimeError(f"test suite already started: {test_suite_name}")
+        if entry["finished"]:
+            raise RuntimeError(f"test suite already finished: {test_suite_name}")
+
+        output_path = entry["output_path"]
+        TestRunner._prepare_test_suite_output_path(output_path)  # pylint: disable=protected-access
+
+        entry["start_time"] = ostools.get_time()
+        entry["started"] = True
+
+        test_suite = entry["test_suite"]
+        command = self._get_test_run(test_suite).prepare(output_path, print_seed=False)
+        if command is None:
+            self._add_failed_run_entry_results(state["report"], entry)
+            entry["finished"] = True
+            return None
+
+        return command
 
     # AI NOTICE: Generated, minimally reviewed.
     def finish_run_command(self, test_suite_name, sim_ok) -> bool:
@@ -847,10 +892,17 @@ other preprocessors. Lowest value first. The order between preprocessors with th
         entry["finished"] = True
         return suite_passed
 
-    # AI NOTICE: Generated, minimally reviewed.
+    # AI NOTICE: Generated, not reviewed.
     def finalize_run_commands(self) -> bool:
         """
         Complete an external run after all test suite simulations have finished.
+
+        Each external run uses its own VUnit instance. Cross-instance state lives in
+        the shared project database and files under vunit_out, and is only touched
+        within single GIL holds.
+
+        Note: This method must be called under a workspace-wide lock, otherwise the
+        test history might become corrupted.
         """
         state = self._external_run_state
         if state is None:
@@ -907,11 +959,13 @@ other preprocessors. Lowest value first. The order between preprocessors with th
 
         return all(status == PASSED for status in results.values())
 
-    # AI NOTICE: Generated, minimally reviewed.
+    # AI NOTICE: Generated, not reviewed.
     def _add_failed_run_entry_results(self, report, entry):
         test_suite = entry["test_suite"]
         output_file_name = entry["output_file_name"]
         start_time = entry["start_time"]
+        if start_time is None:
+            start_time = ostools.get_time()
         raw_results = {
             test_name: FAILED for test_name in self._get_test_run(test_suite)._test_cases
         }
@@ -1229,6 +1283,9 @@ other preprocessors. Lowest value first. The order between preprocessors with th
     def _update_test_history(self, report):
         """
         Update the database test history with the results from the completed test run.
+
+        Note: This method must be called under a workspace-wide lock, otherwise the
+        test history might become corrupted.
         """
         test_suite_data = {}
         for test_result in report:
@@ -1413,7 +1470,10 @@ other preprocessors. Lowest value first. The order between preprocessors with th
         elif not Path(self._output_path).exists():
             os.makedirs(self._output_path)
 
-        ostools.renew_path(self._preprocessed_path)
+        if clean:
+            ostools.renew_path(self._preprocessed_path)
+        elif not Path(self._preprocessed_path).exists():
+            os.makedirs(self._preprocessed_path)
 
     @property
     def vhdl_standard(self) -> str:

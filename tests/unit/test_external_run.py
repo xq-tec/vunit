@@ -4,6 +4,8 @@
 #
 # Copyright (c) 2026, xq-Tec <info@xq-tec.com>
 
+# AI NOTICE: Generated, not reviewed.
+
 """
 Tests for externally executed simulation runs
 """
@@ -124,12 +126,11 @@ class MockRunCommands:
     def __init__(self):
         self.entries = []
 
-    def append(self, test_suite_name, output_file_name, command):
+    def append(self, test_suite_name, output_file_name):
         self.entries.append(
             {
                 "test_suite_name": test_suite_name,
                 "output_file_name": output_file_name,
-                "command": command,
             }
         )
 
@@ -216,7 +217,8 @@ class TestPrepareRunCommands(unittest.TestCase):
         self.assertEqual(len(collect_commands.entries), 1)
         entry = collect_commands.entries[0]
         self.assertEqual(entry["test_suite_name"], "lib.tb_entity.all")
-        self.assertEqual(entry["command"][0], "mock-sim")
+        command = ui.start_run_command("lib.tb_entity.all")
+        self.assertEqual(command[0], "mock-sim")
 
         write_file(
             get_result_file_name(run_output_path(entry)),
@@ -249,6 +251,7 @@ class TestPrepareRunCommands(unittest.TestCase):
         self.assertEqual(len(collect_commands.entries), 2)
 
         for entry in collect_commands.entries:
+            ui.start_run_command(entry["test_suite_name"])
             write_file(
                 get_result_file_name(run_output_path(entry)),
                 "test_start:all\ntest_suite_done\n",
@@ -274,14 +277,12 @@ class TestPrepareRunCommands(unittest.TestCase):
 
         collect_commands, _ = self._prepare(ui, test_list)
 
-        write_file(
-            get_result_file_name(run_output_path(collect_commands.entries[0])),
-            "test_start:all\ntest_suite_done\n",
-        )
-        write_file(
-            get_result_file_name(run_output_path(collect_commands.entries[1])),
-            "test_start:all\ntest_suite_done\n",
-        )
+        for entry in collect_commands.entries:
+            ui.start_run_command(entry["test_suite_name"])
+            write_file(
+                get_result_file_name(run_output_path(entry)),
+                "test_start:all\ntest_suite_done\n",
+            )
 
         self.assertFalse(ui.finish_run_command("lib.tb_entity.all", False))
         self.assertTrue(ui.finish_run_command("lib.tb_other.all", True))
@@ -294,7 +295,7 @@ class TestPrepareRunCommands(unittest.TestCase):
         self.assertTrue(report.result_of("lib.tb_other.all").passed)
 
     @mock.patch("vunit.ui.VUnit._create_external_run_mapping_file")
-    def test_pre_config_failure_at_prepare(self, _mapping):
+    def test_pre_config_failure_at_start(self, _mapping):
         from vunit.test.list import TestList
 
         test_run = self._single_suite_test_run()
@@ -302,10 +303,12 @@ class TestPrepareRunCommands(unittest.TestCase):
         test_list.add_suite(self._suite("lib.tb_entity.all", test_run))
         ui = self._make_ui(mock.Mock(return_value=test_list))
 
-        with mock.patch.object(test_run, "prepare", return_value=None):
-            collect_commands, _ = self._prepare(ui, test_list)
+        collect_commands, _ = self._prepare(ui, test_list)
+        self.assertEqual(len(collect_commands.entries), 1)
 
-        self.assertEqual(len(collect_commands.entries), 0)
+        with mock.patch.object(test_run, "prepare", return_value=None):
+            self.assertIsNone(ui.start_run_command("lib.tb_entity.all"))
+
         entry = ui._external_run_state["run_suites_by_name"]["lib.tb_entity.all"]
         self.assertTrue(entry["finished"])
         self.assertFalse(ui.finalize_run_commands())
@@ -320,6 +323,7 @@ class TestPrepareRunCommands(unittest.TestCase):
         ui = self._make_ui(mock.Mock(return_value=test_list))
 
         collect_commands, _ = self._prepare(ui, test_list)
+        ui.start_run_command("lib.tb_entity.all")
         write_file(
             get_result_file_name(run_output_path(collect_commands.entries[0])),
             "test_start:all\ntest_suite_done\n",
@@ -328,6 +332,20 @@ class TestPrepareRunCommands(unittest.TestCase):
         ui.finish_run_command("lib.tb_entity.all", True)
         with self.assertRaises(RuntimeError):
             ui.finish_run_command("lib.tb_entity.all", True)
+
+    @mock.patch("vunit.ui.VUnit._create_external_run_mapping_file")
+    def test_start_twice_raises(self, _mapping):
+        from vunit.test.list import TestList
+
+        test_run = self._single_suite_test_run()
+        test_list = TestList()
+        test_list.add_suite(self._suite("lib.tb_entity.all", test_run))
+        ui = self._make_ui(mock.Mock(return_value=test_list))
+
+        self._prepare(ui, test_list)
+        ui.start_run_command("lib.tb_entity.all")
+        with self.assertRaises(RuntimeError):
+            ui.start_run_command("lib.tb_entity.all")
 
     @mock.patch("vunit.ui.VUnit._create_external_run_mapping_file")
     def test_abort_clears_state(self, _mapping):
@@ -359,6 +377,7 @@ class TestPrepareRunCommands(unittest.TestCase):
         ui = self._make_ui(mock.Mock(return_value=test_list))
 
         collect_commands, _ = self._prepare(ui, test_list)
+        ui.start_run_command("lib.tb_entity.all")
         write_file(
             get_result_file_name(run_output_path(collect_commands.entries[0])),
             "test_start:all\ntest_suite_done\n",
