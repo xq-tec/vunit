@@ -159,17 +159,22 @@ class VUnit(object):  # pylint: disable=too-many-instance-attributes, too-many-p
 
         self._simulator_class = SIMULATOR_FACTORY.select_simulator(args)
 
+        simulator_executable_mtime = self._get_simulator_executable_mtime()
+        clean = args.clean or self._simulator_marker_differs(simulator_executable_mtime)
+
         # Use default simulator options if no simulator was present
         if self._simulator_class is None:
             simulator_class = SimulatorInterface
             self._simulator_output_path = str(Path(self._output_path) / "none")
-            self._create_output_path(args.clean)
+            self._create_output_path(clean)
             self._simulator_if = None
         else:
             simulator_class = self._simulator_class
             self._simulator_output_path = str(Path(self._output_path) / simulator_class.name)
-            self._create_output_path(args.clean)
+            self._create_output_path(clean)
             self._simulator_if = self._create_simulator_if()
+
+        self._write_simulator_marker(simulator_executable_mtime)
 
         self._database_version = (11, sys.version)
         self._pickled_database_version = (self._database_version[0], pickle.HIGHEST_PROTOCOL)
@@ -1460,6 +1465,47 @@ other preprocessors. Lowest value first. The order between preprocessors with th
         """
         self._compile()
         return True
+
+    def _get_simulator_executable_mtime(self):
+        """
+        Return the modification time of the simulator executable, or None.
+        """
+        if self._simulator_class is None:
+            return None
+        executable_path = self._simulator_class.executable_path(self._args)
+        if executable_path is None:
+            return None
+        try:
+            return ostools.get_modification_time(str(executable_path))
+        except OSError:
+            return None
+
+    def _simulator_marker_path(self):
+        return Path(self._output_path) / ".simulator_timestamp"
+
+    def _simulator_marker_differs(self, mtime):
+        """
+        Return True if the stored simulator mtime differs from mtime, forcing a clean.
+        """
+        if mtime is None:
+            return False
+        marker = self._simulator_marker_path()
+        if not marker.exists():
+            # No marker: only force clean if an output path already exists, i.e. it was
+            # produced by an older/unknown simulator install (the upgrade case).
+            return Path(self._output_path).exists()
+        try:
+            return ostools.read_file(str(marker)).strip() != repr(mtime)
+        except OSError:
+            return True
+
+    def _write_simulator_marker(self, mtime):
+        """
+        Persist the simulator executable mtime so later runs can detect changes.
+        """
+        if mtime is None:
+            return
+        ostools.write_file(str(self._simulator_marker_path()), repr(mtime))
 
     def _create_output_path(self, clean: bool):
         """

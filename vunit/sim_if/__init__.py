@@ -134,6 +134,13 @@ class SimulatorInterface(object):  # pylint: disable=too-many-public-methods
         """
 
     @classmethod
+    def executable_path(cls, args):  # pylint: disable=unused-argument
+        """
+        Return the path to the main simulator executable, or None if unknown.
+        """
+        return None
+
+    @classmethod
     def is_available(cls):
         """
         Returns True if simulator is available

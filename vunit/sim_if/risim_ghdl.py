@@ -32,6 +32,9 @@ class RisimGHDLInterface(SimulatorInterface):  # pylint: disable=too-many-instan
     name = "risim-ghdl"
     executable = environ.get("RISIM_GHDL", "risim-ghdl")
 
+    # Cached result of the executable path lookup, see executable_path().
+    _resolved_executable_path = None
+
     compile_options = [
         ListOfStringOption("risim-ghdl.a_flags"),
         ListOfStringOption("risim-ghdl.flags"),  # Removed in v5.0.0
@@ -63,26 +66,34 @@ class RisimGHDLInterface(SimulatorInterface):  # pylint: disable=too-many-instan
         """
         Create instance from args namespace
         """
-        explicit_path = getattr(args, "risim_ghdl", None)
-        if explicit_path is not None:
-            executable_path = Path(explicit_path).resolve()
-            prefix = str(executable_path.parent)
-            executable = executable_path.name
-            return cls(
-                output_path=output_path,
-                prefix=prefix,
-                gui=args.gui,
-                executable=executable,
-            )
+        executable_path = cls.executable_path(args)
+        prefix = str(executable_path.parent)
+        executable = executable_path.name
 
-        prefix = cls.find_prefix()
-        check_executable("RISIM_GHDL", prefix, cls.executable)
+        if getattr(args, "risim_ghdl", None) is None:
+            check_executable("RISIM_GHDL", prefix, executable)
 
         return cls(
             output_path=output_path,
             prefix=prefix,
             gui=args.gui,
+            executable=executable,
         )
+
+    @classmethod
+    def executable_path(cls, args):
+        """
+        Return the resolved path to the risim-ghdl executable.
+
+        The lookup is performed once and the result cached on the class.
+        """
+        if cls._resolved_executable_path is None:
+            explicit_path = getattr(args, "risim_ghdl", None)
+            if explicit_path is not None:
+                cls._resolved_executable_path = Path(explicit_path).resolve()
+            else:
+                cls._resolved_executable_path = Path(cls.find_prefix()) / cls.executable
+        return cls._resolved_executable_path
 
     @classmethod
     def find_prefix(cls):
