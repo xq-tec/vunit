@@ -31,6 +31,27 @@ include = [
 [lib]
 name = "risim_vunit_frontend"
 
+[dependencies]
+blake3 = "1.8"
+camino = { version = "1.2", features = ["serde1"] }
+globset = "0.4"
+rayon = "1"
+regex = "1.12"
+rustc-hash = "2"
+serde = { version = "1", features = ["derive"] }
+serde_ignored = "0.1"
+thiserror = "2"
+toml = "1.1"
+tracing = "0.1"
+walkdir = "2.5"
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"
+
+[build-dependencies]
+blake3 = "1.8"
+
 [lints.rust]
 # Copied from the risim workspace. This package must not use workspace inheritance,
 # so a standalone checkout of the fork can be packaged on its own.

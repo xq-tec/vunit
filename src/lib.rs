@@ -6,6 +6,20 @@
 //!
 //! The VHDL libraries under `vunit/vhdl` stay upstream `VUnit` sources.
 //! This crate has no command-line interface; event-cache drives it.
-//! Parsing, discovery, and compile/simulate orchestration are added in later phases.
+//!
+//! Implemented so far: reading the configuration ([`config`], [`spec`]), collecting and parsing
+//! sources ([`sources`], [`vhdl_parser`]), the builtin libraries ([`builtins`]), and the
+//! project model with dependency analysis ([`project`], [`dependency_graph`]). Test discovery
+//! and compile/simulate orchestration are added in later phases.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
+
+pub mod builtins;
+pub mod config;
+pub mod dependency_graph;
+pub mod diagnostics;
+pub mod project;
+pub mod sources;
+pub mod spec;
+pub mod vhdl_parser;
+pub mod vhdl_standard;

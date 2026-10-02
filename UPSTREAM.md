@@ -57,3 +57,9 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - Duplicate tests and invalid attributes disable only the affected testbench instead of aborting.
 - Testcase patterns are case-insensitive on all platforms (Python's `fnmatch` is case-insensitive only on Windows).
 - Compile and simulation processes run with the workspace root as working directory.
+- Files that are independent of each other compile in the order they were added. VUnit sorts them by path. Both orders respect the dependencies.
+- An ambiguous direct entity instantiation is an error for the instantiating file instead of aborting. Dependency cycles are reported only when the compile order is computed, not when collecting the files a testbench needs.
+- The VHDL parser skips enumeration, record and array types, which VUnit only uses for com codec generation. Word boundaries (`\b`) only treat ASCII characters as word characters.
+- `vunit_lib` is reserved for the VUnit library. A user library named `osvvm` replaces the builtin OSVVM library, with a warning. Library names, including `work`, are compared case-insensitively.
+- com is always added from VHDL-2008 on, and left out for older standards instead of raising an error.
+- In file patterns, `*` also matches hidden files, and `risim-out/` and `.git/` directories are never searched. Files with unknown extensions are skipped with a warning instead of raising an error.

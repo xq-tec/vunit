@@ -1,0 +1,22 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this file,
+# You can obtain one at http://mozilla.org/MPL/2.0/.
+
+# Copied from the risim workspace, so standalone checkouts lint the same way.
+
+allow-expect-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-panic-in-tests = true
+allow-unwrap-in-tests = true
+avoid-breaking-exported-api = false
+check-inconsistent-struct-field-initializers = true
+# check-private-items = true
+doc-valid-idents = ["CPython", "PyO3", "VUnit", ".."]
+allowed-idents-below-min-chars = ["f", ".."]
+lint-commented-code = true
+absolute-paths-max-segments = 3
+
+disallowed-types = [
+    { path = "std::collections::HashMap", reason = "prefer faster implementation from rustc_hash", replacement = "rustc_hash::FxHashMap" },
+    { path = "std::collections::HashSet", reason = "prefer faster implementation from rustc_hash", replacement = "rustc_hash::FxHashSet" },
+]
