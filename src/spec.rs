@@ -256,7 +256,8 @@ pub struct TestConfigSpec {
     pub target: String,
     /// Named configurations; if there are any, the default configuration isn't run.
     pub configurations: Vec<ConfigurationSpec>,
-    /// Generics of the default configuration.
+    /// Generics set in all configurations of the target before `configurations` are added, so
+    /// the added configurations inherit them.
     pub generics: BTreeMap<String, String>,
 }
 
@@ -269,7 +270,9 @@ pub struct ConfigurationSpec {
     pub generics: BTreeMap<String, String>,
     /// Simulation options on top of the project's.
     pub sim_options: SimOptions,
-    /// User attributes (names starting with `.`) and their values.
+    /// User attributes (names starting with `.`) and their values. The builtin attribute
+    /// `fail_on_warning` sets the assert stop level to warning, or to error if its value is
+    /// `false`; `run_all_in_same_sim` is ignored.
     pub attributes: BTreeMap<String, String>,
     /// A VHDL configuration to elaborate instead of the testbench entity.
     pub vhdl_configuration_name: Option<String>,

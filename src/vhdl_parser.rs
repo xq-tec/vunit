@@ -30,6 +30,8 @@ use thiserror::Error;
 
 use crate::diagnostics::LineIndex;
 use crate::diagnostics::Range;
+use crate::discovery;
+use crate::discovery::TestScan;
 
 #[cfg(test)]
 mod tests;
@@ -53,6 +55,8 @@ pub struct VhdlDesignFile {
     pub configurations: Vec<VhdlConfiguration>,
     /// References to other design units.
     pub references: Vec<VhdlReference>,
+    /// Test markers, for test discovery if the file contains a testbench architecture.
+    pub tests: TestScan,
 }
 
 /// An entity declaration.
@@ -60,6 +64,8 @@ pub struct VhdlDesignFile {
 pub struct VhdlEntity {
     /// The lowercase entity name.
     pub identifier: String,
+    /// The entity name in the case it is declared with.
+    pub declared_name: String,
     /// The location of the name.
     pub range: Range,
     /// Constant generics; type, package and subprogram generics are skipped.
@@ -215,8 +221,9 @@ impl VhdlDesignFile {
     /// Fails like `VUnit` does, for example on an unbalanced generic or port clause.
     pub fn parse(source: &[u8]) -> Result<Self, ParseError> {
         let mut code = remove_comments(source);
-        lowercase_latin1(&mut code);
         let lines = LineIndex::new(source);
+        let tests = discovery::scan_tests(source, &code, &lines);
+        lowercase_latin1(&mut code);
         let range = |captures: &Captures<'_>, group: &str| -> Range {
             lines.range(captures.name(group).map_or(0..0, |found| found.range()))
         };
@@ -228,8 +235,10 @@ impl VhdlDesignFile {
             let sub_code = &code[start..];
             if let Some(end) = entity_end_re(identifier).find(sub_code) {
                 let entity_code = &sub_code[..end.end()];
+                let id_span = captures.name("id").map_or(0..0, |found| found.range());
                 entities.push(VhdlEntity {
                     identifier: latin1(identifier),
+                    declared_name: latin1(&source[id_span]),
                     range: range(&captures, "id"),
                     generics: find_generic_clause(entity_code)?,
                     ports: find_port_clause(entity_code)?,
@@ -309,6 +318,7 @@ impl VhdlDesignFile {
             component_instantiations,
             configurations,
             references: find_references(&code),
+            tests,
         })
     }
 }
@@ -326,9 +336,9 @@ const PACKAGE_INSTANCE_PATTERN: &str =
     r"\bpackage\s+(?P<new_name><ID>)\s+is\s+new\s+(?P<lib><ID>)\.(?P<name><ID>)";
 
 #[derive(Clone, Copy)]
-struct Flags {
-    multi_line: bool,
-    dot_all: bool,
+pub(crate) struct Flags {
+    pub(crate) multi_line: bool,
+    pub(crate) dot_all: bool,
 }
 
 const MULTILINE: Flags = Flags {
@@ -348,7 +358,7 @@ const MULTILINE_DOTALL: Flags = Flags {
     clippy::unwrap_used,
     reason = "the patterns are constants; a broken one fails every test"
 )]
-fn python_regex(pattern: &str, flags: Flags) -> Regex {
+pub(crate) fn python_regex(pattern: &str, flags: Flags) -> Regex {
     let pattern = translate_python_classes(&pattern.replace("<ID>", ID_PATTERN));
     RegexBuilder::new(&pattern)
         .unicode(false)
@@ -556,7 +566,7 @@ fn lowercase_latin1(code: &mut [u8]) {
 }
 
 /// Decodes Latin-1 bytes.
-fn latin1(bytes: &[u8]) -> String {
+pub(crate) fn latin1(bytes: &[u8]) -> String {
     bytes.iter().copied().map(char::from).collect()
 }
 

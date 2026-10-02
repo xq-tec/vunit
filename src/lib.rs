@@ -9,15 +9,19 @@
 //!
 //! Implemented so far: reading the configuration ([`config`], [`spec`]), collecting and parsing
 //! sources ([`sources`], [`vhdl_parser`]), the builtin libraries ([`builtins`]), and the
-//! project model with dependency analysis ([`project`], [`dependency_graph`]). Test discovery
-//! and compile/simulate orchestration are added in later phases.
+//! project model with dependency analysis ([`project`], [`dependency_graph`]), and test
+//! discovery with configurations and testcase patterns ([`discovery`], [`configuration`],
+//! [`pattern`]). Compile/simulate orchestration is added in later phases.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
 pub mod builtins;
 pub mod config;
+pub mod configuration;
 pub mod dependency_graph;
 pub mod diagnostics;
+pub mod discovery;
+pub mod pattern;
 pub mod project;
 pub mod sources;
 pub mod spec;

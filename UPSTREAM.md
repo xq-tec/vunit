@@ -54,7 +54,7 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - No test history; no seed "repeat"; no xUnit/JUnit reports; no elaborate-only mode; no `pre_config`/`post_check` hooks.
 - A test that never started counts as failed (VUnit: skipped).
 - Recompilation uses compile keys instead of timestamps. Independent libraries compile in parallel and continue after unrelated failures.
-- Duplicate tests and invalid attributes disable only the affected testbench instead of aborting.
+- Duplicate tests, invalid attributes, and testbenches with no or several architectures disable only the affected testbench instead of aborting. Configuration errors (duplicate or empty names, invalid attributes) skip only that configuration.
 - Testcase patterns are case-insensitive on all platforms (Python's `fnmatch` is case-insensitive only on Windows).
 - Compile and simulation processes run with the workspace root as working directory.
 - Files that are independent of each other compile in the order they were added. VUnit sorts them by path. Both orders respect the dependencies.
@@ -63,3 +63,5 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - `vunit_lib` is reserved for the VUnit library. A user library named `osvvm` replaces the builtin OSVVM library, with a warning. Library names, including `work`, are compared case-insensitively.
 - com is always added from VHDL-2008 on, and left out for older standards instead of raising an error.
 - In file patterns, `*` also matches hidden files, and `risim-out/` and `.git/` directories are never searched. Files with unknown extensions are skipped with a warning instead of raising an error.
+- Testcase names keep the case of the entity declaration; `VUnit` uses the lowercase entity name. Test names that differ only in case produce a warning.
+- Test configurations are declarative: each `TestConfigSpec` first sets its generics in all configurations of its target, then adds its configurations as copies of the target's default configuration. Generic names are compared case-insensitively, and generics of a configuration that the entity doesn't declare produce a warning and are skipped (`VUnit` sets them silently). A `fail_on_warning` attribute of a configuration only affects that configuration instead of the whole testbench.
