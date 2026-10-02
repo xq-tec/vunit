@@ -1,0 +1,44 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this file,
+# You can obtain one at http://mozilla.org/MPL/2.0/.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # Same toolchain as the risim CI. rustfmt options in rustfmt.toml need nightly,
+      # and the date matches risim's NIGHTLY_DATE so both repositories format the same way.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.97.1
+        with:
+          components: clippy
+
+      - name: Install nightly rustfmt
+        uses: dtolnay/rust-toolchain@nightly-2026-07-21
+        with:
+          components: rustfmt
+
+      - name: Format
+        run: cargo +nightly-2026-07-21 fmt --check
+
+      - name: Clippy
+        run: cargo +1.97.1 clippy --all-targets --locked -- -D warnings
+
+      - name: Test
+        run: cargo +1.97.1 test --all-targets --locked
+
+      - name: Package list
+        run: cargo +1.97.1 package --list --locked
