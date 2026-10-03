@@ -53,6 +53,8 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - Every test runs in its own simulation (`run_all_in_same_sim` is ignored).
 - No test history; no seed "repeat"; no xUnit/JUnit reports; no elaborate-only mode; no `pre_config`/`post_check` hooks.
 - A test that never started counts as failed (VUnit: skipped).
+- `runner_cfg` has no `run script path`, so `run_script_path(runner_cfg)` is empty. Tests of a simulation start in name order. A test cancelled before it started keeps its previous result.
+- The compile set includes the files declaring the VHDL configurations that runs elaborate. VUnit's `--minimal` compiles only the testbench files and their dependencies, which misses them.
 - Recompilation uses compile keys instead of timestamps. Independent libraries compile in parallel and continue after unrelated failures.
 - Duplicate tests, invalid attributes, and testbenches with no or several architectures disable only the affected testbench instead of aborting. Configuration errors (duplicate or empty names, invalid attributes) skip only that configuration.
 - Testcase patterns are case-insensitive on all platforms (Python's `fnmatch` is case-insensitive only on Windows).
@@ -67,4 +69,4 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - com is always added from VHDL-2008 on, and left out for older standards instead of raising an error.
 - In file patterns, `*` also matches hidden files, and `risim-out/` and `.git/` directories are never searched. Files with unknown extensions are skipped with a warning instead of raising an error.
 - Testcase names keep the case of the entity declaration; `VUnit` uses the lowercase entity name. Test names that differ only in case produce a warning.
-- Test configurations are declarative: each `TestConfigSpec` first sets its generics in all configurations of its target, then adds its configurations as copies of the target's default configuration. Generic names are compared case-insensitively, and generics of a configuration that the entity doesn't declare produce a warning and are skipped (`VUnit` sets them silently). A `fail_on_warning` attribute of a configuration only affects that configuration instead of the whole testbench.
+- Test configurations are declarative: each `TestConfigSpec` first sets its generics, simulation options and VHDL configuration in all configurations of its target, then adds its configurations as copies of the target's default configuration. Generic names are compared case-insensitively, and generics of a configuration that the entity doesn't declare produce a warning and are skipped (`VUnit` sets them silently). A `fail_on_warning` attribute of a configuration only affects that configuration instead of the whole testbench.

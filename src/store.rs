@@ -22,6 +22,7 @@
 //! AI NOTICE: Generated, minimally reviewed.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::fs::File;
 use std::fs::TryLockError;
@@ -30,6 +31,8 @@ use std::io::Read as _;
 use std::io::Seek as _;
 use std::io::Write;
 use std::process;
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -109,6 +112,90 @@ impl OutputLayout {
     /// The last test results.
     pub fn results_file(&self) -> Utf8PathBuf {
         self.root.join("results.json")
+    }
+
+    /// The parent directory of all test output directories.
+    pub fn test_output_root(&self) -> Utf8PathBuf {
+        self.root.join("test_output")
+    }
+
+    /// The output directory of `testcase`: `<safe-name>_<hash>`.
+    ///
+    /// The safe name replaces every character except `[A-Za-z0-9._]` with `_`. On Windows, it is
+    /// shortened like `VUnit` does, so that paths stay below 260 characters with a margin of 100
+    /// characters for the files inside.
+    pub fn test_output_dir(&self, testcase: &str) -> Utf8PathBuf {
+        let root = self.test_output_root();
+        let max_safe_len = if cfg!(windows) {
+            const MAX_PATH: usize = 260;
+            const MARGIN: usize = 100;
+            const HASH_LEN: usize = 16;
+            // `VUnit` measures the root without the separator before the directory name.
+            Some(MAX_PATH.saturating_sub(MARGIN + root.as_str().len() + HASH_LEN))
+        } else {
+            None
+        };
+        root.join(test_output_name(testcase, max_safe_len))
+    }
+}
+
+/// The name of a test output directory: the safe name, `_`, and the short hash of `testcase`.
+/// The safe name and its `_` are cut to `max_safe_len` characters.
+fn test_output_name(testcase: &str, max_safe_len: Option<usize>) -> String {
+    let mut name: String = testcase
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    name.push('_');
+    if let Some(max) = max_safe_len {
+        // The safe name is ASCII, so any length is a character boundary.
+        name.truncate(max);
+    }
+    name.push_str(&short_hash(testcase));
+    name
+}
+
+/// The files of a test output directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TestOutputPaths {
+    /// The directory, passed to the testbench as `output path`.
+    pub dir: Utf8PathBuf,
+    /// The simulator output (stdout and stderr).
+    pub output_file: Utf8PathBuf,
+    /// The file the `VUnit` runner writes its progress to.
+    pub results_file: Utf8PathBuf,
+}
+
+impl TestOutputPaths {
+    /// The paths for `testcase`.
+    pub fn new(layout: &OutputLayout, testcase: &str) -> Self {
+        let dir = layout.test_output_dir(testcase);
+        let output_file = dir.join("output.txt");
+        let results_file = dir.join("vunit_results");
+        Self {
+            dir,
+            output_file,
+            results_file,
+        }
+    }
+
+    /// Recreates the directory empty, with an empty results file, as `VUnit`'s
+    /// `_prepare_test_suite_output_path` and `TestRun.run` do.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the directory can't be deleted or created.
+    pub fn prepare(&self) -> io::Result<()> {
+        remove_path(&self.dir)?;
+        fs::create_dir_all(&self.dir)?;
+        File::create(&self.results_file)?;
+        Ok(())
     }
 }
 
@@ -487,6 +574,145 @@ impl CompileState {
     }
 }
 
+// -------------------------------------------------------------------------------------------------
+// Test results
+// -------------------------------------------------------------------------------------------------
+
+/// How a test ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestOutcome {
+    /// The test passed.
+    Passed,
+    /// The test failed, didn't start, or the simulation couldn't be run.
+    Failed,
+    /// The test was cancelled.
+    Cancelled,
+}
+
+/// A point in time, in milliseconds since the Unix epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Timestamp(pub u64);
+
+impl Timestamp {
+    /// The current time.
+    pub fn now() -> Self {
+        Self::from_system_time(SystemTime::now())
+    }
+
+    /// Converts `time`; times before the Unix epoch become the epoch.
+    pub fn from_system_time(time: SystemTime) -> Self {
+        let millis = time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |since_epoch| since_epoch.as_millis());
+        Self(u64::try_from(millis).unwrap_or(u64::MAX))
+    }
+}
+
+/// The last result of a testcase.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestResult {
+    /// How the test ended.
+    pub outcome: TestOutcome,
+    /// When the simulator was started.
+    pub started_at: Timestamp,
+    /// When the test ended.
+    pub finished_at: Timestamp,
+    /// The simulator output file (`output.txt`).
+    pub output_path: Utf8PathBuf,
+}
+
+/// The last result of every testcase (`results.json`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TestResults {
+    /// The results by testcase name.
+    pub results: BTreeMap<String, TestResult>,
+}
+
+const RESULTS_VERSION: u32 = 1;
+
+impl TestResults {
+    /// Reads `results.json`; a missing or invalid file gives no results.
+    pub fn load(layout: &OutputLayout) -> Self {
+        read_json(&layout.results_file(), RESULTS_VERSION).unwrap_or_default()
+    }
+
+    /// Writes `results.json`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file can't be written.
+    pub fn save(&self, layout: &OutputLayout) -> io::Result<()> {
+        write_json(&layout.results_file(), RESULTS_VERSION, self)
+    }
+}
+
+/// The test results of a workspace, shared by concurrent simulations. Every change is written
+/// to `results.json` right away.
+#[derive(Debug)]
+pub struct ResultStore {
+    layout: OutputLayout,
+    results: Mutex<TestResults>,
+}
+
+impl ResultStore {
+    /// Loads the results of `layout`.
+    pub fn load(layout: &OutputLayout) -> Self {
+        Self {
+            layout: layout.clone(),
+            results: Mutex::new(TestResults::load(layout)),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, TestResults> {
+        // The results stay consistent even if a holder panicked: every change is one insert or
+        // retain.
+        self.results
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A copy of the current results.
+    pub fn snapshot(&self) -> BTreeMap<String, TestResult> {
+        self.lock().results.clone()
+    }
+
+    /// Records the result of `testcase` and saves the results.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `results.json` can't be written; the result is recorded in memory anyway.
+    pub fn record(&self, testcase: &str, result: TestResult) -> io::Result<()> {
+        let mut results = self.lock();
+        results.results.insert(testcase.to_owned(), result);
+        // Saving under the lock keeps concurrent writes in order.
+        results.save(&self.layout)
+    }
+
+    /// Drops the results of testcases that don't exist anymore, and saves the results if
+    /// that changed them.
+    ///
+    /// # Errors
+    ///
+    /// Fails if `results.json` can't be written.
+    pub fn retain_testcases<'name>(
+        &self,
+        testcases: impl IntoIterator<Item = &'name str>,
+    ) -> io::Result<()> {
+        let names: BTreeSet<&str> = testcases.into_iter().collect();
+        let mut results = self.lock();
+        let before = results.results.len();
+        results
+            .results
+            .retain(|name, _| names.contains(name.as_str()));
+        if results.results.len() == before {
+            return Ok(());
+        }
+        results.save(&self.layout)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,6 +778,89 @@ mod tests {
             output,
             layout.compile_output_file("Lib", Utf8Path::new("/ws/tb/a.vhd"))
         );
+    }
+
+    #[test]
+    fn test_output_names_are_safe_and_unique() {
+        let name = test_output_name("lib.tb.Test 1: a/b", None);
+        assert_eq!(
+            name,
+            format!("lib.tb.Test_1__a_b_{}", short_hash("lib.tb.Test 1: a/b"))
+        );
+        // Different names with the same safe name get different directories.
+        assert_ne!(name, test_output_name("lib.tb.Test_1__a_b", None));
+        // Non-ASCII characters become one `_` each.
+        assert!(test_output_name("lib.tb.ä", None).starts_with("lib.tb.__"));
+
+        let shortened = test_output_name("lib.tb.long test name", Some(4));
+        assert_eq!(
+            shortened,
+            format!("lib.{}", short_hash("lib.tb.long test name"))
+        );
+        assert_eq!(test_output_name("x", Some(0)), short_hash("x"));
+
+        let layout = OutputLayout::new(Utf8Path::new("/ws"));
+        let dir = layout.test_output_dir("lib.tb.t");
+        assert_eq!(dir.parent(), Some(layout.test_output_root().as_path()));
+        let paths = TestOutputPaths::new(&layout, "lib.tb.t");
+        assert_eq!(paths.output_file, dir.join("output.txt"));
+        assert_eq!(paths.results_file, dir.join("vunit_results"));
+    }
+
+    #[test]
+    fn prepare_recreates_the_output_directory() {
+        let temp = temp();
+        let layout = OutputLayout::new(&temp.root);
+        let paths = TestOutputPaths::new(&layout, "lib.tb.t");
+        fs::create_dir_all(&paths.dir).unwrap();
+        fs::write(paths.dir.join("stale.txt"), "old").unwrap();
+        fs::write(&paths.results_file, "test_suite_done\n").unwrap();
+        paths.prepare().unwrap();
+        assert!(!paths.dir.join("stale.txt").exists());
+        assert_eq!(fs::read(&paths.results_file).unwrap(), b"");
+    }
+
+    fn result(outcome: TestOutcome) -> TestResult {
+        TestResult {
+            outcome,
+            started_at: Timestamp(1_000),
+            finished_at: Timestamp(2_500),
+            output_path: "/ws/risim-out/test_output/x/output.txt".into(),
+        }
+    }
+
+    #[test]
+    fn result_store_saves_every_change() {
+        let temp = temp();
+        let layout = OutputLayout::new(&temp.root);
+        let store = ResultStore::load(&layout);
+        assert!(store.snapshot().is_empty());
+        store
+            .record("lib.tb.a", result(TestOutcome::Passed))
+            .unwrap();
+        store
+            .record("lib.tb.b", result(TestOutcome::Failed))
+            .unwrap();
+        store
+            .record("lib.tb.a", result(TestOutcome::Cancelled))
+            .unwrap();
+
+        let text = fs::read_to_string(layout.results_file()).unwrap();
+        assert!(
+            text.starts_with(
+                r#"{"version":1,"results":{"lib.tb.a":{"outcome":"cancelled","started_at":1000,"#
+            ),
+            "{text}"
+        );
+        let reloaded = ResultStore::load(&layout);
+        assert_eq!(reloaded.snapshot(), store.snapshot());
+        assert_eq!(reloaded.snapshot()["lib.tb.b"], result(TestOutcome::Failed));
+
+        reloaded
+            .retain_testcases(["lib.tb.b", "lib.tb.new"])
+            .unwrap();
+        assert_eq!(reloaded.snapshot().keys().collect::<Vec<_>>(), ["lib.tb.b"]);
+        assert_eq!(TestResults::load(&layout).results.len(), 1);
     }
 
     #[test]

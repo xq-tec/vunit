@@ -322,6 +322,7 @@ fn testbench_configurations() {
             },
         ],
         generics: map(&[("global_value", "global value")]),
+        ..TestConfigSpec::default()
     }];
     let discovery = discover(&test.project, &configs);
     assert_eq!(
@@ -532,6 +533,45 @@ fn invalid_configuration_targets() {
          possible values are [runner_cfg]",
         ]
     );
+}
+
+#[test]
+fn sim_options_and_vhdl_configuration_of_a_target_apply_to_its_configurations() {
+    let mut test = TestProject::new();
+    test.add(
+        "/src/tb.vhd",
+        &testbench("tb_entity", "if run(\"Test 1\")\nif run(\"Test 2\")"),
+    );
+    let warning = SimOptions {
+        vhdl_assert_stop_level: Some(AssertLevel::Warning),
+        ..SimOptions::default()
+    };
+    let configs = [
+        TestConfigSpec {
+            target: "lib.tb_entity".to_owned(),
+            vhdl_configuration_name: Some("cfg1".to_owned()),
+            ..TestConfigSpec::default()
+        },
+        TestConfigSpec {
+            target: "lib.tb_entity.Test 2".to_owned(),
+            configurations: vec![ConfigurationSpec {
+                name: "copy".to_owned(),
+                ..ConfigurationSpec::default()
+            }],
+            sim_options: warning.clone(),
+            ..TestConfigSpec::default()
+        },
+    ];
+    let discovery = discover(&test.project, &configs);
+    assert_eq!(discovery.config_diagnostics, []);
+    let configuration = |name: &str| &discovery.run(name).unwrap().configuration;
+    let first = configuration("lib.tb_entity.Test 1");
+    assert_eq!(first.vhdl_configuration_name.as_deref(), Some("cfg1"));
+    assert_eq!(first.sim_options, SimOptions::default());
+    // The added configuration copies the default one, including the options set before.
+    let copy = configuration("lib.tb_entity.copy.Test 2");
+    assert_eq!(copy.vhdl_configuration_name.as_deref(), Some("cfg1"));
+    assert_eq!(copy.sim_options, warning);
 }
 
 #[test]

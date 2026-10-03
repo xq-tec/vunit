@@ -713,8 +713,9 @@ fn bench_state(
     Some(bench)
 }
 
-/// Applies one [`TestConfigSpec`]: first its generics to all configurations of the target, then
-/// its configurations, each starting as a copy of the target's default configuration.
+/// Applies one [`TestConfigSpec`]: first its generics, simulation options and VHDL configuration
+/// to all configurations of the target, then its configurations, each starting as a copy of the
+/// target's default configuration.
 ///
 /// For a testbench target, every test gets the configurations. A configuration that can't be
 /// added to one of them (for example because a test already has one with that name) is added
@@ -784,6 +785,13 @@ fn apply_test_config(
                 warnings.push(warning);
                 break;
             }
+        }
+    }
+    for &index in &indices {
+        let set = &mut bench.configurations[index];
+        set.set_sim_options(&spec.sim_options);
+        if let Some(name) = &spec.vhdl_configuration_name {
+            set.set_vhdl_configuration_name(name);
         }
     }
     for configuration in &spec.configurations {

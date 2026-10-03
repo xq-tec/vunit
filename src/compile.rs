@@ -7,8 +7,9 @@
 //! Replaces `compile_source_files` of `sim_if/__init__.py` and the recompile logic of
 //! `project.py`:
 //!
-//! - **Compile set:** the testbench files and everything they need, following implementation
-//!   dependencies. Files no testbench uses aren't compiled.
+//! - **Compile set:** the testbench files, the VHDL configurations that runs elaborate, and
+//!   everything they need, following implementation dependencies. Files no testbench uses
+//!   aren't compiled.
 //! - **Recompile decision:** every file gets a compile key, a Merkle-style hash over its
 //!   contents, standard, options, the simulator identity and the keys of its direct
 //!   dependencies. A file is compiled if its stored key differs, its library directory is
@@ -49,6 +50,7 @@ use crate::process;
 use crate::project::FileId;
 use crate::project::LibraryId;
 use crate::project::Project;
+use crate::project::UnitKind;
 use crate::simulator::CompileArgs;
 use crate::simulator::Simulator;
 use crate::simulator::SimulatorIdentity;
@@ -64,13 +66,31 @@ use crate::vhdl_standard::VhdlStandard;
 #[cfg(test)]
 mod tests;
 
-/// The files a compile starts from: the entity and architecture files of all testbenches.
-pub fn targets(discovery: &Discovery) -> Vec<FileId> {
+/// The files a compile starts from.
+///
+/// These are the entity and architecture files of all testbenches, and the files declaring the
+/// VHDL configurations that runs elaborate. Nothing depends on a configuration declaration, so
+/// it must be a target itself.
+pub fn targets(project: &Project, discovery: &Discovery) -> Vec<FileId> {
     let mut seen = FxHashSet::default();
-    discovery
+    let testbench_files = discovery
         .testbenches
         .iter()
-        .flat_map(|testbench| [testbench.entity_file, testbench.architecture_file])
+        .flat_map(|testbench| [testbench.entity_file, testbench.architecture_file]);
+    let configuration_files = discovery.runs.iter().filter_map(|run| {
+        let name = run.configuration.vhdl_configuration_name.as_deref()?;
+        let library = discovery.testbenches.get(run.testbench)?.library;
+        let unit = project
+            .library(library)
+            .primary_unit(&name.to_ascii_lowercase())
+            .filter(|unit| unit.kind == UnitKind::Configuration);
+        if unit.is_none() {
+            tracing::debug!(name, "VHDL configuration not found");
+        }
+        unit.map(|unit| unit.file)
+    });
+    testbench_files
+        .chain(configuration_files)
         .filter(|&file| seen.insert(file))
         .collect()
 }
@@ -217,15 +237,7 @@ impl CompilePlan {
     /// Adds the files of `order` with their compile keys and commands.
     fn add_files(&mut self, input: &PlanInput<'_>, state: &CompileState, order: &[FileId]) {
         let project = input.project;
-        let library_dirs: Vec<Utf8PathBuf> = project
-            .libraries()
-            .map(|(_, library)| {
-                library
-                    .external_path
-                    .clone()
-                    .unwrap_or_else(|| input.layout.library_dir(&library.name))
-            })
-            .collect();
+        let library_dirs = library_dirs(project, input.layout);
         let simulator_hash = identity_hash(input.simulator.identity());
         let positions: FxHashMap<FileId, usize> = order
             .iter()
@@ -367,6 +379,19 @@ impl CompilePlan {
             })
             .collect();
     }
+}
+
+/// The directories of all libraries, passed to the simulator with `-P`.
+pub(crate) fn library_dirs(project: &Project, layout: &OutputLayout) -> Vec<Utf8PathBuf> {
+    project
+        .libraries()
+        .map(|(_, library)| {
+            library
+                .external_path
+                .clone()
+                .unwrap_or_else(|| layout.library_dir(&library.name))
+        })
+        .collect()
 }
 
 fn file_key(project: &Project, id: FileId, path: &Utf8Path) -> FileKey {

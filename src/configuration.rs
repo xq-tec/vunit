@@ -215,6 +215,13 @@ impl ConfigurationSet {
         }
     }
 
+    /// Sets the VHDL configuration to elaborate in all configurations.
+    pub fn set_vhdl_configuration_name(&mut self, name: &str) {
+        for configuration in &mut self.configurations {
+            configuration.vhdl_configuration_name = Some(name.to_owned());
+        }
+    }
+
     /// Adds a configuration that starts as a copy of the default configuration
     /// (`ConfigurationVisitor.add_config`).
     ///

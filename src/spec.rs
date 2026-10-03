@@ -259,6 +259,10 @@ pub struct TestConfigSpec {
     /// Generics set in all configurations of the target before `configurations` are added, so
     /// the added configurations inherit them.
     pub generics: BTreeMap<String, String>,
+    /// Simulation options set in all configurations of the target, like `generics`.
+    pub sim_options: SimOptions,
+    /// A VHDL configuration to elaborate in all configurations of the target, like `generics`.
+    pub vhdl_configuration_name: Option<String>,
 }
 
 /// A named configuration of a testbench or test.

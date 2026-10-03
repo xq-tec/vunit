@@ -17,6 +17,18 @@
 //!   - `-- fake: sleep <ms>`: sleep;
 //!   - `-- fake: hang`: sleep for an hour;
 //!   - `-- fake: spawn-sleeper <file>`: start a sleeping grandchild and write its PID to `file`.
+//! - `--elab-run … --name=<testcase>` "simulates" the testcase: it appends `simstart <testcase>`
+//!   and `simend <testcase>` to the log, writes its arguments to `args.txt` in the output path
+//!   from `runner_cfg`, and follows the directives for the testcase in `fake-sim.txt` in the
+//!   working directory (lines `<testcase>\t<directive>`), in order:
+//!   - `fail`: the test starts but the suite doesn't complete, exit code 1;
+//!   - `no-results`: don't write `vunit_results`;
+//!   - `exit <code>`: set the exit code;
+//!   - `print <text>`: print `text` to stdout;
+//!   - `sleep <ms>`, `hang`: as for `-a`.
+//!
+//!   Without `fail` or `no-results`, the enabled test passes: `vunit_results` records its start
+//!   and the end of the suite.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -40,6 +52,9 @@ pub const ENV: &str = "RISIM_FAKE_GHDL";
 /// The log file in the working directory.
 pub const LOG: &str = "fake-ghdl.log";
 
+/// The simulation directives in the working directory.
+pub const SIM_DIRECTIVES: &str = "fake-sim.txt";
+
 pub fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -53,6 +68,7 @@ pub fn main() -> ExitCode {
             ExitCode::SUCCESS
         },
         Some("-a") => analyse(&args[1..]),
+        Some("--elab-run") => simulate(&args[1..]),
         _ => {
             eprintln!("fake risim-ghdl: unsupported arguments {args:?}");
             ExitCode::from(2)
@@ -115,5 +131,100 @@ fn analyse(args: &[String]) -> ExitCode {
         }
     }
     log(&format!("end {work} {name}"));
+    ExitCode::from(code)
+}
+
+/// Decodes `VUnit`'s dictionary encoding (`encode_dict`).
+fn decode_dict(encoded: &str) -> Vec<(String, String)> {
+    let mut entries = Vec::new();
+    let mut entry = String::new();
+    let mut chars = encoded.chars().peekable();
+    let mut push = |current: &mut String| {
+        if let Some((key, value)) = current.split_once(" : ") {
+            let unescape = |text: &str| text.replace("::", ":");
+            entries.push((unescape(key), unescape(value)));
+        }
+        current.clear();
+    };
+    while let Some(ch) = chars.next() {
+        if ch == ',' {
+            if chars.peek() == Some(&',') {
+                chars.next();
+                entry.push(',');
+            } else {
+                push(&mut entry);
+            }
+        } else {
+            entry.push(ch);
+        }
+    }
+    push(&mut entry);
+    entries
+}
+
+fn simulate(args: &[String]) -> ExitCode {
+    let name = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("--name="))
+        .unwrap_or("?")
+        .to_owned();
+    log(&format!("simstart {name}"));
+    let runner_cfg = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix("-grunner_cfg="))
+        .map(decode_dict)
+        .unwrap_or_default();
+    let value = |key: &str| {
+        runner_cfg
+            .iter()
+            .find(|(candidate, _)| candidate == key)
+            .map(|(_, value)| value.clone())
+            .unwrap_or_default()
+    };
+    let output_path = value("output path");
+    fs::write(format!("{output_path}args.txt"), args.join("\n")).expect("write args.txt");
+
+    let directives = fs::read_to_string(SIM_DIRECTIVES).unwrap_or_default();
+    let mut code = 0;
+    let mut results = true;
+    let mut suite_done = true;
+    for directive in directives.lines().filter_map(|line| {
+        let (testcase, directive) = line.split_once('\t')?;
+        (testcase == name).then_some(directive)
+    }) {
+        let (command, argument) = directive.split_once(' ').unwrap_or((directive, ""));
+        match command {
+            "fail" => {
+                suite_done = false;
+                code = 1;
+            },
+            "no-results" => results = false,
+            "exit" => code = argument.parse().unwrap_or(1),
+            "print" => println!("{argument}"),
+            "sleep" => thread::sleep(Duration::from_millis(argument.parse().unwrap_or(0))),
+            "hang" => thread::sleep(Duration::from_secs(3600)),
+            _ => eprintln!("fake risim-ghdl: unknown directive {directive}"),
+        }
+    }
+    if results {
+        // The enabled test is still encoded with `encode_test_case`.
+        let enabled = value("enabled_test_cases").replace(",,", ",");
+        let mut contents = String::new();
+        if !enabled.is_empty() {
+            contents.push_str("test_start:");
+            contents.push_str(&enabled);
+            contents.push('\n');
+        }
+        if suite_done {
+            contents.push_str("test_suite_done\n");
+        }
+        let mut file = fs::File::options()
+            .append(true)
+            .open(format!("{output_path}vunit_results"))
+            .expect("open vunit_results");
+        file.write_all(contents.as_bytes())
+            .expect("write vunit_results");
+    }
+    log(&format!("simend {name}"));
     ExitCode::from(code)
 }

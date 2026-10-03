@@ -2,16 +2,17 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! Integration tests of compile operations.
+//! Integration tests of compile and simulation operations.
 //!
 //! The binary doubles as a fake risim-ghdl (see `fake_ghdl.rs`), so the tests run everywhere
-//! without a simulator. The trial `real_risim_ghdl_compiles_examples` uses the risim-ghdl named
-//! by `RISIM_GHDL` and is ignored without it.
+//! without a simulator. The trials `real_risim_ghdl_*` use the risim-ghdl named by `RISIM_GHDL`
+//! and are ignored without it.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
 mod fake_ghdl;
 
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::future::Future;
@@ -38,13 +39,28 @@ use risim_vunit_frontend::compile::FileStatus;
 use risim_vunit_frontend::compile::PlanInput;
 use risim_vunit_frontend::diagnostics::Severity;
 use risim_vunit_frontend::discovery;
+use risim_vunit_frontend::runner;
+use risim_vunit_frontend::runner::SimulationContext;
+use risim_vunit_frontend::runner::SimulationEvent;
+use risim_vunit_frontend::runner::SimulationInput;
+use risim_vunit_frontend::runner::SimulationPlan;
+use risim_vunit_frontend::runner::SimulationReport;
+use risim_vunit_frontend::runner::SimulationRequest;
 use risim_vunit_frontend::simulator::Simulator;
 use risim_vunit_frontend::sources;
 use risim_vunit_frontend::sources::SourceCache;
+use risim_vunit_frontend::spec::AssertLevel;
+use risim_vunit_frontend::spec::ConfigurationSpec;
 use risim_vunit_frontend::spec::Feature;
 use risim_vunit_frontend::spec::ProjectSpec;
+use risim_vunit_frontend::spec::SimOptions;
+use risim_vunit_frontend::spec::TestConfigSpec;
 use risim_vunit_frontend::store::CompileState;
 use risim_vunit_frontend::store::OutputLayout;
+use risim_vunit_frontend::store::ResultStore;
+use risim_vunit_frontend::store::TestOutcome;
+use risim_vunit_frontend::store::TestOutputPaths;
+use risim_vunit_frontend::store::TestResults;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -96,8 +112,30 @@ fn main() -> ExitCode {
             detect_rejects_other_programs,
         ),
         trial(
+            "simulates_and_records_results",
+            simulates_and_records_results,
+        ),
+        trial(
+            "non_zero_exit_code_fails_a_passed_test",
+            non_zero_exit_code_fails_a_passed_test,
+        ),
+        trial("semaphore_limits_simulations", semaphore_limits_simulations),
+        trial(
+            "cancel_terminates_and_skips_simulations",
+            cancel_terminates_and_skips_simulations,
+        ),
+        trial(
+            "simulation_spawn_failure_fails_the_test",
+            simulation_spawn_failure_fails_the_test,
+        ),
+        trial(
             "real_risim_ghdl_compiles_examples",
             real_risim_ghdl_compiles_examples,
+        )
+        .with_ignored_flag(env::var_os("RISIM_GHDL").is_none()),
+        trial(
+            "real_risim_ghdl_runs_artificial",
+            real_risim_ghdl_runs_artificial,
         )
         .with_ignored_flag(env::var_os("RISIM_GHDL").is_none()),
     ];
@@ -158,6 +196,36 @@ impl Run {
             .into_iter()
             .filter(|&(_, file_status)| file_status == status)
             .map(|(name, _)| name)
+            .collect()
+    }
+}
+
+/// The result of a simulation, with its events.
+struct SimRun {
+    report: SimulationReport,
+    events: Vec<SimulationEvent>,
+}
+
+impl SimRun {
+    fn outcomes(&self) -> Vec<(&str, TestOutcome)> {
+        self.report
+            .outcomes
+            .iter()
+            .map(|(name, outcome)| (name.as_str(), *outcome))
+            .collect()
+    }
+
+    /// The events without diagnostics, as `(kind, testcase)`.
+    fn event_names(&self) -> Vec<(&'static str, String)> {
+        self.events
+            .iter()
+            .filter_map(|event| match event {
+                SimulationEvent::Started { .. } => Some(("started", String::new())),
+                SimulationEvent::TestStarted { name, .. } => Some(("test_started", name.clone())),
+                SimulationEvent::TestFinished { name, .. } => Some(("test_finished", name.clone())),
+                SimulationEvent::Finished { .. } => Some(("finished", String::new())),
+                SimulationEvent::Diagnostic(_) => None,
+            })
             .collect()
     }
 }
@@ -247,7 +315,7 @@ impl Workspace {
         };
         assert_eq!(loaded.config_diagnostics, [], "config diagnostics");
         let found = discovery::discover(&loaded.project, &self.spec.test_configs);
-        let targets = compile::targets(&found);
+        let targets = compile::targets(&loaded.project, &found);
 
         let (events, mut receiver) = mpsc::unbounded_channel();
         let cancel = CancellationToken::new();
@@ -283,6 +351,82 @@ impl Workspace {
             report,
             events: collector.await.expect("collector"),
         }
+    }
+
+    /// Discovers the testcases and simulates those matching `requests` (`(pattern, gui)`),
+    /// cancelling as soon as an event satisfies `cancel_on`.
+    async fn simulate_until(
+        &self,
+        requests: &[(&str, bool)],
+        results: &Arc<ResultStore>,
+        cancel_on: impl Fn(&SimulationEvent) -> bool + Send + 'static,
+    ) -> SimRun {
+        let loaded = {
+            let mut cache = SOURCE_CACHE.lock().expect("cache lock");
+            sources::build_project(&self.root, &self.spec, &BUILTINS, &mut cache)
+        };
+        assert_eq!(loaded.config_diagnostics, [], "config diagnostics");
+        let found = discovery::discover(&loaded.project, &self.spec.test_configs);
+        let requests: Vec<SimulationRequest> = requests
+            .iter()
+            .map(|&(pattern, gui)| SimulationRequest {
+                pattern: pattern.to_owned(),
+                gui,
+            })
+            .collect();
+        let plan = SimulationPlan::new(
+            &SimulationInput {
+                layout: &self.layout,
+                project: &loaded.project,
+                discovery: &found,
+                sim_options: &self.spec.sim_options,
+            },
+            &requests,
+        );
+
+        let (events, mut receiver) = mpsc::unbounded_channel();
+        let cancel = CancellationToken::new();
+        let collector = {
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                let mut collected = Vec::new();
+                while let Some(event) = receiver.recv().await {
+                    if cancel_on(&event) {
+                        cancel.cancel();
+                    }
+                    collected.push(event);
+                }
+                collected
+            })
+        };
+        let context = SimulationContext {
+            workspace_root: self.root.clone(),
+            simulator: self.simulator.clone(),
+            semaphore: Arc::clone(&self.semaphore),
+            results: Arc::clone(results),
+            events,
+            cancel,
+        };
+        let report = runner::simulate(plan, &context).await;
+        drop(context);
+        SimRun {
+            report,
+            events: collector.await.expect("collector"),
+        }
+    }
+
+    async fn simulate(&self, requests: &[(&str, bool)], results: &Arc<ResultStore>) -> SimRun {
+        self.simulate_until(requests, results, |_| false).await
+    }
+
+    /// Adds a directive for `testcase` to the fake simulator.
+    fn sim_directive(&self, testcase: &str, directive: &str) {
+        let path = self.root.join(fake_ghdl::SIM_DIRECTIVES);
+        let mut directives = fs::read_to_string(&path).unwrap_or_default();
+        for part in [testcase, "\t", directive, "\n"] {
+            directives.push_str(part);
+        }
+        fs::write(&path, directives).expect("write the directives");
     }
 
     /// Returns and clears the log of the fake simulator.
@@ -641,6 +785,276 @@ async fn detect_rejects_other_programs() {
     }
 }
 
+/// `lib` with a testbench with three explicit tests and one without explicit tests.
+fn simulation_project(workspace: &mut Workspace) {
+    workspace.write(
+        "tb/tb_tests.vhd",
+        "entity tb_tests is generic (runner_cfg : string; output_path : string); end entity;\n\
+         architecture tb of tb_tests is\nbegin\n  main : process\n  begin\n    \
+         test_runner_setup(runner, runner_cfg);\n    \
+         if run(\"pass\") then\n    elsif run(\"fail, really\") then\n    \
+         elsif run(\"slow\") then\n    end if;\n    test_runner_cleanup(runner);\n  \
+         end process;\nend architecture;\n",
+    );
+    workspace.write("tb/tb_implicit.vhd", &testbench("tb_implicit", ""));
+    workspace.spec.add_library("lib", ["tb/*.vhd"]);
+}
+
+#[expect(clippy::too_many_lines, reason = "one scenario with many checks")]
+async fn simulates_and_records_results() {
+    let mut workspace = Workspace::new().await;
+    simulation_project(&mut workspace);
+    workspace.spec.sim_options.seed = Some("0123456789abcdef".to_owned());
+    workspace.sim_directive("lib.tb_tests.fail, really", "print it broke");
+    workspace.sim_directive("lib.tb_tests.fail, really", "fail");
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    let run = workspace
+        .simulate(
+            &[
+                ("lib.tb_tests.*", false),
+                ("*.ALL", true),
+                ("missing", false),
+            ],
+            &results,
+        )
+        .await;
+    assert_eq!(
+        run.outcomes(),
+        [
+            ("lib.tb_implicit.all", TestOutcome::Passed),
+            ("lib.tb_tests.fail, really", TestOutcome::Failed),
+            ("lib.tb_tests.pass", TestOutcome::Passed),
+            ("lib.tb_tests.slow", TestOutcome::Passed),
+        ]
+    );
+    assert_eq!(run.report.diagnostics.len(), 1);
+    assert_eq!(
+        run.report.diagnostics[0].message,
+        "no testcase matches 'missing'"
+    );
+
+    // Every test starts before it finishes; the whole run is bracketed.
+    let names = run.event_names();
+    assert_eq!(names.first().map(|(kind, _)| *kind), Some("started"));
+    assert_eq!(names.last().map(|(kind, _)| *kind), Some("finished"));
+    for (name, _) in run.outcomes() {
+        let position = |kind| {
+            names
+                .iter()
+                .position(|(event_kind, event_name)| *event_kind == kind && event_name == name)
+                .expect("event")
+        };
+        assert!(
+            position("test_started") < position("test_finished"),
+            "{name}"
+        );
+    }
+    assert!(run.events.iter().any(|event| matches!(
+        event,
+        SimulationEvent::Finished {
+            passed: 3,
+            failed: 1,
+            cancelled: 0
+        }
+    )));
+    assert!(matches!(
+        &run.events[0],
+        SimulationEvent::Started { testcases } if testcases.len() == 4
+    ));
+
+    // The output file starts with the seed and holds the simulator output.
+    let fail_paths = TestOutputPaths::new(&workspace.layout, "lib.tb_tests.fail, really");
+    let output = fs::read_to_string(&fail_paths.output_file).expect("output.txt");
+    assert!(
+        output.starts_with("Seed for lib.tb_tests.fail, really: 0123456789abcdef\n"),
+        "{output}"
+    );
+    assert!(output.contains("it broke"), "{output}");
+    assert_eq!(
+        fs::read_to_string(&fail_paths.results_file).expect("vunit_results"),
+        "test_start:fail, really\n"
+    );
+
+    // The command line: `runner_cfg`, the filled `output_path` generic, and GUI mode.
+    let args = |testcase: &str| {
+        let paths = TestOutputPaths::new(&workspace.layout, testcase);
+        fs::read_to_string(paths.dir.join("args.txt")).expect("args.txt")
+    };
+    let pass_args = args("lib.tb_tests.pass");
+    let pass_dir = TestOutputPaths::new(&workspace.layout, "lib.tb_tests.pass").dir;
+    assert!(
+        pass_args.contains(&format!("-goutput_path={pass_dir}/")),
+        "{pass_args}"
+    );
+    assert!(
+        pass_args.contains("enabled_test_cases : pass,"),
+        "{pass_args}"
+    );
+    assert!(pass_args.contains("seed : 0123456789abcdef"), "{pass_args}");
+    assert!(
+        pass_args.contains("--name=lib.tb_tests.pass"),
+        "{pass_args}"
+    );
+    assert!(!pass_args.contains("--wait"), "{pass_args}");
+    assert!(args("lib.tb_tests.fail, really").contains("enabled_test_cases : fail,,,, really,"));
+    let implicit_args = args("lib.tb_implicit.all");
+    assert!(implicit_args.contains("--wait"), "{implicit_args}");
+    assert!(
+        implicit_args.contains("enabled_test_cases : ,"),
+        "{implicit_args}"
+    );
+
+    // The results are persisted.
+    let saved = TestResults::load(&workspace.layout).results;
+    assert_eq!(saved.len(), 4);
+    let failed = &saved["lib.tb_tests.fail, really"];
+    assert_eq!(failed.outcome, TestOutcome::Failed);
+    assert_eq!(failed.output_path, fail_paths.output_file);
+    assert!(failed.started_at <= failed.finished_at);
+
+    // A rerun replaces the output directory.
+    let stale = fail_paths.dir.join("stale.txt");
+    fs::write(&stale, "").expect("write");
+    let rerun = workspace.simulate(&[("*fail*", false)], &results).await;
+    assert_eq!(
+        rerun.outcomes(),
+        [("lib.tb_tests.fail, really", TestOutcome::Failed)]
+    );
+    assert!(!stale.exists());
+}
+
+async fn non_zero_exit_code_fails_a_passed_test() {
+    let mut workspace = Workspace::new().await;
+    simulation_project(&mut workspace);
+    workspace.sim_directive("lib.tb_tests.pass", "exit 3");
+    workspace.sim_directive("lib.tb_implicit.all", "no-results");
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    let run = workspace
+        .simulate(&[("*.pass", false), ("*.all", false)], &results)
+        .await;
+    assert_eq!(
+        run.outcomes(),
+        [
+            ("lib.tb_implicit.all", TestOutcome::Failed),
+            ("lib.tb_tests.pass", TestOutcome::Failed),
+        ]
+    );
+    assert_eq!(run.report.diagnostics, []);
+}
+
+async fn semaphore_limits_simulations() {
+    let mut workspace = Workspace::new().await;
+    workspace.semaphore = Arc::new(Semaphore::new(2));
+    simulation_project(&mut workspace);
+    for test in ["pass", "fail, really", "slow"] {
+        workspace.sim_directive(&format!("lib.tb_tests.{test}"), "sleep 300");
+    }
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    let run = workspace
+        .simulate(&[("lib.tb_tests.*", false)], &results)
+        .await;
+    assert_eq!(run.report.count(TestOutcome::Passed), 3);
+    let mut running: i32 = 0;
+    let mut max_running = 0;
+    for line in workspace.take_log() {
+        if line.starts_with("simstart") {
+            running += 1;
+        } else if line.starts_with("simend") {
+            running -= 1;
+        }
+        max_running = max_running.max(running);
+    }
+    assert_eq!(max_running, 2);
+}
+
+async fn cancel_terminates_and_skips_simulations() {
+    let mut workspace = Workspace::new().await;
+    workspace.semaphore = Arc::new(Semaphore::new(1));
+    simulation_project(&mut workspace);
+    workspace.sim_directive("lib.tb_tests.fail, really", "hang");
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    let first = workspace
+        .simulate(&[("lib.tb_tests.slow", false)], &results)
+        .await;
+    assert_eq!(
+        first.outcomes(),
+        [("lib.tb_tests.slow", TestOutcome::Passed)]
+    );
+    let previous = results.snapshot()["lib.tb_tests.slow"].clone();
+    workspace.take_log();
+
+    let started = Instant::now();
+    let run = workspace
+        .simulate_until(
+            &[("lib.tb_tests.fail*", false), ("lib.tb_tests.slow", false)],
+            &results,
+            |event| matches!(event, SimulationEvent::TestStarted { name, .. } if name.contains("fail")),
+        )
+        .await;
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(
+        run.outcomes(),
+        [
+            ("lib.tb_tests.fail, really", TestOutcome::Cancelled),
+            ("lib.tb_tests.slow", TestOutcome::Cancelled),
+        ]
+    );
+    assert!(run.events.iter().any(|event| matches!(
+        event,
+        SimulationEvent::Finished {
+            passed: 0,
+            failed: 0,
+            cancelled: 2
+        }
+    )));
+    // The test that never started has no `TestStarted` and keeps its previous result.
+    assert!(
+        !run.event_names()
+            .contains(&("test_started", "lib.tb_tests.slow".to_owned()))
+    );
+    assert!(
+        run.event_names()
+            .contains(&("test_finished", "lib.tb_tests.slow".to_owned()))
+    );
+    let saved = TestResults::load(&workspace.layout).results;
+    assert_eq!(saved["lib.tb_tests.slow"], previous);
+    assert_eq!(
+        saved["lib.tb_tests.fail, really"].outcome,
+        TestOutcome::Cancelled
+    );
+    // The hanging simulation may be killed before it logs its start, but never ends by itself.
+    let log = workspace.take_log();
+    assert!(
+        !log.iter().any(|line| line.starts_with("simend")),
+        "{log:?}"
+    );
+}
+
+async fn simulation_spawn_failure_fails_the_test() {
+    let mut workspace = Workspace::new().await;
+    simulation_project(&mut workspace);
+    let mut identity = workspace.simulator.identity().clone();
+    identity.path = workspace.root.join("missing-risim-ghdl");
+    workspace.simulator = Simulator::from_identity(identity).expect("valid identity");
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    let run = workspace.simulate(&[("*.pass", false)], &results).await;
+    assert_eq!(run.outcomes(), [("lib.tb_tests.pass", TestOutcome::Failed)]);
+    assert_eq!(run.report.diagnostics.len(), 1);
+    let message = &run.report.diagnostics[0].message;
+    assert!(
+        message.starts_with("lib.tb_tests.pass: failed to run risim-ghdl"),
+        "{message}"
+    );
+    let paths = TestOutputPaths::new(&workspace.layout, "lib.tb_tests.pass");
+    let output = fs::read_to_string(&paths.output_file).expect("output.txt");
+    assert!(output.contains("failed to run risim-ghdl"), "{output}");
+    assert!(
+        run.events
+            .iter()
+            .any(|event| matches!(event, SimulationEvent::Diagnostic(_)))
+    );
+}
+
 /// Compiles some `VUnit` examples with the real risim-ghdl, then recompiles after edits.
 #[expect(clippy::print_stderr, reason = "reports timings")]
 async fn real_risim_ghdl_compiles_examples() {
@@ -742,4 +1156,356 @@ async fn real_risim_ghdl_compiles_examples() {
         restored.with_status(FileStatus::Compiled),
         ["uart_tx.vhd", "tb_uart_tx.vhd"]
     );
+}
+
+// -------------------------------------------------------------------------------------------------
+// tests/acceptance/artificial/vhdl
+// -------------------------------------------------------------------------------------------------
+
+fn generics(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|&(name, value)| (name.to_owned(), value.to_owned()))
+        .collect()
+}
+
+fn target(target: &str) -> TestConfigSpec {
+    TestConfigSpec {
+        target: target.to_owned(),
+        ..TestConfigSpec::default()
+    }
+}
+
+fn config(name: &str) -> ConfigurationSpec {
+    ConfigurationSpec {
+        name: name.to_owned(),
+        ..ConfigurationSpec::default()
+    }
+}
+
+/// `tests/acceptance/artificial/vhdl/run.py` as a project spec, without hooks, test history,
+/// `scan_tests_from_file` and `add_package`.
+#[expect(clippy::too_many_lines, reason = "follows run.py function by function")]
+fn artificial_spec(spec: &mut ProjectSpec) {
+    let root =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/acceptance/artificial/vhdl");
+    let mut lib = Vec::new();
+    for entry in fs::read_dir(&root).expect("read artificial/vhdl") {
+        let path = Utf8PathBuf::from_path_buf(entry.expect("entry").path()).expect("UTF-8");
+        let name = path.file_name().unwrap_or_default();
+        // `tb_vunit_pkg` needs `add_package`, which isn't supported.
+        if path.extension() == Some("vhd")
+            && name != "tb_set_generic.vhd"
+            && name != "tb_vunit_pkg.vhd"
+        {
+            lib.push(path.to_string());
+        }
+    }
+    lib.sort();
+    spec.add_library("lib", lib)
+        .add_library("lib2", [root.join("tb_set_generic.vhd").to_string()]);
+
+    let configs = &mut spec.test_configs;
+    // configure_tb_with_generic_config
+    configs.push(TestConfigSpec {
+        generics: generics(&[("set_generic", "set-for-entity")]),
+        ..target("lib.tb_with_generic_config")
+    });
+    configs.push(TestConfigSpec {
+        configurations: vec![ConfigurationSpec {
+            generics: generics(&[("config_generic", "set-from-config")]),
+            ..config("cfg")
+        }],
+        ..target("lib.tb_with_generic_config.Test 1")
+    });
+    configs.push(TestConfigSpec {
+        generics: generics(&[("set_generic", "set-for-test")]),
+        ..target("lib.tb_with_generic_config.Test 2")
+    });
+    configs.push(TestConfigSpec {
+        configurations: vec![ConfigurationSpec {
+            generics: generics(&[
+                ("set_generic", "set-for-test"),
+                ("config_generic", "set-from-config"),
+            ]),
+            ..config("cfg")
+        }],
+        ..target("lib.tb_with_generic_config.Test 3")
+    });
+    configs.push(TestConfigSpec {
+        configurations: vec![ConfigurationSpec {
+            generics: generics(&[
+                ("set_generic", "set-from-config"),
+                ("config_generic", "set-from-config"),
+            ]),
+            ..config("cfg")
+        }],
+        ..target("lib.tb_with_generic_config.Test 4")
+    });
+    // configure_tb_same_sim_all_pass
+    configs.push(TestConfigSpec {
+        configurations: vec![config("cfg")],
+        ..target("lib.tb_same_sim_all_pass")
+    });
+    configs.push(TestConfigSpec {
+        configurations: vec![ConfigurationSpec {
+            attributes: generics(&[("run_all_in_same_sim", "true")]),
+            ..config("cfg")
+        }],
+        ..target("lib.tb_same_sim_from_python_all_pass")
+    });
+    // configure_tb_set_generic; risim-ghdl is GHDL, which can't override real and time generics.
+    let long_value = "0123456789abcdef".repeat(512);
+    configs.push(TestConfigSpec {
+        generics: generics(&[
+            ("is_ghdl", "True"),
+            ("true_boolean", "True"),
+            ("false_boolean", "False"),
+            ("negative_integer", "-10000"),
+            ("positive_integer", "99999"),
+            ("str_val", "4ns"),
+            ("str_space_val", "1 2 3"),
+            ("str_quote_val", "a\"b"),
+            ("str_long_num", "512"),
+            ("str_long_val", &long_value),
+        ]),
+        ..target("lib2.tb_set_generic")
+    });
+    // configure_tb_assert_stop_level
+    let levels = [
+        ("warning", AssertLevel::Warning),
+        ("error", AssertLevel::Error),
+        ("failure", AssertLevel::Failure),
+    ];
+    for (stop_level, level) in levels {
+        for (report_level, _) in levels {
+            configs.push(TestConfigSpec {
+                sim_options: SimOptions {
+                    vhdl_assert_stop_level: Some(level),
+                    ..SimOptions::default()
+                },
+                ..target(&format!(
+                    "lib.tb_assert_stop_level.Report {report_level} when VHDL assert stop level \
+                     = {stop_level}"
+                ))
+            });
+        }
+    }
+    // configure_tb_with_vhdl_configuration
+    configs.push(TestConfigSpec {
+        vhdl_configuration_name: Some("cfg1".to_owned()),
+        ..target("lib.tb_with_vhdl_configuration")
+    });
+    configs.push(TestConfigSpec {
+        vhdl_configuration_name: Some("cfg2".to_owned()),
+        configurations: vec![config("cfg2")],
+        ..target("lib.tb_with_vhdl_configuration.test 2")
+    });
+    configs.push(TestConfigSpec {
+        configurations: vec![ConfigurationSpec {
+            vhdl_configuration_name: Some("cfg3".to_owned()),
+            ..config("cfg3")
+        }],
+        ..target("lib.tb_with_vhdl_configuration.test 3")
+    });
+    // configure_tb_no_fail_on_warning
+    configs.push(TestConfigSpec {
+        configurations: vec![
+            ConfigurationSpec {
+                attributes: generics(&[("fail_on_warning", "False")]),
+                ..config("cfg1")
+            },
+            config("cfg2"),
+        ],
+        ..target("lib.tb_no_fail_on_warning")
+    });
+    // configure_tb_test_prio, without the `pre_config` hooks
+    configs.push(TestConfigSpec {
+        configurations: (1..=4)
+            .map(|index| config(&format!("test_{index}")))
+            .collect(),
+        ..target("lib.tb_test_prio_1")
+    });
+    configs.push(TestConfigSpec {
+        configurations: (1..=2)
+            .map(|index| config(&format!("test_{index}")))
+            .collect(),
+        ..target("lib.tb_test_prio_2")
+    });
+    configs.push(TestConfigSpec {
+        generics: generics(&[("g_val", "False")]),
+        ..target("lib.tb_no_generic_override")
+    });
+    configs.push(TestConfigSpec {
+        sim_options: SimOptions {
+            disable_ieee_warnings: Some(true),
+            ..SimOptions::default()
+        },
+        ..target("lib.tb_ieee_warning.pass")
+    });
+    // `set_attribute("fail_on_warning", True)` on the testbench.
+    configs.push(TestConfigSpec {
+        sim_options: SimOptions {
+            vhdl_assert_stop_level: Some(AssertLevel::Warning),
+            ..SimOptions::default()
+        },
+        ..target("lib.tb_fail_on_warning_from_python")
+    });
+}
+
+/// `EXPECTED_REPORT` of `test_artificial.py`, adapted to the intentional deviations.
+const ARTIFICIAL_EXPECTED: &[(&str, TestOutcome)] = {
+    use TestOutcome::Failed;
+    use TestOutcome::Passed;
+    &[
+        // `scan_tests_from_file` isn't supported, so the tests of `other_file_tests.vhd` aren't
+        // found; the testbench runs as one test without enabled tests, which passes.
+        ("lib.tb_other_file_tests.all", Passed),
+        ("lib.tb_pass.all", Passed),
+        ("lib.tb_fail.all", Failed),
+        ("lib.tb_infinite_events.all", Passed),
+        ("lib.tb_fail_on_warning.all", Failed),
+        ("lib.tb_fail_on_warning_from_python.all", Failed),
+        ("lib.tb_no_fail_on_warning.cfg1", Passed),
+        ("lib.tb_no_fail_on_warning.cfg2", Passed),
+        ("lib.tb_with_vhdl_runner.pass", Passed),
+        ("lib.tb_with_vhdl_runner.Test with spaces", Passed),
+        ("lib.tb_with_vhdl_runner.fail", Failed),
+        ("lib.tb_with_vhdl_runner.Test that timeouts", Failed),
+        // There is no run script, so `run_script_path(runner_cfg)` is empty.
+        ("lib.tb_magic_paths.all", Failed),
+        ("lib.tb_no_fail_after_cleanup.all", Passed),
+        ("lib.tb_elab_fail.all", Failed),
+        ("lib.tb_same_sim_all_pass.cfg.Test 1", Passed),
+        // Tests 2 and 3 rely on Test 1 running before them in the same simulation.
+        ("lib.tb_same_sim_all_pass.cfg.Test 2", Failed),
+        ("lib.tb_same_sim_all_pass.cfg.Test 3", Failed),
+        ("lib.tb_same_sim_some_fail.Test 1", Passed),
+        ("lib.tb_same_sim_some_fail.Test 2", Failed),
+        // Runs in its own simulation, so the failure of Test 2 doesn't skip it.
+        ("lib.tb_same_sim_some_fail.Test 3", Passed),
+        ("lib.tb_same_sim_from_python_all_pass.cfg.Test 1", Passed),
+        // Tests 2 and 3 rely on Test 1 running before them in the same simulation.
+        ("lib.tb_same_sim_from_python_all_pass.cfg.Test 2", Failed),
+        ("lib.tb_same_sim_from_python_all_pass.cfg.Test 3", Failed),
+        ("lib.tb_same_sim_from_python_some_fail.Test 1", Passed),
+        ("lib.tb_same_sim_from_python_some_fail.Test 2", Failed),
+        ("lib.tb_same_sim_from_python_some_fail.Test 3", Passed),
+        ("lib.tb_with_checks.Test passing check", Passed),
+        ("lib.tb_with_checks.Test failing check", Failed),
+        ("lib.tb_with_checks.Test non-stopping failing check", Failed),
+        ("lib2.tb_set_generic.all", Passed),
+        ("lib.tb_with_generic_config.Test 0", Passed),
+        ("lib.tb_with_generic_config.cfg.Test 1", Passed),
+        ("lib.tb_with_generic_config.Test 2", Passed),
+        ("lib.tb_with_generic_config.cfg.Test 3", Passed),
+        ("lib.tb_with_generic_config.cfg.Test 4", Passed),
+        ("lib.tb_no_generic_override.all", Passed),
+        ("lib.tb_ieee_warning.pass", Passed),
+        ("lib.tb_ieee_warning.fail", Failed),
+        (
+            "lib.tb_assert_stop_level.Report warning when VHDL assert stop level = warning",
+            Failed,
+        ),
+        (
+            "lib.tb_assert_stop_level.Report error when VHDL assert stop level = warning",
+            Failed,
+        ),
+        (
+            "lib.tb_assert_stop_level.Report failure when VHDL assert stop level = warning",
+            Failed,
+        ),
+        (
+            "lib.tb_assert_stop_level.Report warning when VHDL assert stop level = error",
+            Passed,
+        ),
+        (
+            "lib.tb_assert_stop_level.Report error when VHDL assert stop level = error",
+            Failed,
+        ),
+        (
+            "lib.tb_assert_stop_level.Report failure when VHDL assert stop level = error",
+            Failed,
+        ),
+        (
+            "lib.tb_assert_stop_level.Report warning when VHDL assert stop level = failure",
+            Passed,
+        ),
+        (
+            "lib.tb_assert_stop_level.Report error when VHDL assert stop level = failure",
+            Passed,
+        ),
+        (
+            "lib.tb_assert_stop_level.Report failure when VHDL assert stop level = failure",
+            Failed,
+        ),
+        ("lib.tb_with_vhdl_configuration.test 1", Passed),
+        ("lib.tb_with_vhdl_configuration.cfg2.test 2", Passed),
+        ("lib.tb_with_vhdl_configuration.cfg3.test 3", Passed),
+        // Without the `pre_config` hooks, the tests that VUnit fails there pass.
+        ("lib.tb_test_prio_1.test_1", Passed),
+        ("lib.tb_test_prio_1.test_2", Passed),
+        ("lib.tb_test_prio_1.test_3", Passed),
+        ("lib.tb_test_prio_1.test_4", Passed),
+        ("lib.tb_test_prio_2.test_1", Passed),
+        ("lib.tb_test_prio_2.test_2", Passed),
+        ("lib.tb_seed.test_1", Passed),
+        ("lib.tb_seed.test_2", Passed),
+    ]
+};
+
+/// Compiles and runs `tests/acceptance/artificial/vhdl` with the real risim-ghdl and compares
+/// the outcomes with `test_artificial.py`.
+#[expect(clippy::print_stderr, reason = "reports timings and failures")]
+async fn real_risim_ghdl_runs_artificial() {
+    let mut workspace = Workspace::new().await;
+    let ghdl = Utf8PathBuf::from(env::var("RISIM_GHDL").expect("RISIM_GHDL"));
+    workspace.simulator = Simulator::detect(&ghdl).await.expect("detect risim-ghdl");
+    let parallelism = thread::available_parallelism().map_or(4, NonZeroUsize::get);
+    workspace.semaphore = Arc::new(Semaphore::new(parallelism));
+    artificial_spec(&mut workspace.spec);
+
+    let started = Instant::now();
+    let compiled = workspace.compile(&mut CompileState::default()).await;
+    eprintln!("compile: {:?}", started.elapsed());
+    let errors: Vec<String> = compiled
+        .report
+        .diagnostics
+        .values()
+        .flatten()
+        .filter(|diagnostic| diagnostic.severity == Severity::Error)
+        .map(ToString::to_string)
+        .collect();
+    // `tb_elab_fail` fails only at elaboration.
+    assert_eq!(errors, Vec::<String>::new());
+    assert_eq!(compiled.report.status, CompileStatus::Succeeded);
+
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    let simulation_started = Instant::now();
+    let run = workspace.simulate(&[("*", false)], &results).await;
+    eprintln!("simulate: {:?}", simulation_started.elapsed());
+    assert_eq!(run.report.diagnostics, []);
+
+    let actual: BTreeMap<&str, TestOutcome> = run.outcomes().into_iter().collect();
+    let expected: BTreeMap<&str, TestOutcome> = ARTIFICIAL_EXPECTED.iter().copied().collect();
+    let mut mismatches = Vec::new();
+    let mut names: Vec<&str> = actual.keys().chain(expected.keys()).copied().collect();
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        let (actual_outcome, expected_outcome) = (actual.get(name), expected.get(name));
+        if actual_outcome != expected_outcome {
+            let output = TestOutputPaths::new(&workspace.layout, name).output_file;
+            let contents = fs::read_to_string(&output).unwrap_or_default();
+            let lines: Vec<&str> = contents.lines().collect();
+            let tail = lines[lines.len().saturating_sub(8)..].join("\n    ");
+            mismatches.push(format!(
+                "{name}: expected {expected_outcome:?}, got {actual_outcome:?}\n    {tail}"
+            ));
+        }
+    }
+    for mismatch in &mismatches {
+        eprintln!("{mismatch}");
+    }
+    assert!(mismatches.is_empty(), "{} mismatches", mismatches.len());
 }

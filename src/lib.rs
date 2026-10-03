@@ -11,9 +11,9 @@
 //! sources ([`sources`], [`vhdl_parser`]), the builtin libraries ([`builtins`]), the project
 //! model with dependency analysis ([`project`], [`dependency_graph`]), test discovery with
 //! configurations and testcase patterns ([`discovery`], [`configuration`], [`pattern`]), the
-//! `risim-out/` directory ([`store`]), the simulator interface ([`simulator`], [`process`]), and
-//! incremental parallel compilation ([`compile`]). Simulation runs and the workspace actor are
-//! added in later phases.
+//! `risim-out/` directory ([`store`]), the simulator interface ([`simulator`], [`process`]),
+//! incremental parallel compilation ([`compile`]), and simulation runs with persisted results
+//! ([`runner`]). The workspace actor is added in a later phase.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -27,6 +27,7 @@ pub mod discovery;
 pub mod pattern;
 pub mod process;
 pub mod project;
+pub mod runner;
 pub mod simulator;
 pub mod sources;
 pub mod spec;

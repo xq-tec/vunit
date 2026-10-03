@@ -77,7 +77,8 @@ fn create_output_file(path: &Utf8Path) -> io::Result<File> {
     File::create(path)
 }
 
-/// Runs `command_line` in `cwd` with stdout and stderr redirected to `output_file`.
+/// Runs `command_line` in `cwd` with stdout and stderr redirected to `output_file`, which
+/// starts with `header`.
 ///
 /// # Errors
 ///
@@ -86,10 +87,12 @@ pub async fn run_to_file(
     command_line: &[String],
     cwd: &Utf8Path,
     output_file: &Utf8Path,
+    header: &[u8],
     cancel: &CancellationToken,
 ) -> io::Result<Outcome> {
     let (program, args) = split_command_line(command_line)?;
-    let stdout = create_output_file(output_file)?;
+    let mut stdout = create_output_file(output_file)?;
+    stdout.write_all(header)?;
     let stderr = stdout.try_clone()?;
     let mut command = command(program, args, Some(cwd));
     command.stdout(stdout).stderr(stderr);
@@ -373,6 +376,7 @@ mod tests {
             &shell("echo hello && echo oops 1>&2 && exit 3"),
             &root,
             &output,
+            b"header\n",
             &CancellationToken::new(),
         )
         .await
@@ -382,6 +386,7 @@ mod tests {
         };
         assert_eq!(status.code(), Some(3));
         let contents = fs::read_to_string(&output).unwrap();
+        assert!(contents.starts_with("header\n"), "{contents}");
         assert!(contents.contains("hello") && contents.contains("oops"));
         assert!(!contents.contains("old contents"));
     }
@@ -414,13 +419,20 @@ mod tests {
             &[root.join("missing-program").to_string()],
             &root,
             &root.join("out.txt"),
+            b"",
             &CancellationToken::new(),
         )
         .await;
         result.unwrap_err();
-        run_to_file(&[], &root, &root.join("out.txt"), &CancellationToken::new())
-            .await
-            .unwrap_err();
+        run_to_file(
+            &[],
+            &root,
+            &root.join("out.txt"),
+            b"",
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
     }
 
     #[cfg(unix)]

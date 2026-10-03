@@ -411,5 +411,30 @@ fn targets_are_testbench_files() {
     );
     fixture.add("lib", "other.vhd", PKG);
     let discovery = crate::discovery::discover(&fixture.project, &[]);
-    assert_eq!(targets(&discovery), [entity, architecture]);
+    assert_eq!(
+        targets(&fixture.project, &discovery),
+        [entity, architecture]
+    );
+
+    // VHDL configurations that runs elaborate are targets too; nothing depends on them.
+    let configuration = fixture.add(
+        "lib",
+        "cfg.vhd",
+        "configuration Cfg1 of tb_split is for a end for; end configuration;",
+    );
+    fixture.add(
+        "lib",
+        "unused_cfg.vhd",
+        "configuration cfg2 of tb_split is for a end for; end configuration;",
+    );
+    let configs = [crate::spec::TestConfigSpec {
+        target: "lib.tb_split".to_owned(),
+        vhdl_configuration_name: Some("CFG1".to_owned()),
+        ..crate::spec::TestConfigSpec::default()
+    }];
+    let configured = crate::discovery::discover(&fixture.project, &configs);
+    assert_eq!(
+        targets(&fixture.project, &configured),
+        [entity, architecture, configuration]
+    );
 }
