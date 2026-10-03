@@ -12,8 +12,10 @@
 //! model with dependency analysis ([`project`], [`dependency_graph`]), test discovery with
 //! configurations and testcase patterns ([`discovery`], [`configuration`], [`pattern`]), the
 //! `risim-out/` directory ([`store`]), the simulator interface ([`simulator`], [`process`]),
-//! incremental parallel compilation ([`compile`]), and simulation runs with persisted results
-//! ([`runner`]). The workspace actor is added in a later phase.
+//! incremental parallel compilation ([`compile`]), simulation runs with persisted results
+//! ([`runner`]), and the entry points: a [`Runtime`] shared by all workspaces of a process, and
+//! [`Workspace`]s that load and watch their project ([`watch`]) and run compile and simulate
+//! operations with live events ([`workspace`]).
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -28,9 +30,30 @@ pub mod pattern;
 pub mod process;
 pub mod project;
 pub mod runner;
+pub mod runtime;
 pub mod simulator;
 pub mod sources;
 pub mod spec;
 pub mod store;
 pub mod vhdl_parser;
 pub mod vhdl_standard;
+pub mod watch;
+pub mod workspace;
+
+pub use crate::diagnostics::Diagnostic;
+pub use crate::diagnostics::DiagnosticSource;
+pub use crate::discovery::Testcase;
+pub use crate::runtime::Runtime;
+pub use crate::runtime::RuntimeError;
+pub use crate::runtime::RuntimeOptions;
+pub use crate::store::TestOutcome;
+pub use crate::store::TestResult;
+pub use crate::workspace::DiagnosticSets;
+pub use crate::workspace::OpenError;
+pub use crate::workspace::ProjectSource;
+pub use crate::workspace::RequestTag;
+pub use crate::workspace::SimulationRequest;
+pub use crate::workspace::Snapshot;
+pub use crate::workspace::Workspace;
+pub use crate::workspace::WorkspaceEvent;
+pub use crate::workspace::WorkspaceEventKind;

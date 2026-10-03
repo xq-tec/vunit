@@ -50,6 +50,11 @@ pub enum DiagnosticSource {
     Simulation,
 }
 
+impl DiagnosticSource {
+    /// All sources.
+    pub const ALL: [Self; 4] = [Self::Config, Self::Project, Self::Compile, Self::Simulation];
+}
+
 /// A 1-based line and column.
 ///
 /// Columns count UTF-16 code units if the line is valid UTF-8, and bytes otherwise.

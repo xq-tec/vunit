@@ -11,6 +11,7 @@
 //! AI NOTICE: Generated, minimally reviewed.
 
 mod fake_ghdl;
+mod workspace;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -139,6 +140,7 @@ fn main() -> ExitCode {
         )
         .with_ignored_flag(env::var_os("RISIM_GHDL").is_none()),
     ];
+    let trials = trials.into_iter().chain(workspace::trials()).collect();
     libtest_mimic::run(&args, trials).exit_code()
 }
 
@@ -224,7 +226,7 @@ impl SimRun {
                 SimulationEvent::TestStarted { name, .. } => Some(("test_started", name.clone())),
                 SimulationEvent::TestFinished { name, .. } => Some(("test_finished", name.clone())),
                 SimulationEvent::Finished { .. } => Some(("finished", String::new())),
-                SimulationEvent::Diagnostic(_) => None,
+                SimulationEvent::Diagnostic { .. } => None,
             })
             .collect()
     }
@@ -404,6 +406,7 @@ impl Workspace {
             simulator: self.simulator.clone(),
             semaphore: Arc::clone(&self.semaphore),
             results: Arc::clone(results),
+            testcase_locks: Arc::default(),
             events,
             cancel,
         };
@@ -1051,7 +1054,7 @@ async fn simulation_spawn_failure_fails_the_test() {
     assert!(
         run.events
             .iter()
-            .any(|event| matches!(event, SimulationEvent::Diagnostic(_)))
+            .any(|event| matches!(event, SimulationEvent::Diagnostic { .. }))
     );
 }
 

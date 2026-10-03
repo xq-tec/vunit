@@ -35,6 +35,8 @@ name = "risim_vunit_frontend"
 blake3 = "1.8"
 camino = { version = "1.2", features = ["serde1"] }
 globset = "0.4"
+# No FSEvents on macOS.
+notify = { version = "8.2", default-features = false }
 rand = "0.10"
 rayon = "1"
 regex = "1.12"
@@ -43,7 +45,14 @@ serde = { version = "1", features = ["derive"] }
 serde_ignored = "0.1"
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1.52", features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+tokio = { version = "1.52", features = [
+    "io-util",
+    "macros",
+    "process",
+    "rt",
+    "sync",
+    "time",
+] }
 tokio-util = "0.7"
 toml = "1.1"
 tracing = "0.1"

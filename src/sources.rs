@@ -300,20 +300,14 @@ fn is_glob_component(component: &str) -> bool {
     component.contains(['*', '?', '[', '{'])
 }
 
-/// Returns the files matching `pattern`, sorted, with `excluded` and `.git` directories
-/// skipped.
+/// Splits `pattern` into its base directory, the longest prefix without glob characters
+/// resolved against `root`, and the remaining components.
 ///
-/// The walk starts at the longest directory prefix without glob characters. It is recursive
-/// only if the pattern contains `**`.
-///
-/// # Errors
-///
-/// Fails if the pattern is invalid.
-pub fn expand_glob(
+/// Without glob components, the base is the file the pattern names.
+pub(crate) fn split_pattern<'pattern>(
     root: &Utf8Path,
-    pattern: &str,
-    excluded: &Utf8Path,
-) -> Result<Vec<Utf8PathBuf>, globset::Error> {
+    pattern: &'pattern str,
+) -> (Utf8PathBuf, Vec<&'pattern str>) {
     let pattern_path = Utf8Path::new(pattern);
     let mut base = if pattern_path.is_absolute() {
         Utf8PathBuf::new()
@@ -328,7 +322,24 @@ pub fn expand_glob(
             glob_components.push(component.as_str());
         }
     }
-    let base = normalize(&base);
+    (normalize(&base), glob_components)
+}
+
+/// Returns the files matching `pattern`, sorted, with `excluded` and `.git` directories
+/// skipped.
+///
+/// The walk starts at the longest directory prefix without glob characters. It is recursive
+/// only if the pattern contains `**`.
+///
+/// # Errors
+///
+/// Fails if the pattern is invalid.
+pub fn expand_glob(
+    root: &Utf8Path,
+    pattern: &str,
+    excluded: &Utf8Path,
+) -> Result<Vec<Utf8PathBuf>, globset::Error> {
+    let (base, glob_components) = split_pattern(root, pattern);
     let matcher: Option<GlobMatcher> = if glob_components.is_empty() {
         None
     } else {

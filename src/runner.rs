@@ -9,9 +9,12 @@
 //!
 //! - **Resolution:** [`SimulationPlan::new`] matches the requested patterns against the
 //!   testcases and prepares a [`PlannedTest`] per match.
-//! - **Run:** tests get permits of the simulation semaphore in name order. Each test with a
-//!   permit recreates its output directory, gets a seed and its `runner_cfg` generic, and runs
-//!   `risim-ghdl --elab-run` with stdout and stderr redirected to `output.txt`.
+//! - **Run:** each test first takes its testcase lock, so the same testcase never runs twice at
+//!   once, and then a permit of the simulation semaphore. Tests whose lock is free get permits
+//!   in name order; a test whose lock is held by another simulation waits for it without
+//!   holding up the others. Each test with a permit recreates its output directory, gets a seed
+//!   and its `runner_cfg` generic, and runs `risim-ghdl --elab-run` with stdout and stderr
+//!   redirected to `output.txt`.
 //! - **Outcome:** an explicit test passed if `vunit_results` records its start and the end of
 //!   the test suite; a testbench without explicit tests passed if the test suite ended. A
 //!   non-zero exit code fails a passed test from VHDL-2008 on (`has_valid_exit_code`).
@@ -32,12 +35,15 @@ use std::fs;
 use std::io;
 use std::io::Write as _;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
 use camino::Utf8Path;
 use camino::Utf8PathBuf;
 use rustc_hash::FxHashMap;
+use tokio::sync::OwnedMutexGuard;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -422,7 +428,12 @@ pub enum SimulationEvent {
     },
     /// A problem with a simulation: a spawn failure, an unreadable results file, or a pattern
     /// that matches nothing.
-    Diagnostic(Diagnostic),
+    Diagnostic {
+        /// The testcase the problem belongs to; `None` for a pattern that matches nothing.
+        testcase: Option<String>,
+        /// The problem.
+        diagnostic: Diagnostic,
+    },
     /// All testcases are done.
     Finished {
         /// The number of passed testcases.
@@ -453,6 +464,30 @@ impl SimulationReport {
     }
 }
 
+/// One lock per testcase, shared by all simulations of a workspace, so that the same testcase
+/// never runs twice at once.
+#[derive(Debug, Default)]
+pub struct TestcaseLocks {
+    locks: Mutex<FxHashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl TestcaseLocks {
+    /// The lock of `testcase`.
+    fn get(&self, testcase: &str) -> Arc<tokio::sync::Mutex<()>> {
+        // The map stays consistent even if a holder panicked: every change is one insert.
+        let mut locks = self
+            .locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(lock) = locks.get(testcase) {
+            return Arc::clone(lock);
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(testcase.to_owned(), Arc::clone(&lock));
+        lock
+    }
+}
+
 /// The shared resources of a simulation.
 #[derive(Debug, Clone)]
 pub struct SimulationContext {
@@ -464,6 +499,8 @@ pub struct SimulationContext {
     pub semaphore: Arc<Semaphore>,
     /// Receives the results.
     pub results: Arc<ResultStore>,
+    /// The testcase locks of the workspace.
+    pub testcase_locks: Arc<TestcaseLocks>,
     /// Receives the progress.
     pub events: mpsc::UnboundedSender<SimulationEvent>,
     /// Cancels the simulation.
@@ -484,7 +521,10 @@ pub async fn simulate(plan: SimulationPlan, context: &SimulationContext) -> Simu
         testcases: plan.testcases(),
     });
     for diagnostic in &plan.diagnostics {
-        context.emit(SimulationEvent::Diagnostic(diagnostic.clone()));
+        context.emit(SimulationEvent::Diagnostic {
+            testcase: None,
+            diagnostic: diagnostic.clone(),
+        });
     }
 
     let mut outcomes: Vec<(String, TestOutcome)> = plan
@@ -501,32 +541,40 @@ pub async fn simulate(plan: SimulationPlan, context: &SimulationContext) -> Simu
     let mut tasks = JoinSet::new();
     let mut task_indices = FxHashMap::default();
     // Permits are handed out in plan order, so tests start in the order they were announced.
+    // A test whose testcase runs in another simulation waits in its own task instead, so that it
+    // doesn't hold up the tests after it.
     let mut pending = plan.tests.into_iter().enumerate();
     while let Some((index, test)) = pending.next() {
-        // Cancellation wins over a free permit, so no test starts after a cancel.
-        let permit = tokio::select! {
-            biased;
-            () = context.cancel.cancelled() => None,
-            permit = Arc::clone(&context.semaphore).acquire_owned() => permit.ok(),
+        let lock = context.testcase_locks.get(&test.name);
+        let context = context.clone();
+        let Ok(guard) = Arc::clone(&lock).try_lock_owned() else {
+            let handle = tasks.spawn(async move {
+                let guard = tokio::select! {
+                    biased;
+                    () = context.cancel.cancelled() => None,
+                    guard = lock.lock_owned() => Some(guard),
+                };
+                let permit = match guard {
+                    Some(_) => acquire_permit(&context).await,
+                    None => None,
+                };
+                match guard.zip(permit) {
+                    Some((guard, permit)) => run_locked(&test, &context, guard, permit).await,
+                    None => cancelled_before_start(test, &context),
+                }
+            });
+            task_indices.insert(handle.id(), index);
+            continue;
         };
-        let Some(permit) = permit else {
+        // Cancellation wins over a free permit, so no test starts after a cancel.
+        let Some(permit) = acquire_permit(&context).await else {
+            drop(guard);
             for (skipped_index, skipped) in std::iter::once((index, test)).chain(pending.by_ref()) {
-                outcomes[skipped_index].1 = TestOutcome::Cancelled;
-                context.emit(SimulationEvent::TestFinished {
-                    name: skipped.name,
-                    outcome: TestOutcome::Cancelled,
-                    output_path: skipped.paths.output_file,
-                    duration: Duration::ZERO,
-                });
+                outcomes[skipped_index].1 = cancelled_before_start(skipped, &context).0;
             }
             break;
         };
-        let context = context.clone();
-        let handle = tasks.spawn(async move {
-            let result = run_test(&test, &context).await;
-            drop(permit);
-            result
-        });
+        let handle = tasks.spawn(async move { run_locked(&test, &context, guard, permit).await });
         task_indices.insert(handle.id(), index);
     }
     while let Some(joined) = tasks.join_next_with_id().await {
@@ -564,6 +612,42 @@ pub async fn simulate(plan: SimulationPlan, context: &SimulationContext) -> Simu
     report
 }
 
+/// A permit of the simulation semaphore, or `None` if the simulation is cancelled first.
+async fn acquire_permit(context: &SimulationContext) -> Option<OwnedSemaphorePermit> {
+    tokio::select! {
+        biased;
+        () = context.cancel.cancelled() => None,
+        permit = Arc::clone(&context.semaphore).acquire_owned() => permit.ok(),
+    }
+}
+
+/// Runs a test that holds its testcase lock and a permit, and releases both afterwards.
+async fn run_locked(
+    test: &PlannedTest,
+    context: &SimulationContext,
+    guard: OwnedMutexGuard<()>,
+    permit: OwnedSemaphorePermit,
+) -> (TestOutcome, Vec<Diagnostic>) {
+    let result = run_test(test, context).await;
+    drop(permit);
+    drop(guard);
+    result
+}
+
+/// Reports a test that was cancelled before it started; its previous result is kept.
+fn cancelled_before_start(
+    test: PlannedTest,
+    context: &SimulationContext,
+) -> (TestOutcome, Vec<Diagnostic>) {
+    context.emit(SimulationEvent::TestFinished {
+        name: test.name,
+        outcome: TestOutcome::Cancelled,
+        output_path: test.paths.output_file,
+        duration: Duration::ZERO,
+    });
+    (TestOutcome::Cancelled, Vec::new())
+}
+
 /// Runs one test that holds a simulation permit; returns its outcome and the problems found.
 async fn run_test(
     test: &PlannedTest,
@@ -598,7 +682,10 @@ async fn run_test(
         )));
     }
     for diagnostic in &diagnostics {
-        context.emit(SimulationEvent::Diagnostic(diagnostic.clone()));
+        context.emit(SimulationEvent::Diagnostic {
+            testcase: Some(test.name.clone()),
+            diagnostic: diagnostic.clone(),
+        });
     }
     context.emit(SimulationEvent::TestFinished {
         name: test.name.clone(),
