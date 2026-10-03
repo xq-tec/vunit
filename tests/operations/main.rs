@@ -407,7 +407,7 @@ impl Workspace {
             semaphore: Arc::clone(&self.semaphore),
             results: Arc::clone(results),
             testcase_locks: Arc::default(),
-            events,
+            events: events.into(),
             cancel,
         };
         let report = runner::simulate(plan, &context).await;

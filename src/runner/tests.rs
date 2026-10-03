@@ -423,7 +423,7 @@ async fn cancelled_simulation_starts_nothing_despite_free_permits() {
         semaphore: Arc::new(Semaphore::new(8)),
         results: Arc::new(ResultStore::load(&fixture.layout)),
         testcase_locks: Arc::default(),
-        events,
+        events: events.into(),
         cancel: CancellationToken::new(),
     };
     context.cancel.cancel();

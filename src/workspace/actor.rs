@@ -47,6 +47,7 @@ use crate::discovery::Testcase;
 use crate::runner;
 use crate::runner::SimulationContext;
 use crate::runner::SimulationEvent;
+use crate::runner::SimulationEvents;
 use crate::runner::SimulationInput;
 use crate::runner::SimulationPlan;
 use crate::runner::SimulationRequest;
@@ -535,7 +536,13 @@ impl Actor {
                 ..RunningSimulation::default()
             },
         );
-        let (events, mut receiver) = mpsc::unbounded_channel();
+        let internal = self.internal_sender.clone();
+        // The events go straight into the actor's channel, so that the events of all
+        // simulations stay in emission order.
+        let events = SimulationEvents::new({
+            let internal = internal.clone();
+            move |event| send_internal(&internal, Internal::Simulation { id, event })
+        });
         let context = SimulationContext {
             workspace_root: self.root.to_path_buf(),
             simulator: self.runtime.simulator().clone(),
@@ -545,22 +552,12 @@ impl Actor {
             events,
             cancel: self.operations_cancel.child_token(),
         };
-        let internal = self.internal_sender.clone();
         tokio::spawn(async move {
             let _done = DoneGuard {
-                sender: internal.clone(),
+                sender: internal,
                 message: Some(Internal::SimulationDone { id }),
             };
-            let simulate = async {
-                let _report = runner::simulate(plan, &context).await;
-                drop(context);
-            };
-            let forward = async {
-                while let Some(event) = receiver.recv().await {
-                    send_internal(&internal, Internal::Simulation { id, event });
-                }
-            };
-            tokio::join!(simulate, forward);
+            let _report = runner::simulate(plan, &context).await;
         });
     }
 
@@ -770,28 +767,30 @@ impl Actor {
     }
 
     /// Publishes a new snapshot if anything changed, and sends the events for the changes.
+    ///
+    /// The snapshot is updated before the events are sent, so that a client reading it after an
+    /// event never sees an older state.
     fn publish(&mut self) {
-        let mut changed = false;
+        let mut events = Vec::new();
         if self.testcases_dirty {
             self.testcases_dirty = false;
             if !self.testcases_sent || self.published.testcases != self.testcases {
                 self.testcases_sent = true;
                 self.published.testcases.clone_from(&self.testcases);
-                self.send(WorkspaceEventKind::TestcasesChanged(self.testcases.clone()));
-                changed = true;
+                events.push(WorkspaceEventKind::TestcasesChanged(self.testcases.clone()));
             }
         }
         for source in std::mem::take(&mut self.dirty) {
             let diagnostics = self.diagnostics(source);
             if diagnostics != self.published.diagnostics.get(source) {
                 self.published.diagnostics.set(source, diagnostics.clone());
-                self.send(WorkspaceEventKind::DiagnosticsChanged {
+                events.push(WorkspaceEventKind::DiagnosticsChanged {
                     source,
                     diagnostics,
                 });
-                changed = true;
             }
         }
+        let mut changed = !events.is_empty();
         if self.results_dirty {
             self.results_dirty = false;
             let results = self.results.snapshot();
@@ -802,6 +801,9 @@ impl Actor {
         }
         if changed {
             self.snapshot.send_replace(Arc::new(self.published.clone()));
+        }
+        for kind in events {
+            self.send(kind);
         }
     }
 

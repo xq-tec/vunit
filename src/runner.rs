@@ -488,6 +488,41 @@ impl TestcaseLocks {
     }
 }
 
+/// Receives the events of a simulation, synchronously and in emission order.
+///
+/// A callback rather than a channel, so that a listener of several simulations can merge their
+/// events into one ordered stream: with a channel per simulation, the second run of a testcase
+/// could be reported as started before the first run is reported as finished.
+#[derive(Clone)]
+pub struct SimulationEvents(Arc<dyn Fn(SimulationEvent) + Send + Sync>);
+
+impl SimulationEvents {
+    /// Calls `listener` for every event.
+    pub fn new(listener: impl Fn(SimulationEvent) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(listener))
+    }
+
+    fn send(&self, event: SimulationEvent) {
+        (self.0)(event);
+    }
+}
+
+impl From<mpsc::UnboundedSender<SimulationEvent>> for SimulationEvents {
+    fn from(sender: mpsc::UnboundedSender<SimulationEvent>) -> Self {
+        Self::new(move |event| {
+            if sender.send(event).is_err() {
+                tracing::trace!("nobody listens to simulation events");
+            }
+        })
+    }
+}
+
+impl std::fmt::Debug for SimulationEvents {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SimulationEvents")
+    }
+}
+
 /// The shared resources of a simulation.
 #[derive(Debug, Clone)]
 pub struct SimulationContext {
@@ -502,16 +537,14 @@ pub struct SimulationContext {
     /// The testcase locks of the workspace.
     pub testcase_locks: Arc<TestcaseLocks>,
     /// Receives the progress.
-    pub events: mpsc::UnboundedSender<SimulationEvent>,
+    pub events: SimulationEvents,
     /// Cancels the simulation.
     pub cancel: CancellationToken,
 }
 
 impl SimulationContext {
     fn emit(&self, event: SimulationEvent) {
-        if self.events.send(event).is_err() {
-            tracing::trace!("nobody listens to simulation events");
-        }
+        self.events.send(event);
     }
 }
 
