@@ -209,9 +209,13 @@ impl VhdlReference {
 }
 
 /// The file can't be parsed. `VUnit` then treats it as having no design units.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
 #[error("{0}")]
 pub struct ParseError(String);
+
+/// The version of the parser output. Persistent parse caches with another version are
+/// discarded, so increment it whenever the parser's results change.
+pub const PARSER_VERSION: u32 = 1;
 
 impl VhdlDesignFile {
     /// Parses the raw (Latin-1) contents of a VHDL file.

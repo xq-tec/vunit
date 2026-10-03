@@ -13,6 +13,7 @@
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -39,6 +40,9 @@ use crate::project::Project;
 use crate::spec::FilePattern;
 use crate::spec::LibrarySpec;
 use crate::spec::ProjectSpec;
+use crate::store;
+use crate::store::FileTime;
+use crate::vhdl_parser::PARSER_VERSION;
 use crate::vhdl_parser::ParseError;
 use crate::vhdl_parser::VhdlDesignFile;
 use crate::vhdl_standard::VhdlStandard;
@@ -424,6 +428,23 @@ struct CacheEntry {
     file: Arc<LoadedFile>,
 }
 
+/// A cache entry in `parse_cache.json`.
+#[derive(Serialize, Deserialize)]
+struct PersistedEntry {
+    modified: Option<FileTime>,
+    size: u64,
+    content_hash: ContentHash,
+    parsed: Result<VhdlDesignFile, ParseError>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedCache {
+    parser_version: u32,
+    files: BTreeMap<Utf8PathBuf, PersistedEntry>,
+}
+
+const PARSE_CACHE_VERSION: u32 = 1;
+
 /// Parse results of files, kept between loads of a project.
 #[derive(Debug, Clone, Default)]
 pub struct SourceCache {
@@ -465,6 +486,68 @@ impl SourceCache {
         }
         self.entries = entries;
         loaded
+    }
+
+    /// Reads a cache written by [`save`](Self::save).
+    ///
+    /// A missing or invalid file, or one written by another parser version, gives an empty
+    /// cache.
+    pub fn load_persisted(path: &Utf8Path) -> Self {
+        let Some(persisted) = store::read_json::<PersistedCache>(path, PARSE_CACHE_VERSION) else {
+            return Self::new();
+        };
+        if persisted.parser_version != PARSER_VERSION {
+            tracing::info!(%path, "discarding the parse cache of another parser version");
+            return Self::new();
+        }
+        let entries = persisted
+            .files
+            .into_iter()
+            .map(|(file_path, entry)| {
+                let file = LoadedFile {
+                    content_hash: entry.content_hash,
+                    design_file: entry.parsed.map(Arc::new),
+                };
+                let entry = CacheEntry {
+                    modified: entry.modified.map(FileTime::to_system_time),
+                    size: entry.size,
+                    file: Arc::new(file),
+                };
+                (file_path, entry)
+            })
+            .collect();
+        Self { entries }
+    }
+
+    /// Writes the cache to `path`.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the file can't be written.
+    pub fn save(&self, path: &Utf8Path) -> io::Result<()> {
+        let files = self
+            .entries
+            .iter()
+            .map(|(file_path, entry)| {
+                let persisted = PersistedEntry {
+                    modified: entry.modified.and_then(FileTime::from_system_time),
+                    size: entry.size,
+                    content_hash: entry.file.content_hash,
+                    parsed: entry
+                        .file
+                        .design_file
+                        .as_ref()
+                        .map(|design_file| VhdlDesignFile::clone(design_file))
+                        .map_err(Clone::clone),
+                };
+                (file_path.clone(), persisted)
+            })
+            .collect();
+        let persisted = PersistedCache {
+            parser_version: PARSER_VERSION,
+            files,
+        };
+        store::write_json(path, PARSE_CACHE_VERSION, &persisted)
     }
 }
 
@@ -794,6 +877,49 @@ mod tests {
         assert_ne!(third.content_hash, first.content_hash);
         let design_file = third.design_file.as_ref().unwrap();
         assert_eq!(design_file.entities[0].identifier, "b");
+    }
+
+    #[test]
+    fn cache_persists_parse_results() {
+        let workspace = Workspace::new();
+        let good = workspace.write("good.vhd", "entity good is end;");
+        let bad = workspace.write("bad.vhd", "entity bad is\n port (x : in bit;\nend;");
+        let cache_file = workspace.root.join("parse_cache.json");
+        let paths = [good, bad.clone()];
+        let mut cache = SourceCache::new();
+        let first = cache.load(&paths);
+        cache.save(&cache_file).unwrap();
+
+        let mut restored = SourceCache::load_persisted(&cache_file);
+        assert_eq!(restored.entries.len(), 2);
+        let second = restored.load(&paths);
+        for path in &paths {
+            let (first, second) = (
+                first[path].as_ref().unwrap(),
+                second[path].as_ref().unwrap(),
+            );
+            assert_eq!(first.content_hash, second.content_hash);
+            assert_eq!(first.design_file, second.design_file);
+        }
+        second[&bad]
+            .as_ref()
+            .unwrap()
+            .design_file
+            .as_ref()
+            .unwrap_err();
+
+        // A cache of another parser version is discarded.
+        let text = fs::read_to_string(&cache_file).unwrap().replace(
+            &format!("\"parser_version\":{PARSER_VERSION}"),
+            "\"parser_version\":0",
+        );
+        fs::write(&cache_file, text).unwrap();
+        assert!(SourceCache::load_persisted(&cache_file).entries.is_empty());
+        assert!(
+            SourceCache::load_persisted(&workspace.root.join("missing"))
+                .entries
+                .is_empty()
+        );
     }
 
     #[test]

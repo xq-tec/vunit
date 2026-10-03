@@ -2,12 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! Diagnostics reported to the client, and conversion of byte offsets to positions.
+//! Diagnostics reported to the client, conversion of byte offsets to positions, and parsing of
+//! GHDL messages (ported from event-cache's `compile_output.rs`).
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
 use std::fmt;
 
+use camino::Utf8Path;
 use camino::Utf8PathBuf;
 use serde::Deserialize;
 use serde::Serialize;
@@ -196,6 +198,62 @@ fn saturating_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
+/// A diagnostic line of GHDL output: `<file>:<line>:<column>:<severity>:<message>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GhdlMessage<'line> {
+    /// The file as GHDL printed it; relative paths are relative to GHDL's working directory.
+    pub file: &'line str,
+    /// The 1-based position.
+    pub position: Position,
+    /// The severity.
+    pub severity: Severity,
+    /// The trimmed message.
+    pub message: &'line str,
+}
+
+impl GhdlMessage<'_> {
+    /// Parses a GHDL diagnostic line; returns `None` for any other line.
+    ///
+    /// Example: `C:\proj\tb.vhd:7:32:warning: example warning`.
+    pub fn parse(line: &str) -> Option<GhdlMessage<'_>> {
+        [
+            (":error:", Severity::Error),
+            (":warning:", Severity::Warning),
+            (":note:", Severity::Note),
+        ]
+        .into_iter()
+        .find_map(|(marker, severity)| {
+            let (location, message) = line.split_once(marker)?;
+            let message = message.trim();
+            let (location, column) = location.rsplit_once(':')?;
+            let (file, line_number) = location.rsplit_once(':')?;
+            let column: u32 = column.parse().ok()?;
+            let line_number: u32 = line_number.parse().ok()?;
+            (!message.is_empty() && !file.is_empty() && line_number > 0 && column > 0).then_some(
+                GhdlMessage {
+                    file,
+                    position: Position {
+                        line: line_number,
+                        column,
+                    },
+                    severity,
+                    message,
+                },
+            )
+        })
+    }
+
+    /// Converts the message into a [`Diagnostic`], resolving a relative file against `cwd`.
+    pub fn to_diagnostic(&self, cwd: &Utf8Path) -> Diagnostic {
+        Diagnostic::new(self.severity, self.message)
+            .in_file(cwd.join(self.file))
+            .at(Some(Range {
+                start: self.position,
+                end: self.position,
+            }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +296,51 @@ mod tests {
         let range = index.range(7..10);
         assert_eq!(range.start, pos(1, 8));
         assert_eq!(range.end, pos(1, 10));
+    }
+
+    #[test]
+    fn ghdl_message_with_location() {
+        let line = "/proj/tb_bad_syntax.vhd:4:28:error: missing \";\" at end of use clause";
+        assert_eq!(
+            GhdlMessage::parse(line),
+            Some(GhdlMessage {
+                file: "/proj/tb_bad_syntax.vhd",
+                position: pos(4, 28),
+                severity: Severity::Error,
+                message: "missing \";\" at end of use clause",
+            })
+        );
+    }
+
+    #[test]
+    fn ghdl_message_with_windows_path() {
+        let line = r"C:\proj\tb.vhd:7:32:warning: example warning";
+        let message = GhdlMessage::parse(line).unwrap();
+        assert_eq!(message.file, r"C:\proj\tb.vhd");
+        assert_eq!(message.severity, Severity::Warning);
+        assert_eq!(message.message, "example warning");
+    }
+
+    #[test]
+    fn ghdl_message_rejects_other_lines() {
+        for line in [
+            "use ieee.std_logic_1164.all",
+            "                           ^",
+            "risim-ghdl:error: compilation error",
+            "/a.vhd:0:3:error: zero line",
+            "/a.vhd:x:3:error: no line",
+            "/a.vhd:3:4:error:   ",
+            ":3:4:note: no file",
+        ] {
+            assert_eq!(GhdlMessage::parse(line), None, "{line}");
+        }
+    }
+
+    #[test]
+    fn ghdl_message_resolves_relative_paths() {
+        let message = GhdlMessage::parse("src/a.vhd:1:2:note: hello").unwrap();
+        let diagnostic = message.to_diagnostic(Utf8Path::new("/root"));
+        assert_eq!(diagnostic.to_string(), "/root/src/a.vhd:1:2: note: hello");
     }
 
     #[test]

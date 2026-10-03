@@ -8,22 +8,28 @@
 //! This crate has no command-line interface; event-cache drives it.
 //!
 //! Implemented so far: reading the configuration ([`config`], [`spec`]), collecting and parsing
-//! sources ([`sources`], [`vhdl_parser`]), the builtin libraries ([`builtins`]), and the
-//! project model with dependency analysis ([`project`], [`dependency_graph`]), and test
-//! discovery with configurations and testcase patterns ([`discovery`], [`configuration`],
-//! [`pattern`]). Compile/simulate orchestration is added in later phases.
+//! sources ([`sources`], [`vhdl_parser`]), the builtin libraries ([`builtins`]), the project
+//! model with dependency analysis ([`project`], [`dependency_graph`]), test discovery with
+//! configurations and testcase patterns ([`discovery`], [`configuration`], [`pattern`]), the
+//! `risim-out/` directory ([`store`]), the simulator interface ([`simulator`], [`process`]), and
+//! incremental parallel compilation ([`compile`]). Simulation runs and the workspace actor are
+//! added in later phases.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
 pub mod builtins;
+pub mod compile;
 pub mod config;
 pub mod configuration;
 pub mod dependency_graph;
 pub mod diagnostics;
 pub mod discovery;
 pub mod pattern;
+pub mod process;
 pub mod project;
+pub mod simulator;
 pub mod sources;
 pub mod spec;
+pub mod store;
 pub mod vhdl_parser;
 pub mod vhdl_standard;

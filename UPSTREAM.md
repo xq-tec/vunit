@@ -58,7 +58,10 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - Testcase patterns are case-insensitive on all platforms (Python's `fnmatch` is case-insensitive only on Windows).
 - Compile and simulation processes run with the workspace root as working directory.
 - Files that are independent of each other compile in the order they were added. VUnit sorts them by path. Both orders respect the dependencies.
-- An ambiguous direct entity instantiation is an error for the instantiating file instead of aborting. Dependency cycles are reported only when the compile order is computed, not when collecting the files a testbench needs.
+- An ambiguous direct entity instantiation is an error for the instantiating file instead of aborting. Dependency cycles are reported only when they involve files that a testbench needs.
+- Mixed VHDL standards are checked among the files to compile, not among all files of the project.
+- A compile that fails without a parsable error message gets an error diagnostic with the compiler output, even if it printed parsable warnings.
+- Library work directories are `risim-out/libraries/<lowercase library name>`.
 - The VHDL parser skips enumeration, record and array types, which VUnit only uses for com codec generation. Word boundaries (`\b`) only treat ASCII characters as word characters.
 - `vunit_lib` is reserved for the VUnit library. A user library named `osvvm` replaces the builtin OSVVM library, with a warning. Library names, including `work`, are compared case-insensitively.
 - com is always added from VHDL-2008 on, and left out for older standards instead of raising an error.
