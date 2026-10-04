@@ -7,7 +7,7 @@
 //! The VHDL libraries under `vunit/vhdl` stay upstream `VUnit` sources.
 //! This crate has no command-line interface; event-cache drives it.
 //!
-//! Implemented so far: reading the configuration ([`config`], [`spec`]), collecting and parsing
+//! The crate covers reading the configuration ([`config`], [`spec`]), collecting and parsing
 //! sources ([`sources`], [`vhdl_parser`]), the builtin libraries ([`builtins`]), the project
 //! model with dependency analysis ([`project`], [`dependency_graph`]), test discovery with
 //! configurations and testcase patterns ([`discovery`], [`configuration`], [`pattern`]), the

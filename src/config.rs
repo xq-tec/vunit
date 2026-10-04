@@ -422,8 +422,6 @@ files = []
 files = []
 [libraries.lib]
 files = []
-[libraries.vunit_lib]
-files = []
 ",
         );
         let spec = config.spec.unwrap();
@@ -435,14 +433,9 @@ files = []
             .collect();
         assert_eq!(
             errors,
-            [
-                (Severity::Error, pos(2, 12)),
-                (Severity::Error, pos(6, 12)),
-                (Severity::Error, pos(8, 12))
-            ]
+            [(Severity::Error, pos(2, 12)), (Severity::Error, pos(6, 12))]
         );
         assert!(config.diagnostics[1].message.contains("'Lib'"));
-        assert!(config.diagnostics[2].message.contains("reserved"));
     }
 
     #[test]

@@ -185,6 +185,21 @@ pub fn collect(root: &Utf8Path, spec: &ProjectSpec, builtins_dir: &Utf8Path) -> 
                         }
                     }
                 }
+                if name.eq_ignore_ascii_case(builtins::VUNIT_LIB) {
+                    // Like `ui.library("vunit_lib").add_source_files(…)` in VUnit.
+                    if vhdl_standard.is_some_and(|standard| standard != spec.vhdl_standard) {
+                        collected.config_diagnostics.push(Diagnostic::error(format!(
+                            "library '{name}' must use the project's VHDL standard"
+                        )));
+                    } else if let Some(vunit_lib) = collected
+                        .libraries
+                        .iter_mut()
+                        .find(|collected| collected.name == builtins::VUNIT_LIB)
+                    {
+                        vunit_lib.files.extend(library_files);
+                    }
+                    continue;
+                }
                 collected.libraries.push(CollectedLibrary {
                     name: name.clone(),
                     vhdl_standard: vhdl_standard.unwrap_or(spec.vhdl_standard),
@@ -213,7 +228,8 @@ pub fn collect(root: &Utf8Path, spec: &ProjectSpec, builtins_dir: &Utf8Path) -> 
 }
 
 /// Returns the libraries of `spec` with valid names, and whether the builtin OSVVM library is
-/// needed. A user library named `osvvm` replaces the builtin one.
+/// needed. A user library named `osvvm` replaces the builtin one; the files of a library named
+/// `vunit_lib` are added to the builtin one, which can't be replaced by a precompiled library.
 fn valid_libraries<'spec>(
     spec: &'spec ProjectSpec,
     diagnostics: &mut Vec<Diagnostic>,
@@ -225,6 +241,14 @@ fn valid_libraries<'spec>(
         let name = library.name();
         if let Some(error) = library_name_error(name, &names) {
             diagnostics.push(Diagnostic::error(error));
+            continue;
+        }
+        if matches!(library, LibrarySpec::External { .. })
+            && name.eq_ignore_ascii_case(builtins::VUNIT_LIB)
+        {
+            diagnostics.push(Diagnostic::error(format!(
+                "library name '{name}' is reserved for the VUnit library"
+            )));
             continue;
         }
         let lowercase = name.to_ascii_lowercase();
@@ -250,10 +274,6 @@ pub(crate) fn library_name_error(
     let lowercase = name.to_ascii_lowercase();
     if lowercase == "work" {
         Some(LibraryError::Work.to_string())
-    } else if lowercase == builtins::VUNIT_LIB {
-        Some(format!(
-            "library name '{name}' is reserved for the VUnit library"
-        ))
     } else {
         defined.get(&lowercase).map(|existing| {
             LibraryError::Duplicate {
@@ -838,11 +858,28 @@ mod tests {
     }
 
     #[test]
+    fn collect_adds_user_files_to_vunit_lib() {
+        let workspace = Workspace::new();
+        let tb = workspace.write("test/tb_queue.vhd", "");
+        let mut spec = ProjectSpec::new();
+        spec.add_library("VUnit_Lib", ["test/*.vhd"]);
+        let collected = collect(&workspace.root, &spec, Utf8Path::new("/builtins"));
+        assert_eq!(collected.config_diagnostics, []);
+        let names: Vec<_> = collected
+            .libraries
+            .iter()
+            .map(|library| library.name.as_str())
+            .collect();
+        assert_eq!(names, ["vunit_lib", "osvvm"]);
+        assert_eq!(collected.libraries[0].files.last(), Some(&tb));
+    }
+
+    #[test]
     fn collect_validates_library_names() {
         let workspace = Workspace::new();
         let mut spec = ProjectSpec::new();
         spec.add_library("work", Vec::<String>::new())
-            .add_library("VUnit_Lib", Vec::<String>::new())
+            .add_external_library("VUnit_Lib", ".")
             .add_library("Lib", Vec::<String>::new())
             .add_library("LIB", Vec::<String>::new())
             .add_library("OSVVM", Vec::<String>::new());

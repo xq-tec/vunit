@@ -7,7 +7,6 @@
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::time::Duration;
@@ -29,9 +28,7 @@ use risim_vunit_frontend::WorkspaceEventKind;
 use risim_vunit_frontend::diagnostics::Severity;
 use tokio::sync::mpsc;
 
-use crate::ARTIFICIAL_EXPECTED;
 use crate::Workspace;
-use crate::artificial_spec;
 use crate::simulation_project;
 use crate::testbench;
 use crate::trial;
@@ -80,11 +77,6 @@ pub fn trials() -> Vec<Trial> {
             "workspace_without_handles_finishes_and_closes",
             workspace_without_handles_finishes_and_closes,
         ),
-        trial(
-            "real_risim_ghdl_workspace_runs_artificial",
-            real_risim_ghdl_workspace_runs_artificial,
-        )
-        .with_ignored_flag(std::env::var_os("RISIM_GHDL").is_none()),
     ]
 }
 
@@ -735,41 +727,6 @@ async fn workspace_without_handles_finishes_and_closes() {
         Some("simulation_finished a 1/0/0")
     );
     assert_eq!(lock_contents(&fixture), "");
-}
-
-/// Runs the artificial acceptance tests with the real risim-ghdl through the workspace API.
-async fn real_risim_ghdl_workspace_runs_artificial() {
-    let mut fixture = Workspace::new().await;
-    artificial_spec(&mut fixture.spec);
-    let ghdl = Utf8PathBuf::from(std::env::var("RISIM_GHDL").expect("RISIM_GHDL"));
-    let parallelism =
-        std::thread::available_parallelism().unwrap_or(NonZeroUsize::new(4).expect("non-zero"));
-    let runtime = Runtime::new(RuntimeOptions {
-        risim_ghdl: ghdl,
-        max_parallel_simulations: parallelism,
-        max_parallel_compiles: parallelism,
-    })
-    .await
-    .expect("create the runtime");
-    let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
-    session.handle.simulate(requests(&["*"]), tag("all"));
-    let events = session.operation("all").await;
-
-    let actual: BTreeMap<&str, TestOutcome> = events
-        .iter()
-        .filter_map(|event| match event {
-            WorkspaceEventKind::TestFinished { name, outcome, .. } => {
-                Some((name.as_str(), *outcome))
-            },
-            _ => None,
-        })
-        .collect();
-    let expected: BTreeMap<&str, TestOutcome> = ARTIFICIAL_EXPECTED.iter().copied().collect();
-    assert_eq!(actual, expected, "{:#?}", summary(&events));
-    let snapshot = session.handle.snapshot();
-    assert_eq!(snapshot.results.len(), expected.len());
-    assert_eq!(snapshot.diagnostics.get(DiagnosticSource::Simulation), []);
-    session.handle.close().await;
 }
 
 async fn workspace_rewatches_a_recreated_directory() {

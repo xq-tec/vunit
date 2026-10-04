@@ -25,7 +25,8 @@ include = [
     "vunit/vhdl/*/src/**/*.vhd",
     "vunit/vhdl/osvvm/*.vhd",
     "vunit/vhdl/osvvm/LICENSE.md",
-    "vunit/verilog/**",
+    "vunit/verilog/*.sv",
+    "vunit/verilog/include/**",
 ]
 
 [lib]
@@ -76,6 +77,10 @@ tokio = { version = "1.52", features = ["rt-multi-thread"] }
 
 [[test]]
 name = "operations"
+harness = false
+
+[[test]]
+name = "acceptance"
 harness = false
 
 [build-dependencies]

@@ -1,5 +1,0 @@
-
-Bug Fixes
-~~~~~~~~~
-
-- Fixed broken GHDL container image build. (:vunit_issue:`1226`)

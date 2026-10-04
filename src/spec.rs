@@ -130,7 +130,8 @@ impl FromStr for Feature {
 /// A library of the project.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LibrarySpec {
-    /// A library compiled from source files.
+    /// A library compiled from source files. For `vunit_lib`, the files are added to the
+    /// `VUnit` library.
     Sources {
         /// The library name.
         name: String,

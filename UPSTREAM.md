@@ -15,10 +15,15 @@ The fork adds `2ad0add1c51798c4c7d117e585125221ea337ff7`, which rewrites the OSV
 ## Sync procedure
 
 1. Merge upstream `master` into the fork.
-2. Keep `vunit/vhdl/**` and `vunit/verilog/**` from upstream.
-3. Resolve conflicts on deleted Python files by keeping the deletion.
-4. Review `git diff <recorded>..<new> -- vunit/*.py vunit/**/*.py` for logic to port, using the mapping below.
-5. Update the recorded commit in this file.
+2. Keep `vunit/vhdl/**` and `vunit/verilog/**` from upstream, including their unused `run.py` and `tools/*.py` files.
+3. Resolve conflicts on deleted files (the Python package outside `vunit/vhdl` and `vunit/verilog`, the Python tests, `docs/`, `examples/`, `tools/`, `setup.py`, `pyproject.toml` and the Python workflows) by keeping the deletion. Keep this fork's `README.md`, `.gitignore` and `.github/workflows/ci.yml`.
+4. Review `git diff <recorded>..<new> -- vunit/*.py vunit/**/*.py` for logic to port, using the mapping below. Review the changes to `vunit/vhdl/*/run.py` and `tests/acceptance/test_artificial.py` too, and update their translations in `tests/acceptance/`.
+5. Run the acceptance tests with `RISIM_GHDL` set, and update the expected failures.
+6. Update the recorded commit in this file.
+
+## Tests
+
+The `acceptance` test target ports VUnit's `tests/acceptance` (artificial VHDL testbenches and the package body dependency test) and the `run.py` of every VUnit VHDL library with a test directory. It leaves out what needs unsupported features: Verilog, `add_package`, test history, the check and location preprocessors, com codec generation, and the testbenches that `run.py` generates with Python. The expected outcomes follow VUnit, adapted to the deviations below; `tests/acceptance/vhdl_libraries.rs` lists the tests that fail only because every test runs in its own simulation.
 
 ## Module mapping
 
@@ -65,7 +70,7 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - A compile that fails without a parsable error message gets an error diagnostic with the compiler output, even if it printed parsable warnings.
 - Library work directories are `risim-out/libraries/<lowercase library name>`.
 - The VHDL parser skips enumeration, record and array types, which VUnit only uses for com codec generation. Word boundaries (`\b`) only treat ASCII characters as word characters.
-- `vunit_lib` is reserved for the VUnit library. A user library named `osvvm` replaces the builtin OSVVM library, with a warning. Library names, including `work`, are compared case-insensitively.
+- The files of a user library named `vunit_lib` are added to the VUnit library, like `ui.library("vunit_lib").add_source_files(…)`; a precompiled library can't be named `vunit_lib`. A user library named `osvvm` replaces the builtin OSVVM library, with a warning. Library names, including `work`, are compared case-insensitively.
 - com is always added from VHDL-2008 on, and left out for older standards instead of raising an error.
 - In file patterns, `*` also matches hidden files, and `risim-out/` and `.git/` directories are never searched. Files with unknown extensions are skipped with a warning instead of raising an error.
 - Testcase names keep the case of the entity declaration; `VUnit` uses the lowercase entity name. Test names that differ only in case produce a warning.
