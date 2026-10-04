@@ -19,20 +19,19 @@ jobs:
         with:
           submodules: recursive
 
-      # Same toolchain as the risim CI. rustfmt options in rustfmt.toml need nightly,
-      # and the date matches risim's NIGHTLY_DATE so both repositories format the same way.
+      # rustfmt options in rustfmt.toml need nightly.
       - name: Install Rust
         uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: clippy
 
       - name: Install nightly rustfmt
-        uses: dtolnay/rust-toolchain@nightly-2026-07-21
+        uses: dtolnay/rust-toolchain@nightly
         with:
           components: rustfmt
 
       - name: Format
-        run: cargo +nightly-2026-07-21 fmt --check
+        run: cargo +nightly fmt --check
 
       - name: Clippy
         run: cargo +1.97.1 clippy --all-targets --locked -- -D warnings
