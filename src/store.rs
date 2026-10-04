@@ -23,6 +23,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::fmt;
 use std::fs;
 use std::fs::File;
 use std::fs::TryLockError;
@@ -48,6 +49,7 @@ use thiserror::Error;
 use crate::diagnostics::Diagnostic;
 use crate::simulator::SimulatorIdentity;
 pub use crate::sources::OUTPUT_DIR;
+use crate::sync::lock_unpoisoned;
 
 /// The paths inside `risim-out/`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,17 +286,20 @@ pub fn write_atomic(path: &Utf8Path, contents: &[u8]) -> io::Result<()> {
         process::id(),
         TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    let result = (|| {
-        let mut file = File::create(&temp)?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-        drop(file);
-        fs::rename(&temp, path)
-    })();
+    let result = write_synced_and_rename(&temp, path, contents);
     if result.is_err() {
         let _ignored = fs::remove_file(&temp);
     }
     result
+}
+
+/// Writes `contents` to `temp`, flushes it to disk and renames it to `path`.
+fn write_synced_and_rename(temp: &Utf8Path, path: &Utf8Path, contents: &[u8]) -> io::Result<()> {
+    let mut file = File::create(temp)?;
+    file.write_all(contents)?;
+    file.sync_all()?;
+    drop(file);
+    fs::rename(temp, path)
 }
 
 /// Removes a file or directory tree; a missing path isn't an error.
@@ -353,7 +358,7 @@ pub enum LockError {
         path: Utf8PathBuf,
     },
     /// The lock file can't be created or locked.
-    #[error("failed to lock {path}: {source}")]
+    #[error("failed to lock {path}")]
     Io {
         /// The lock file.
         path: Utf8PathBuf,
@@ -463,11 +468,12 @@ impl OutputLock {
 // -------------------------------------------------------------------------------------------------
 
 /// The hash deciding whether a file must be recompiled (see the `compile` module).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CompileKey(pub [u8; 32]);
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CompileKey(#[serde(with = "hex32")] pub [u8; 32]);
 
-impl std::fmt::Debug for CompileKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for CompileKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
             "CompileKey({})",
@@ -476,17 +482,25 @@ impl std::fmt::Debug for CompileKey {
     }
 }
 
-impl Serialize for CompileKey {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(blake3::Hash::from_bytes(self.0).to_hex().as_str())
-    }
-}
+/// Serializes a 32-byte hash as a hex string, with `#[serde(with = "hex32")]`.
+pub(crate) mod hex32 {
+    use serde::Deserialize as _;
+    use serde::Deserializer;
+    use serde::Serializer;
 
-impl<'de> Deserialize<'de> for CompileKey {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+    pub(crate) fn serialize<S: Serializer>(
+        bytes: &[u8; 32],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&blake3::Hash::from_bytes(*bytes).to_hex())
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<[u8; 32], D::Error> {
         let hex = String::deserialize(deserializer)?;
         let hash = blake3::Hash::from_hex(&hex).map_err(serde::de::Error::custom)?;
-        Ok(Self(*hash.as_bytes()))
+        Ok(*hash.as_bytes())
     }
 }
 
@@ -507,8 +521,8 @@ impl FileKey {
     }
 }
 
-impl std::fmt::Display for FileKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for FileKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
@@ -590,6 +604,38 @@ pub enum TestOutcome {
     Cancelled,
 }
 
+/// The number of tests with each [`TestOutcome`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TestCounts {
+    /// The number of passed tests.
+    pub passed: usize,
+    /// The number of failed tests.
+    pub failed: usize,
+    /// The number of cancelled tests.
+    pub cancelled: usize,
+}
+
+impl TestCounts {
+    /// Counts one more test with `outcome`.
+    pub const fn record(&mut self, outcome: TestOutcome) {
+        match outcome {
+            TestOutcome::Passed => self.passed += 1,
+            TestOutcome::Failed => self.failed += 1,
+            TestOutcome::Cancelled => self.cancelled += 1,
+        }
+    }
+}
+
+impl FromIterator<TestOutcome> for TestCounts {
+    fn from_iter<I: IntoIterator<Item = TestOutcome>>(outcomes: I) -> Self {
+        let mut counts = Self::default();
+        for outcome in outcomes {
+            counts.record(outcome);
+        }
+        counts
+    }
+}
+
 /// A point in time, in milliseconds since the Unix epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -668,9 +714,7 @@ impl ResultStore {
     fn lock(&self) -> MutexGuard<'_, TestResults> {
         // The results stay consistent even if a holder panicked: every change is one insert or
         // retain.
-        self.results
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        lock_unpoisoned(&self.results)
     }
 
     /// A copy of the current results.
@@ -716,17 +760,8 @@ impl ResultStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct Temp {
-        _dir: tempfile::TempDir,
-        root: Utf8PathBuf,
-    }
-
-    fn temp() -> Temp {
-        let dir = tempfile::tempdir().unwrap();
-        let root = Utf8Path::from_path(dir.path()).unwrap().to_owned();
-        Temp { _dir: dir, root }
-    }
+    use crate::test_support::TempRoot;
+    use crate::test_support::simulator_identity;
 
     #[derive(Debug, PartialEq, Serialize, Deserialize)]
     struct Data {
@@ -735,7 +770,7 @@ mod tests {
 
     #[test]
     fn json_round_trip_checks_version() {
-        let temp = temp();
+        let temp = TempRoot::new();
         let path = temp.root.join("sub/data.json");
         let data = Data { items: vec![1, 2] };
         write_json(&path, 3, &data).unwrap();
@@ -753,7 +788,7 @@ mod tests {
 
     #[test]
     fn atomic_write_leaves_no_temporary_files() {
-        let temp = temp();
+        let temp = TempRoot::new();
         let path = temp.root.join("a.json");
         write_atomic(&path, b"1").unwrap();
         write_atomic(&path, b"2").unwrap();
@@ -809,7 +844,7 @@ mod tests {
 
     #[test]
     fn prepare_recreates_the_output_directory() {
-        let temp = temp();
+        let temp = TempRoot::new();
         let layout = OutputLayout::new(&temp.root);
         let paths = TestOutputPaths::new(&layout, "lib.tb.t");
         fs::create_dir_all(&paths.dir).unwrap();
@@ -831,7 +866,7 @@ mod tests {
 
     #[test]
     fn result_store_saves_every_change() {
-        let temp = temp();
+        let temp = TempRoot::new();
         let layout = OutputLayout::new(&temp.root);
         let store = ResultStore::load(&layout);
         assert!(store.snapshot().is_empty());
@@ -865,7 +900,7 @@ mod tests {
 
     #[test]
     fn lock_excludes_and_detects_crashes() {
-        let temp = temp();
+        let temp = TempRoot::new();
         let layout = OutputLayout::new(&temp.root);
         let (lock, previous) = OutputLock::acquire(&layout).unwrap();
         assert_eq!(previous, PreviousOwner::Released);
@@ -894,21 +929,12 @@ mod tests {
         recovered_lock.release();
     }
 
-    fn identity(version: &str) -> SimulatorIdentity {
-        SimulatorIdentity {
-            path: "/bin/risim-ghdl".into(),
-            size: 1,
-            modified: None,
-            version_output: version.to_owned(),
-        }
-    }
-
     #[test]
     fn compile_state_round_trip() {
-        let temp = temp();
+        let temp = TempRoot::new();
         let layout = OutputLayout::new(&temp.root);
         let mut state = CompileState {
-            simulator: Some(identity("1")),
+            simulator: Some(simulator_identity("1")),
             ..CompileState::default()
         };
         state.files.insert(
@@ -926,10 +952,12 @@ mod tests {
 
     #[test]
     fn simulator_change_discards_state() {
-        let temp = temp();
+        let temp = TempRoot::new();
         let layout = OutputLayout::new(&temp.root);
         let mut state = CompileState::default();
-        state.use_simulator(&identity("1"), &layout).unwrap();
+        state
+            .use_simulator(&simulator_identity("1"), &layout)
+            .unwrap();
         state.files.insert(
             FileKey::new("lib", Utf8Path::new("/a.vhd")),
             FileState {
@@ -939,13 +967,17 @@ mod tests {
         );
         fs::create_dir_all(layout.library_dir("lib")).unwrap();
 
-        state.use_simulator(&identity("1"), &layout).unwrap();
+        state
+            .use_simulator(&simulator_identity("1"), &layout)
+            .unwrap();
         assert_eq!(state.files.len(), 1);
         assert!(layout.library_dir("lib").exists());
 
-        state.use_simulator(&identity("2"), &layout).unwrap();
+        state
+            .use_simulator(&simulator_identity("2"), &layout)
+            .unwrap();
         assert!(state.files.is_empty());
         assert!(!layout.libraries_dir().exists());
-        assert_eq!(state.simulator, Some(identity("2")));
+        assert_eq!(state.simulator, Some(simulator_identity("2")));
     }
 }

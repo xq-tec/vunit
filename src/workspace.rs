@@ -41,6 +41,7 @@ use tokio::sync::watch;
 use self::actor::Actor;
 use self::actor::Command;
 use self::loader::Loader;
+use self::loader::ProjectConfig;
 use crate::builtins;
 use crate::config;
 use crate::diagnostics::Diagnostic;
@@ -56,6 +57,7 @@ use crate::store::LockError;
 use crate::store::OutputLayout;
 use crate::store::OutputLock;
 use crate::store::ResultStore;
+use crate::store::TestCounts;
 use crate::store::TestOutcome;
 use crate::store::TestResult;
 
@@ -84,7 +86,7 @@ pub enum OpenError {
         path: Utf8PathBuf,
     },
     /// `risim-out/` can't be set up.
-    #[error("failed to set up {path}: {source}")]
+    #[error("failed to set up {path}")]
     Io {
         /// The file or directory that couldn't be set up.
         path: Utf8PathBuf,
@@ -92,7 +94,7 @@ pub enum OpenError {
         source: io::Error,
     },
     /// The configuration file can't be read at all.
-    #[error("{}: {}", .0, .0.source)]
+    #[error(transparent)]
     Config(#[from] config::ReadError),
 }
 
@@ -223,12 +225,8 @@ pub enum WorkspaceEventKind {
     SimulationFinished {
         /// The tags of the operation.
         tags: Vec<RequestTag>,
-        /// The number of passed testcases.
-        passed: usize,
-        /// The number of failed testcases.
-        failed: usize,
-        /// The number of cancelled testcases.
-        cancelled: usize,
+        /// The number of testcases per outcome.
+        counts: TestCounts,
     },
 }
 
@@ -311,18 +309,17 @@ pub(crate) async fn open(
         });
     }
     let layout = OutputLayout::new(&root);
-    let loader = match source {
-        ProjectSource::ConfigFile(path) => {
-            let path = absolute(&root.join(path))?;
-            Loader::new(root.clone(), layout.clone(), Some(path), None)
-        },
-        ProjectSource::Spec(spec) => Loader::new(root.clone(), layout.clone(), None, Some(spec)),
+    let source = match source {
+        ProjectSource::ConfigFile(path) => ProjectSource::ConfigFile(absolute(&root.join(path))?),
+        ProjectSource::Spec(spec) => ProjectSource::Spec(spec),
     };
-    let opened = tokio::task::spawn_blocking(move || prepare(layout, loader))
+    let config = ProjectConfig::new(source);
+    let prepare_root = root.clone();
+    let opened = tokio::task::spawn_blocking(move || prepare(prepare_root, layout, config))
         .await
         .map_err(|error| OpenError::Io {
             path: root.clone(),
-            source: io::Error::other(error.to_string()),
+            source: io::Error::other(error),
         })??;
 
     let root: Arc<Utf8Path> = Arc::from(root.as_path());
@@ -349,8 +346,12 @@ struct Opened {
 
 /// Reads the configuration, locks `risim-out/`, extracts the builtins, loads the stored state
 /// and loads the project.
-fn prepare(layout: OutputLayout, mut loader: Loader) -> Result<Opened, OpenError> {
-    loader.read_config()?;
+fn prepare(
+    root: Utf8PathBuf,
+    layout: OutputLayout,
+    mut config: ProjectConfig,
+) -> Result<Opened, OpenError> {
+    config.read()?;
     let (lock, _previous) = OutputLock::acquire(&layout)?;
     let builtins_root = layout.builtins_root();
     let builtins_dir = match builtins::extract(&builtins_root) {
@@ -363,10 +364,8 @@ fn prepare(layout: OutputLayout, mut loader: Loader) -> Result<Opened, OpenError
             });
         },
     };
-    loader.prepare(
-        builtins_dir,
-        SourceCache::load_persisted(&layout.parse_cache_file()),
-    );
+    let cache = SourceCache::load_persisted(&layout.parse_cache_file());
+    let mut loader = Loader::new(root, layout.clone(), config, builtins_dir, cache);
     let initial = loader.load(false);
     let compile_state = CompileState::load(&layout);
     let results = ResultStore::load(&layout);

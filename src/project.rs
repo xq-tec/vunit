@@ -85,7 +85,10 @@ pub enum UnitKind {
 impl UnitKind {
     /// Whether this is a primary unit, which is visible in its library by name.
     pub const fn is_primary(self) -> bool {
-        !matches!(self, Self::Architecture | Self::PackageBody)
+        match self {
+            Self::Entity | Self::Package | Self::Context | Self::Configuration => true,
+            Self::Architecture | Self::PackageBody => false,
+        }
     }
 }
 
@@ -221,6 +224,52 @@ pub enum LibraryError {
     },
 }
 
+/// Checks `name` as the name of a new library and returns it in lowercase.
+///
+/// `existing` returns the name of the library with the given lowercase name, if there is one.
+fn check_library_name(
+    name: &str,
+    existing: impl FnOnce(&str) -> Option<String>,
+) -> Result<String, LibraryError> {
+    let lowercase = name.to_ascii_lowercase();
+    if lowercase == "work" {
+        return Err(LibraryError::Work);
+    }
+    if let Some(existing) = existing(&lowercase) {
+        return Err(LibraryError::Duplicate {
+            name: name.to_owned(),
+            existing,
+        });
+    }
+    Ok(lowercase)
+}
+
+/// The names of the libraries defined so far, for checking the names of new ones.
+#[derive(Debug, Clone, Default)]
+pub struct LibraryNames {
+    /// The names by their lowercase form.
+    by_lowercase: FxHashMap<String, String>,
+}
+
+impl LibraryNames {
+    /// Creates an empty set of names.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds `name`.
+    ///
+    /// # Errors
+    ///
+    /// Fails like [`Project::add_library`]; the name isn't added then.
+    pub fn insert(&mut self, name: &str) -> Result<(), LibraryError> {
+        let lowercase =
+            check_library_name(name, |lowercase| self.by_lowercase.get(lowercase).cloned())?;
+        self.by_lowercase.insert(lowercase, name.to_owned());
+        Ok(())
+    }
+}
+
 /// The libraries and source files of a project.
 #[derive(Debug, Clone, Default)]
 pub struct Project {
@@ -268,16 +317,11 @@ impl Project {
         vhdl_standard: VhdlStandard,
         external_path: Option<Utf8PathBuf>,
     ) -> Result<LibraryId, LibraryError> {
-        if name.eq_ignore_ascii_case("work") {
-            return Err(LibraryError::Work);
-        }
-        let lowercase = name.to_ascii_lowercase();
-        if let Some(&existing) = self.libraries_by_lowercase_name.get(&lowercase) {
-            return Err(LibraryError::Duplicate {
-                name: name.to_owned(),
-                existing: self.libraries[existing.index()].name.clone(),
-            });
-        }
+        let lowercase = check_library_name(name, |lowercase| {
+            self.libraries_by_lowercase_name
+                .get(lowercase)
+                .map(|existing| self.libraries[existing.index()].name.clone())
+        })?;
         let id = LibraryId(id_from_index(self.libraries.len()));
         self.libraries.push(Library {
             name: name.to_owned(),
@@ -341,7 +385,10 @@ impl Project {
         let mut duplicates = Vec::new();
         for unit in &file.design_units {
             let previous = match unit.kind {
-                kind if kind.is_primary() => library
+                kind @ (UnitKind::Entity
+                | UnitKind::Package
+                | UnitKind::Context
+                | UnitKind::Configuration) => library
                     .primary_units
                     .insert(unit.name.clone(), PrimaryUnit { kind, file: id })
                     .map(|previous| previous.file),
@@ -359,7 +406,7 @@ impl Project {
                         None
                     }
                 },
-                _ => library.package_bodies.insert(unit.name.clone(), id),
+                UnitKind::PackageBody => library.package_bodies.insert(unit.name.clone(), id),
             };
             if let Some(previous) = previous {
                 duplicates.push((unit, previous));
@@ -665,25 +712,21 @@ fn design_units_of(design_file: &VhdlDesignFile) -> Vec<DesignUnit> {
         primary_unit: None,
         range,
     };
-    let mut units = Vec::new();
-    units.extend(
-        design_file
-            .entities
-            .iter()
-            .map(|entity| primary(&entity.identifier, UnitKind::Entity, entity.range)),
-    );
-    units.extend(
-        design_file
-            .contexts
-            .iter()
-            .map(|context| primary(&context.identifier, UnitKind::Context, context.range)),
-    );
-    units.extend(
-        design_file
-            .packages
-            .iter()
-            .map(|package| primary(&package.identifier, UnitKind::Package, package.range)),
-    );
+    let mut units: Vec<DesignUnit> = design_file
+        .entities
+        .iter()
+        .map(|entity| primary(&entity.identifier, UnitKind::Entity, entity.range))
+        .collect();
+    for (kind, named) in [
+        (UnitKind::Context, &design_file.contexts),
+        (UnitKind::Package, &design_file.packages),
+    ] {
+        units.extend(
+            named
+                .iter()
+                .map(|unit| primary(&unit.identifier, kind, unit.range)),
+        );
+    }
     units.extend(
         design_file
             .architectures

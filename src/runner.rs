@@ -31,6 +31,7 @@
 //! AI NOTICE: Generated, minimally reviewed.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::io::Write as _;
@@ -56,6 +57,7 @@ use crate::discovery::Discovery;
 use crate::pattern;
 use crate::process;
 use crate::project::Project;
+use crate::simulator::CommandError;
 use crate::simulator::SimulateArgs;
 use crate::simulator::Simulator;
 use crate::simulator::Top;
@@ -63,10 +65,12 @@ use crate::spec::AssertLevel;
 use crate::spec::SimOptions;
 use crate::store::OutputLayout;
 use crate::store::ResultStore;
+use crate::store::TestCounts;
 use crate::store::TestOutcome;
 use crate::store::TestOutputPaths;
 use crate::store::TestResult;
 use crate::store::Timestamp;
+use crate::sync::lock_unpoisoned;
 use crate::vhdl_parser::latin1;
 use crate::vhdl_standard::VhdlStandard;
 
@@ -193,16 +197,6 @@ pub struct SimulationInput<'a> {
     pub sim_options: &'a SimOptions,
 }
 
-/// The top-level unit of a planned simulation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PlannedTop {
-    Configuration(String),
-    Entity {
-        entity: String,
-        architecture: String,
-    },
-}
-
 /// A testcase ready to run.
 #[derive(Debug, Clone)]
 pub struct PlannedTest {
@@ -218,7 +212,7 @@ pub struct PlannedTest {
     library: String,
     library_dir: Utf8PathBuf,
     library_dirs: Arc<[Utf8PathBuf]>,
-    top: PlannedTop,
+    top: Top,
     /// The configuration's generics, without `runner_cfg`.
     generics: BTreeMap<String, String>,
     /// Whether the entity declares an `output_path` generic that the configuration leaves unset.
@@ -258,29 +252,15 @@ impl PlannedTest {
     /// # Errors
     ///
     /// Fails if the simulator doesn't support the testbench's standard.
-    pub fn command(
-        &self,
-        simulator: &Simulator,
-        seed: &str,
-    ) -> Result<Vec<String>, crate::simulator::CommandError> {
+    pub fn command(&self, simulator: &Simulator, seed: &str) -> Result<Vec<String>, CommandError> {
         let generics = self.generics(seed);
-        let top = match &self.top {
-            PlannedTop::Configuration(name) => Top::Configuration(name),
-            PlannedTop::Entity {
-                entity,
-                architecture,
-            } => Top::Entity {
-                entity,
-                architecture,
-            },
-        };
         simulator.simulate_command(&SimulateArgs {
             vhdl_standard: self.vhdl_standard,
             library: &self.library,
             library_dir: &self.library_dir,
             library_dirs: &self.library_dirs,
             elab_flags: &self.elab_flags,
-            top,
+            top: &self.top,
             sim_flags: &self.sim_flags,
             generics: &generics,
             assert_level: self.assert_level,
@@ -343,11 +323,11 @@ impl SimulationPlan {
                 let configuration = &run.configuration;
                 let sim_options = input.sim_options.overridden_by(&configuration.sim_options);
                 let top = configuration.vhdl_configuration_name.clone().map_or_else(
-                    || PlannedTop::Entity {
+                    || Top::Entity {
                         entity: testbench.entity.clone(),
                         architecture: testbench.architecture.clone(),
                     },
-                    PlannedTop::Configuration,
+                    Top::Configuration,
                 );
                 let fill_output_path = testbench
                     .generic_names
@@ -436,12 +416,8 @@ pub enum SimulationEvent {
     },
     /// All testcases are done.
     Finished {
-        /// The number of passed testcases.
-        passed: usize,
-        /// The number of failed testcases.
-        failed: usize,
-        /// The number of cancelled testcases.
-        cancelled: usize,
+        /// The number of testcases per outcome.
+        counts: TestCounts,
     },
 }
 
@@ -455,12 +431,9 @@ pub struct SimulationReport {
 }
 
 impl SimulationReport {
-    /// The number of testcases with `outcome`.
-    pub fn count(&self, outcome: TestOutcome) -> usize {
-        self.outcomes
-            .iter()
-            .filter(|(_, test_outcome)| *test_outcome == outcome)
-            .count()
+    /// The number of testcases per outcome.
+    pub fn counts(&self) -> TestCounts {
+        self.outcomes.iter().map(|&(_, outcome)| outcome).collect()
     }
 }
 
@@ -475,16 +448,11 @@ impl TestcaseLocks {
     /// The lock of `testcase`.
     fn get(&self, testcase: &str) -> Arc<tokio::sync::Mutex<()>> {
         // The map stays consistent even if a holder panicked: every change is one insert.
-        let mut locks = self
-            .locks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(lock) = locks.get(testcase) {
-            return Arc::clone(lock);
-        }
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
-        locks.insert(testcase.to_owned(), Arc::clone(&lock));
-        lock
+        Arc::clone(
+            lock_unpoisoned(&self.locks)
+                .entry(testcase.to_owned())
+                .or_default(),
+        )
     }
 }
 
@@ -517,8 +485,8 @@ impl From<mpsc::UnboundedSender<SimulationEvent>> for SimulationEvents {
     }
 }
 
-impl std::fmt::Debug for SimulationEvents {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for SimulationEvents {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("SimulationEvents")
     }
 }
@@ -587,14 +555,13 @@ pub async fn simulate(plan: SimulationPlan, context: &SimulationContext) -> Simu
                     () = context.cancel.cancelled() => None,
                     guard = lock.lock_owned() => Some(guard),
                 };
-                let permit = match guard {
-                    Some(_) => acquire_permit(&context).await,
-                    None => None,
+                let Some(guard) = guard else {
+                    return cancelled_before_start(test, &context);
                 };
-                match guard.zip(permit) {
-                    Some((guard, permit)) => run_locked(&test, &context, guard, permit).await,
-                    None => cancelled_before_start(test, &context),
-                }
+                let Some(permit) = acquire_permit(&context).await else {
+                    return cancelled_before_start(test, &context);
+                };
+                run_locked(&test, &context, guard, permit).await
             });
             task_indices.insert(handle.id(), index);
             continue;
@@ -638,9 +605,7 @@ pub async fn simulate(plan: SimulationPlan, context: &SimulationContext) -> Simu
         diagnostics,
     };
     context.emit(SimulationEvent::Finished {
-        passed: report.count(TestOutcome::Passed),
-        failed: report.count(TestOutcome::Failed),
-        cancelled: report.count(TestOutcome::Cancelled),
+        counts: report.counts(),
     });
     report
 }

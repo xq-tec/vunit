@@ -12,6 +12,7 @@
 
 use super::*;
 use crate::diagnostics::Severity;
+use crate::test_support::add_vhdl;
 
 struct TestProject {
     project: Project,
@@ -31,15 +32,7 @@ impl TestProject {
     }
 
     fn add(&mut self, library: &str, path: &str, code: &str) -> FileId {
-        let library = self.project.find_library(library).unwrap();
-        let design_file = VhdlDesignFile::parse(code.as_bytes()).ok().map(Arc::new);
-        self.project.add_source_file(
-            library,
-            Utf8Path::new(path),
-            None,
-            ContentHash::of(code.as_bytes()),
-            design_file,
-        )
+        add_vhdl(&mut self.project, library, Utf8Path::new(path), code)
     }
 
     fn compile_order(&self) -> Vec<FileId> {

@@ -7,6 +7,7 @@
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
+use std::error::Error;
 use std::fmt;
 
 use camino::Utf8Path;
@@ -64,6 +65,13 @@ pub struct Position {
     pub line: u32,
     /// 1-based column number.
     pub column: u32,
+}
+
+impl Position {
+    /// The position at 1-based `line` and `column`.
+    pub const fn new(line: u32, column: u32) -> Self {
+        Self { line, column }
+    }
 }
 
 /// A range in a file; `end` is the position of the last character, not after it.
@@ -203,6 +211,21 @@ fn saturating_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
 
+/// `error` and its chain of sources on one line, separated by `: `.
+///
+/// The error types of this crate keep the cause out of their message, so this is the way to
+/// turn one into a complete message.
+pub fn error_chain(error: &dyn Error) -> String {
+    let mut message = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
+}
+
 /// A diagnostic line of GHDL output: `<file>:<line>:<column>:<severity>:<message>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GhdlMessage<'line> {
@@ -263,19 +286,24 @@ impl GhdlMessage<'_> {
 mod tests {
     use super::*;
 
-    fn pos(line: u32, column: u32) -> Position {
-        Position { line, column }
+    #[test]
+    fn error_chain_joins_the_sources() {
+        let error = crate::config::ReadError {
+            path: "a.toml".into(),
+            source: std::io::Error::other("gone"),
+        };
+        assert_eq!(error_chain(&error), "failed to read a.toml: gone");
     }
 
     #[test]
     fn positions_are_one_based() {
         let index = LineIndex::new(b"ab\ncd\n");
-        assert_eq!(index.position(0), pos(1, 1));
-        assert_eq!(index.position(1), pos(1, 2));
-        assert_eq!(index.position(3), pos(2, 1));
-        assert_eq!(index.position(5), pos(2, 3));
-        assert_eq!(index.position(6), pos(3, 1));
-        assert_eq!(index.position(100), pos(3, 1));
+        assert_eq!(index.position(0), Position::new(1, 1));
+        assert_eq!(index.position(1), Position::new(1, 2));
+        assert_eq!(index.position(3), Position::new(2, 1));
+        assert_eq!(index.position(5), Position::new(2, 3));
+        assert_eq!(index.position(6), Position::new(3, 1));
+        assert_eq!(index.position(100), Position::new(3, 1));
     }
 
     #[test]
@@ -283,24 +311,24 @@ mod tests {
         // "ä" is two bytes and one UTF-16 code unit; "𝄞" is four bytes and two code units.
         let text = "äx𝄞y\n".as_bytes();
         let index = LineIndex::new(text);
-        assert_eq!(index.position(2), pos(1, 2));
-        assert_eq!(index.position(7), pos(1, 5));
+        assert_eq!(index.position(2), Position::new(1, 2));
+        assert_eq!(index.position(7), Position::new(1, 5));
     }
 
     #[test]
     fn non_utf8_lines_count_bytes() {
         let text = b"\xe4x\ny";
         let index = LineIndex::new(text);
-        assert_eq!(index.position(1), pos(1, 2));
-        assert_eq!(index.position(3), pos(2, 1));
+        assert_eq!(index.position(1), Position::new(1, 2));
+        assert_eq!(index.position(3), Position::new(2, 1));
     }
 
     #[test]
     fn range_end_is_last_character() {
         let index = LineIndex::new(b"entity foo is");
         let range = index.range(7..10);
-        assert_eq!(range.start, pos(1, 8));
-        assert_eq!(range.end, pos(1, 10));
+        assert_eq!(range.start, Position::new(1, 8));
+        assert_eq!(range.end, Position::new(1, 10));
     }
 
     #[test]
@@ -310,7 +338,7 @@ mod tests {
             GhdlMessage::parse(line),
             Some(GhdlMessage {
                 file: "/proj/tb_bad_syntax.vhd",
-                position: pos(4, 28),
+                position: Position::new(4, 28),
                 severity: Severity::Error,
                 message: "missing \";\" at end of use clause",
             })
@@ -353,8 +381,8 @@ mod tests {
         let diagnostic = Diagnostic::warning("something")
             .in_file("/a/b.vhd")
             .at(Some(Range {
-                start: pos(3, 4),
-                end: pos(3, 5),
+                start: Position::new(3, 4),
+                end: Position::new(3, 5),
             }));
         assert_eq!(diagnostic.to_string(), "/a/b.vhd:3:4: warning: something");
     }

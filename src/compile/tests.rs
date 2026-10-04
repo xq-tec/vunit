@@ -8,11 +8,12 @@
 //! AI NOTICE: Generated, minimally reviewed.
 
 use super::*;
-use crate::vhdl_parser::VhdlDesignFile;
+use crate::test_support::TempRoot;
+use crate::test_support::add_vhdl;
+use crate::test_support::simulator;
 
 struct Fixture {
-    _temp: tempfile::TempDir,
-    root: Utf8PathBuf,
+    temp: TempRoot,
     layout: OutputLayout,
     project: Project,
     simulator: Simulator,
@@ -21,21 +22,13 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
-        let root = Utf8Path::from_path(temp.path()).unwrap().to_owned();
-        let simulator = Simulator::from_identity(SimulatorIdentity {
-            path: "/bin/risim-ghdl".into(),
-            size: 1,
-            modified: None,
-            version_output: "GHDL 6.4.0-risim [simulation adapter]".to_owned(),
-        })
-        .unwrap();
+        let temp = TempRoot::new();
+        let layout = OutputLayout::new(&temp.root);
         Self {
-            _temp: temp,
-            root: root.clone(),
-            layout: OutputLayout::new(&root),
+            temp,
+            layout,
             project: Project::new(),
-            simulator,
+            simulator: simulator(),
             options: CompileOptions::default(),
         }
     }
@@ -50,15 +43,8 @@ impl Fixture {
     }
 
     fn add(&mut self, library: &str, name: &str, code: &str) -> FileId {
-        let library = self.project.find_library(library).unwrap();
-        let design_file = VhdlDesignFile::parse(code.as_bytes()).ok().map(Arc::new);
-        self.project.add_source_file(
-            library,
-            &self.root.join(name),
-            None,
-            ContentHash::of(code.as_bytes()),
-            design_file,
-        )
+        let path = self.temp.root.join(name);
+        add_vhdl(&mut self.project, library, &path, code)
     }
 
     fn plan(&self, targets: &[FileId], state: &CompileState) -> CompilePlan {

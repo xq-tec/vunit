@@ -58,7 +58,8 @@ use crate::store::FileKey;
 use crate::store::OutputLayout;
 use crate::store::OutputLock;
 use crate::store::ResultStore;
-use crate::store::TestOutcome;
+use crate::store::TestCounts;
+use crate::sync::lock_unpoisoned;
 use crate::watch::Change;
 use crate::watch::Debouncer;
 use crate::watch::DirectoryWatcher;
@@ -106,13 +107,11 @@ struct RunningCompile {
 struct RunningSimulation {
     tags: Vec<RequestTag>,
     finished: bool,
-    passed: usize,
-    failed: usize,
-    cancelled: usize,
+    counts: TestCounts,
 }
 
 /// How the actor is shutting down.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Closing {
     replies: Vec<oneshot::Sender<()>>,
 }
@@ -281,7 +280,7 @@ impl Actor {
                     } else {
                         // All handles are gone: finish the operations, then close.
                         self.commands_closed = true;
-                        self.closing.get_or_insert_with(|| Closing { replies: Vec::new() });
+                        self.closing.get_or_insert_default();
                     }
                 },
                 Some(event) = self.watch_events.recv() => self.handle_watch_event(event),
@@ -316,12 +315,7 @@ impl Actor {
             Command::Close(reply) => {
                 self.cancel.cancel();
                 self.drop_queued();
-                self.closing
-                    .get_or_insert_with(|| Closing {
-                        replies: Vec::new(),
-                    })
-                    .replies
-                    .push(reply);
+                self.closing.get_or_insert_default().replies.push(reply);
             },
         }
     }
@@ -600,11 +594,7 @@ impl Actor {
                 output_path,
                 duration,
             } => {
-                match outcome {
-                    TestOutcome::Passed => simulation.passed += 1,
-                    TestOutcome::Failed => simulation.failed += 1,
-                    TestOutcome::Cancelled => simulation.cancelled += 1,
-                }
+                simulation.counts.record(outcome);
                 self.results_dirty = true;
                 self.emit(WorkspaceEventKind::TestFinished {
                     name,
@@ -613,19 +603,10 @@ impl Actor {
                     duration,
                 });
             },
-            SimulationEvent::Finished {
-                passed,
-                failed,
-                cancelled,
-            } => {
+            SimulationEvent::Finished { counts } => {
                 simulation.finished = true;
                 let tags = simulation.tags.clone();
-                self.emit(WorkspaceEventKind::SimulationFinished {
-                    tags,
-                    passed,
-                    failed,
-                    cancelled,
-                });
+                self.emit(WorkspaceEventKind::SimulationFinished { tags, counts });
             },
         }
     }
@@ -639,9 +620,7 @@ impl Actor {
             self.results_dirty = true;
             self.emit(WorkspaceEventKind::SimulationFinished {
                 tags: simulation.tags,
-                passed: simulation.passed,
-                failed: simulation.failed,
-                cancelled: simulation.cancelled,
+                counts: simulation.counts,
             });
         }
     }
@@ -663,7 +642,11 @@ impl Actor {
         match event {
             Ok(event) => {
                 if let Some(watcher) = &mut self.watcher {
-                    watcher.forget_removed(&event);
+                    if event.need_rescan() {
+                        watcher.forget_all();
+                    } else {
+                        watcher.forget_removed(&event);
+                    }
                 }
                 let change = if event.need_rescan() {
                     // Events were lost.
@@ -851,9 +834,7 @@ impl Actor {
 
 fn lock_loader(loader: &Mutex<Loader>) -> MutexGuard<'_, Loader> {
     // A panic while loading leaves the loader usable: every load starts over.
-    loader
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    lock_unpoisoned(loader)
 }
 
 fn send_internal(sender: &mpsc::UnboundedSender<Internal>, message: Internal) {

@@ -13,6 +13,8 @@
 mod artificial;
 mod dependencies;
 mod harness;
+#[path = "../common/trial.rs"]
+mod trial;
 mod vhdl_libraries;
 
 use std::env;
@@ -47,15 +49,7 @@ fn main() -> ExitCode {
     libtest_mimic::run(&args, trials).exit_code()
 }
 
+/// A trial that is ignored unless risim-ghdl is available.
 fn trial<F: Future<Output = ()>>(name: &str, test: impl FnOnce() -> F + Send + 'static) -> Trial {
-    Trial::test(name, move || {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("build the runtime")
-            .block_on(test());
-        Ok(())
-    })
-    .with_ignored_flag(env::var_os(harness::RISIM_GHDL).is_none())
+    trial::trial(name, test).with_ignored_flag(env::var_os(harness::RISIM_GHDL).is_none())
 }

@@ -21,6 +21,7 @@ use risim_vunit_frontend::RequestTag;
 use risim_vunit_frontend::Runtime;
 use risim_vunit_frontend::RuntimeOptions;
 use risim_vunit_frontend::SimulationRequest;
+use risim_vunit_frontend::TestCounts;
 use risim_vunit_frontend::TestOutcome;
 use risim_vunit_frontend::Workspace as Handle;
 use risim_vunit_frontend::WorkspaceEvent;
@@ -31,7 +32,7 @@ use tokio::sync::mpsc;
 use crate::Workspace;
 use crate::simulation_project;
 use crate::testbench;
-use crate::trial;
+use crate::trial::trial;
 
 pub fn trials() -> Vec<Trial> {
     vec![
@@ -233,9 +234,12 @@ fn summary(events: &[WorkspaceEventKind]) -> Vec<String> {
             },
             WorkspaceEventKind::SimulationFinished {
                 tags,
-                passed,
-                failed,
-                cancelled,
+                counts:
+                    TestCounts {
+                        passed,
+                        failed,
+                        cancelled,
+                    },
             } => Some(format!(
                 "simulation_finished {} {passed}/{failed}/{cancelled}",
                 tags_text(tags)
@@ -490,10 +494,11 @@ async fn workspace_runs_a_testcase_once_at_a_time() {
         .handle
         .simulate(requests(&["lib.tb_tests.slow"]), tag("second"));
     let events = summary(&session.operation("second").await);
+    // The lock is released when the test finishes, before its simulation reports the end.
     let first_finished = events
         .iter()
-        .position(|event| event == "simulation_finished first 1/0/0")
-        .expect("the first simulation finishes first");
+        .position(|event| event == "test_finished lib.tb_tests.slow Passed")
+        .expect("the first run finishes first");
     let second_started = events
         .iter()
         .rposition(|event| event == "test_started lib.tb_tests.slow")

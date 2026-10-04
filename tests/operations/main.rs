@@ -12,11 +12,12 @@
 //! AI NOTICE: Generated, minimally reviewed.
 
 mod fake_ghdl;
+#[path = "../common/trial.rs"]
+mod trial;
 mod workspace;
 
 use std::env;
 use std::fs;
-use std::future::Future;
 use std::num::NonZeroUsize;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -29,7 +30,6 @@ use std::time::Instant;
 use camino::Utf8Path;
 use camino::Utf8PathBuf;
 use libtest_mimic::Arguments;
-use libtest_mimic::Trial;
 use risim_vunit_frontend::builtins;
 use risim_vunit_frontend::compile;
 use risim_vunit_frontend::compile::CompileContext;
@@ -55,12 +55,15 @@ use risim_vunit_frontend::spec::ProjectSpec;
 use risim_vunit_frontend::store::CompileState;
 use risim_vunit_frontend::store::OutputLayout;
 use risim_vunit_frontend::store::ResultStore;
+use risim_vunit_frontend::store::TestCounts;
 use risim_vunit_frontend::store::TestOutcome;
 use risim_vunit_frontend::store::TestOutputPaths;
 use risim_vunit_frontend::store::TestResults;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+
+use self::trial::trial;
 
 fn main() -> ExitCode {
     if env::var_os(fake_ghdl::ENV).is_some() {
@@ -133,18 +136,6 @@ fn main() -> ExitCode {
     ];
     let trials = trials.into_iter().chain(workspace::trials()).collect();
     libtest_mimic::run(&args, trials).exit_code()
-}
-
-fn trial<F: Future<Output = ()>>(name: &str, test: impl FnOnce() -> F + Send + 'static) -> Trial {
-    Trial::test(name, move || {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .build()
-            .expect("build the runtime")
-            .block_on(test());
-        Ok(())
-    })
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -846,9 +837,11 @@ async fn simulates_and_records_results() {
     assert!(run.events.iter().any(|event| matches!(
         event,
         SimulationEvent::Finished {
-            passed: 3,
-            failed: 1,
-            cancelled: 0
+            counts: TestCounts {
+                passed: 3,
+                failed: 1,
+                cancelled: 0
+            }
         }
     )));
     assert!(matches!(
@@ -947,7 +940,7 @@ async fn semaphore_limits_simulations() {
     let run = workspace
         .simulate(&[("lib.tb_tests.*", false)], &results)
         .await;
-    assert_eq!(run.report.count(TestOutcome::Passed), 3);
+    assert_eq!(run.report.counts().passed, 3);
     let mut running: i32 = 0;
     let mut max_running = 0;
     for line in workspace.take_log() {
@@ -996,9 +989,11 @@ async fn cancel_terminates_and_skips_simulations() {
     assert!(run.events.iter().any(|event| matches!(
         event,
         SimulationEvent::Finished {
-            passed: 0,
-            failed: 0,
-            cancelled: 2
+            counts: TestCounts {
+                passed: 0,
+                failed: 0,
+                cancelled: 2
+            }
         }
     )));
     // The test that never started has no `TestStarted` and keeps its previous result.

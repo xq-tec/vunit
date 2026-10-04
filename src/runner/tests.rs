@@ -9,11 +9,11 @@
 
 use super::*;
 use crate::discovery;
-use crate::simulator::SimulatorIdentity;
-use crate::sources::ContentHash;
 use crate::spec::ConfigurationSpec;
 use crate::spec::TestConfigSpec;
-use crate::vhdl_parser::VhdlDesignFile;
+use crate::test_support::add_vhdl;
+use crate::test_support::simulator;
+use crate::test_support::simulator_identity;
 
 // -------------------------------------------------------------------------------------------------
 // runner_cfg and seeds
@@ -165,15 +165,7 @@ impl Fixture {
     }
 
     fn add(&mut self, path: &str, code: &str) {
-        let library = self.project.find_library("Lib").unwrap();
-        let design_file = VhdlDesignFile::parse(code.as_bytes()).unwrap();
-        self.project.add_source_file(
-            library,
-            Utf8Path::new(path),
-            None,
-            ContentHash::of(code.as_bytes()),
-            Some(Arc::new(design_file)),
-        );
+        add_vhdl(&mut self.project, "Lib", Utf8Path::new(path), code);
     }
 
     fn plan(&self, requests: &[(&str, bool)]) -> SimulationPlan {
@@ -197,16 +189,6 @@ impl Fixture {
             &requests,
         )
     }
-}
-
-fn simulator() -> Simulator {
-    Simulator::from_identity(SimulatorIdentity {
-        path: "/bin/risim-ghdl".into(),
-        size: 1,
-        modified: None,
-        version_output: "GHDL 6.4.0-risim [simulation adapter]\n".to_owned(),
-    })
-    .unwrap()
 }
 
 /// A testbench with the given extra generics and tests.
@@ -396,13 +378,8 @@ fn unsupported_standard_fails_the_command() {
         .unwrap();
     fixture.add("/ws/tb_19.vhd", &testbench("tb_19", "", &[]));
     let plan = fixture.plan(&[("*", false)]);
-    let old = Simulator::from_identity(SimulatorIdentity {
-        path: "/bin/risim-ghdl".into(),
-        size: 1,
-        modified: None,
-        version_output: "GHDL 5.0.0 [simulation adapter]\n".to_owned(),
-    })
-    .unwrap();
+    let old =
+        Simulator::from_identity(simulator_identity("GHDL 5.0.0 [simulation adapter]\n")).unwrap();
     plan.tests[0].command(&old, "1").unwrap_err();
     plan.tests[0].command(&simulator(), "1").unwrap();
 }
@@ -429,7 +406,7 @@ async fn cancelled_simulation_starts_nothing_despite_free_permits() {
     context.cancel.cancel();
     // Nothing is dispatched, so `/ws` is never touched.
     let report = simulate(plan, &context).await;
-    assert_eq!(report.count(TestOutcome::Cancelled), 3);
+    assert_eq!(report.counts().cancelled, 3);
     drop(context);
     let mut started = 0;
     while let Some(event) = receiver.recv().await {

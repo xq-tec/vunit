@@ -263,6 +263,7 @@ pub fn extract(builtins_root: &Utf8Path) -> io::Result<Utf8PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TempRoot;
 
     fn rel_paths(library: &BuiltinLibrary) -> Vec<&'static str> {
         library.files.iter().map(|file| file.rel_path).collect()
@@ -394,8 +395,8 @@ mod tests {
 
     #[test]
     fn extract_writes_files_once_and_removes_old_ones() {
-        let temp = tempfile::tempdir().unwrap();
-        let root = Utf8Path::from_path(temp.path()).unwrap().join("builtins");
+        let temp = TempRoot::new();
+        let root = temp.root.join("builtins");
         fs::create_dir_all(root.join("old")).unwrap();
 
         let target = extract(&root).unwrap();

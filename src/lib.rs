@@ -35,6 +35,9 @@ pub mod simulator;
 pub mod sources;
 pub mod spec;
 pub mod store;
+mod sync;
+#[cfg(test)]
+mod test_support;
 pub mod vhdl_parser;
 pub mod vhdl_standard;
 pub mod watch;
@@ -42,10 +45,12 @@ pub mod workspace;
 
 pub use crate::diagnostics::Diagnostic;
 pub use crate::diagnostics::DiagnosticSource;
+pub use crate::diagnostics::error_chain;
 pub use crate::discovery::Testcase;
 pub use crate::runtime::Runtime;
 pub use crate::runtime::RuntimeError;
 pub use crate::runtime::RuntimeOptions;
+pub use crate::store::TestCounts;
 pub use crate::store::TestOutcome;
 pub use crate::store::TestResult;
 pub use crate::workspace::DiagnosticSets;

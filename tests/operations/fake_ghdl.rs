@@ -113,9 +113,6 @@ fn analyse(args: &[String]) -> ExitCode {
                 }
             },
             "output" => eprintln!("{argument}"),
-            "exit" => code = argument.parse().unwrap_or(1),
-            "sleep" => thread::sleep(Duration::from_millis(argument.parse().unwrap_or(0))),
-            "hang" => thread::sleep(Duration::from_secs(3600)),
             "spawn-sleeper" => {
                 #[expect(
                     clippy::zombie_processes,
@@ -127,11 +124,24 @@ fn analyse(args: &[String]) -> ExitCode {
                     .expect("spawn the sleeper");
                 fs::write(argument, child.id().to_string()).expect("write the PID");
             },
+            _ if shared_directive(command, argument, &mut code) => {},
             _ => eprintln!("fake risim-ghdl: unknown directive {directive}"),
         }
     }
     log(&format!("end {work} {name}"));
     ExitCode::from(code)
+}
+
+/// Runs a directive that `analyse` and `simulate` handle alike: `exit`, `sleep` or `hang`.
+/// Returns `false` for any other directive.
+fn shared_directive(command: &str, argument: &str, code: &mut u8) -> bool {
+    match command {
+        "exit" => *code = argument.parse().unwrap_or(1),
+        "sleep" => thread::sleep(Duration::from_millis(argument.parse().unwrap_or(0))),
+        "hang" => thread::sleep(Duration::from_secs(3600)),
+        _ => return false,
+    }
+    true
 }
 
 /// Decodes `VUnit`'s dictionary encoding (`encode_dict`).
@@ -199,10 +209,8 @@ fn simulate(args: &[String]) -> ExitCode {
                 code = 1;
             },
             "no-results" => results = false,
-            "exit" => code = argument.parse().unwrap_or(1),
             "print" => println!("{argument}"),
-            "sleep" => thread::sleep(Duration::from_millis(argument.parse().unwrap_or(0))),
-            "hang" => thread::sleep(Duration::from_secs(3600)),
+            _ if shared_directive(command, argument, &mut code) => {},
             _ => eprintln!("fake risim-ghdl: unknown directive {directive}"),
         }
     }

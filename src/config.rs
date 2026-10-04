@@ -29,7 +29,6 @@ use std::ops;
 
 use camino::Utf8Path;
 use camino::Utf8PathBuf;
-use rustc_hash::FxHashMap;
 use serde::Deserialize;
 use thiserror::Error;
 use toml::Spanned;
@@ -39,7 +38,7 @@ use toml::de::DeValue;
 use crate::diagnostics::Diagnostic;
 use crate::diagnostics::LineIndex;
 use crate::diagnostics::Severity;
-use crate::sources::library_name_error;
+use crate::project::LibraryNames;
 use crate::spec::CompileOptions;
 use crate::spec::Feature;
 use crate::spec::FilePattern;
@@ -232,13 +231,12 @@ impl Parser<'_> {
             })
             .collect();
         libraries.sort_by_key(|(span, _, _)| span.as_ref().map(|span| span.start));
-        let mut lowercase_names = FxHashMap::default();
+        let mut names = LibraryNames::new();
         for (span, name, library) in libraries {
-            if let Some(error) = library_name_error(&name, &lowercase_names) {
-                self.diagnostic(Severity::Error, error, span);
+            if let Err(error) = names.insert(&name) {
+                self.diagnostic(Severity::Error, error.to_string(), span);
                 continue;
             }
-            lowercase_names.insert(name.to_ascii_lowercase(), name.clone());
 
             let files = library
                 .files
@@ -297,11 +295,10 @@ fn path_segments(path: &serde_ignored::Path<'_>) -> Vec<PathSegment> {
 
 /// Finds the span of the last key in `path`, or of the array element if it ends with an index.
 fn key_span(table: &DeTable<'_>, path: &[PathSegment]) -> Option<ops::Range<usize>> {
-    let (last, parents) = path.split_last()?;
     let mut value: Option<&DeValue<'_>> = None;
     let mut current_table = Some(table);
     let mut span = None;
-    for segment in parents.iter().chain(std::iter::once(last)) {
+    for segment in path {
         match segment {
             PathSegment::Key(key) => {
                 let (found_key, found_value) = current_table?
@@ -326,15 +323,12 @@ mod tests {
     use super::*;
     use crate::diagnostics::Position;
     use crate::diagnostics::Range;
+    use crate::test_support::TempRoot;
 
     const PATH: &str = "/proj/risim-config.toml";
 
     fn parse_str(content: &str) -> Config {
         parse(Utf8Path::new(PATH), content)
-    }
-
-    fn pos(line: u32, column: u32) -> Position {
-        Position { line, column }
     }
 
     fn library_names(spec: &ProjectSpec) -> Vec<&str> {
@@ -370,8 +364,8 @@ files = ["sim/model/*.vhd", "tb/*.vhd"]
             Some(PatternLocation {
                 file: PATH.into(),
                 range: Range {
-                    start: pos(11, 10),
-                    end: pos(11, 26),
+                    start: Position::new(11, 10),
+                    end: Position::new(11, 26),
                 },
             })
         );
@@ -433,23 +427,26 @@ files = []
             .collect();
         assert_eq!(
             errors,
-            [(Severity::Error, pos(2, 12)), (Severity::Error, pos(6, 12))]
+            [
+                (Severity::Error, Position::new(2, 12)),
+                (Severity::Error, Position::new(6, 12))
+            ]
         );
         assert!(config.diagnostics[1].message.contains("'Lib'"));
     }
 
     #[test]
     fn invalid_utf8_is_a_diagnostic() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = Utf8Path::from_path(temp.path())
-            .unwrap()
-            .join("risim-config.toml");
-        fs::write(&path, b"options = []\n# caf\xe9\n").unwrap();
+        let temp = TempRoot::new();
+        let path = temp.write("risim-config.toml", b"options = []\n# caf\xe9\n");
         let config = load(&path).unwrap();
         assert!(config.spec.is_none());
         assert_eq!(config.diagnostics.len(), 1);
         assert_eq!(config.diagnostics[0].severity, Severity::Error);
-        assert_eq!(config.diagnostics[0].range.unwrap().start, pos(2, 6));
+        assert_eq!(
+            config.diagnostics[0].range.unwrap().start,
+            Position::new(2, 6)
+        );
     }
 
     #[test]
@@ -471,8 +468,8 @@ files = []
         assert_eq!(
             diagnostic.range,
             Some(Range {
-                start: pos(2, 23),
-                end: pos(2, 34),
+                start: Position::new(2, 23),
+                end: Position::new(2, 34),
             })
         );
     }
@@ -505,12 +502,12 @@ standard = "2008"
                 (
                     Severity::Warning,
                     "unknown key 'optons' is ignored",
-                    Some(pos(2, 1))
+                    Some(Position::new(2, 1))
                 ),
                 (
                     Severity::Warning,
                     "unknown key 'libraries.lib.standard' is ignored",
-                    Some(pos(5, 1))
+                    Some(Position::new(5, 1))
                 ),
             ]
         );

@@ -74,54 +74,40 @@ pub struct VhdlEntity {
     pub ports: Vec<VhdlInterfaceElement>,
 }
 
-/// An architecture body.
+/// A design unit that is known by its name alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VhdlArchitecture {
-    /// The lowercase architecture name.
+pub struct VhdlNamedUnit {
+    /// The lowercase name; for a package body, the name of its package.
+    pub identifier: String,
+    /// The location of the name.
+    pub range: Range,
+}
+
+/// A design unit that belongs to an entity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VhdlEntityUnit {
+    /// The lowercase name of the unit.
     pub identifier: String,
     /// The lowercase name of the entity.
     pub entity: String,
-    /// The location of the architecture name.
+    /// The location of the unit's name.
     pub range: Range,
 }
+
+/// An architecture body.
+pub type VhdlArchitecture = VhdlEntityUnit;
 
 /// A package declaration or package instantiation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VhdlPackage {
-    /// The lowercase package name.
-    pub identifier: String,
-    /// The location of the name.
-    pub range: Range,
-}
+pub type VhdlPackage = VhdlNamedUnit;
 
 /// A package body.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VhdlPackageBody {
-    /// The lowercase package name.
-    pub identifier: String,
-    /// The location of the name.
-    pub range: Range,
-}
+pub type VhdlPackageBody = VhdlNamedUnit;
 
 /// A context declaration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VhdlContext {
-    /// The lowercase context name.
-    pub identifier: String,
-    /// The location of the name.
-    pub range: Range,
-}
+pub type VhdlContext = VhdlNamedUnit;
 
-/// A configuration declaration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VhdlConfiguration {
-    /// The lowercase configuration name.
-    pub identifier: String,
-    /// The lowercase name of the configured entity.
-    pub entity: String,
-    /// The location of the configuration name.
-    pub range: Range,
-}
+/// A configuration declaration of an entity.
+pub type VhdlConfiguration = VhdlEntityUnit;
 
 /// A generic or port of an entity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,7 +220,7 @@ impl VhdlDesignFile {
 
         let mut entities = Vec::new();
         for captures in ENTITY_START_RE.captures_iter(&code) {
-            let start = captures.get(0).map_or(0, |found| found.start());
+            let start = captures.get_match().start();
             let identifier = group_bytes(&captures, "id");
             let sub_code = &code[start..];
             if let Some(end) = entity_end_re(identifier).find(sub_code) {
@@ -261,7 +247,7 @@ impl VhdlDesignFile {
 
         let mut packages = Vec::new();
         for captures in PACKAGE_START_RE.captures_iter(&code) {
-            let start = captures.get(0).map_or(0, |found| found.start());
+            let start = captures.get_match().start();
             let identifier = group_bytes(&captures, "id");
             if package_end_re(identifier).is_match(&code[start..]) {
                 packages.push(VhdlPackage {
@@ -297,11 +283,7 @@ impl VhdlDesignFile {
 
         let component_instantiations = COMPONENT_RE
             .captures_iter(&code)
-            .map(|captures| {
-                captures
-                    .get(1)
-                    .map_or_else(String::new, |found| latin1(found.as_bytes()))
-            })
+            .map(|captures| group(&captures, "component"))
             .collect();
 
         let configurations = CONFIGURATION_RE
@@ -345,6 +327,10 @@ pub(crate) struct Flags {
     pub(crate) dot_all: bool,
 }
 
+pub(crate) const NO_FLAGS: Flags = Flags {
+    multi_line: false,
+    dot_all: false,
+};
 const MULTILINE: Flags = Flags {
     multi_line: true,
     dot_all: false,
@@ -423,7 +409,7 @@ fn escape_bytes(bytes: &[u8]) -> String {
         if byte.is_ascii_alphanumeric() || byte == b'_' {
             escaped.push(char::from(byte));
         } else {
-            write!(escaped, r"\x{byte:02X}").unwrap_or_default();
+            write!(escaped, r"\x{byte:02X}").expect("writing to a String succeeds");
         }
     }
     escaped
@@ -434,11 +420,8 @@ static COMMENT_RE: LazyLock<Regex> =
 
 static COMPONENT_RE: LazyLock<Regex> = LazyLock::new(|| {
     python_regex(
-        r#"(?:<ID>)\s*:\s*(?:component)?\s*(?:(?:<ID>)\.)?(<ID>)\s*(?:generic|port) map\s*\([\s\w=>,.)(+\-*/'"]*\);"#,
-        Flags {
-            multi_line: false,
-            dot_all: false,
-        },
+        r#"(?:<ID>)\s*:\s*(?:component)?\s*(?:(?:<ID>)\.)?(?P<component><ID>)\s*(?:generic|port) map\s*\([\s\w=>,.)(+\-*/'"]*\);"#,
+        NO_FLAGS,
     )
 });
 
@@ -580,6 +563,10 @@ fn group_bytes<'code>(captures: &Captures<'code>, name: &str) -> &'code [u8] {
 
 fn group(captures: &Captures<'_>, name: &str) -> String {
     latin1(group_bytes(captures, name))
+}
+
+fn optional_group(captures: &Captures<'_>, name: &str) -> Option<String> {
+    captures.name(name).map(|found| latin1(found.as_bytes()))
 }
 
 /// Whitespace as Python's `str.strip()` and `str.split()` see it in Latin-1 text.
@@ -801,9 +788,7 @@ fn parse_subtype_indication(code: &[u8]) -> Option<VhdlSubtypeIndication> {
     Some(VhdlSubtypeIndication {
         code: latin1(code),
         type_mark,
-        constraint: captures
-            .name("constraint")
-            .map(|constraint| latin1(constraint.as_bytes())),
+        constraint: optional_group(&captures, "constraint"),
         array_type,
     })
 }
@@ -852,7 +837,7 @@ fn find_references(code: &[u8]) -> Vec<VhdlReference> {
                 reference_type: ReferenceType::Entity,
                 library: group(&captures, "lib"),
                 design_unit: group(&captures, "ent"),
-                name_within: captures.name("arch").map(|arch| latin1(arch.as_bytes())),
+                name_within: optional_group(&captures, "arch"),
             }),
     );
 

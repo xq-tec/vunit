@@ -14,6 +14,7 @@
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
+use std::ffi::OsStr;
 use std::fs;
 use std::fs::File;
 use std::io;
@@ -46,7 +47,11 @@ pub enum Outcome {
 /// Creates a command for `program` without a console window on Windows.
 ///
 /// The process is killed if the returned command's child is dropped.
-pub fn command(program: &Utf8Path, args: &[String], cwd: Option<&Utf8Path>) -> Command {
+pub fn command(
+    program: &Utf8Path,
+    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+    cwd: Option<&Utf8Path>,
+) -> Command {
     let mut command = Command::new(program);
     command.args(args).stdin(Stdio::null()).kill_on_drop(true);
     if let Some(cwd) = cwd {
@@ -272,9 +277,11 @@ impl Supervised {
 mod job {
     use std::ffi::c_void;
     use std::io;
+    use std::os::windows::io::AsRawHandle as _;
+    use std::os::windows::io::FromRawHandle as _;
+    use std::os::windows::io::OwnedHandle;
     use std::os::windows::io::RawHandle;
 
-    use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::System::JobObjects::AssignProcessToJobObject;
     use windows::Win32::System::JobObjects::CreateJobObjectW;
@@ -286,19 +293,15 @@ mod job {
     use windows::core::PCWSTR;
 
     /// A job object that kills its processes when it is closed.
-    pub(super) struct Job(HANDLE);
-
-    // SAFETY: A job handle can be used from any thread.
-    unsafe impl Send for Job {}
-    // SAFETY: The job functions used here are thread-safe.
-    unsafe impl Sync for Job {}
+    pub(super) struct Job(OwnedHandle);
 
     impl Job {
         pub(super) fn new() -> io::Result<Self> {
             // SAFETY: Creates an anonymous job with default security; no pointers are passed.
             let handle =
                 unsafe { CreateJobObjectW(None, PCWSTR::null()) }.map_err(io::Error::from)?;
-            let job = Self(handle);
+            // SAFETY: The handle was just created, is valid, and nothing else owns it.
+            let job = Self(unsafe { OwnedHandle::from_raw_handle(handle.0) });
             let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
             info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
             #[expect(
@@ -310,7 +313,7 @@ mod job {
             // that outlives the call.
             unsafe {
                 SetInformationJobObject(
-                    job.0,
+                    job.handle(),
                     JobObjectExtendedLimitInformation,
                     (&raw const info).cast::<c_void>(),
                     size,
@@ -320,43 +323,35 @@ mod job {
             Ok(job)
         }
 
+        fn handle(&self) -> HANDLE {
+            HANDLE(self.0.as_raw_handle())
+        }
+
         pub(super) fn assign(&self, process: RawHandle) -> io::Result<()> {
             // SAFETY: Both handles are valid: the job is owned by `self`, and the process handle
             // belongs to a child that hasn't been waited for yet.
-            unsafe { AssignProcessToJobObject(self.0, HANDLE(process)) }.map_err(io::Error::from)
+            unsafe { AssignProcessToJobObject(self.handle(), HANDLE(process)) }
+                .map_err(io::Error::from)
         }
 
         pub(super) fn terminate(&self) {
             // SAFETY: The job handle is valid while `self` exists.
-            if let Err(error) = unsafe { TerminateJobObject(self.0, 1) } {
+            if let Err(error) = unsafe { TerminateJobObject(self.handle(), 1) } {
                 tracing::debug!(%error, "failed to terminate job");
             }
-        }
-    }
-
-    impl Drop for Job {
-        fn drop(&mut self) {
-            // SAFETY: The handle is valid and closed only here.
-            let _ignored = unsafe { CloseHandle(self.0) };
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use camino::Utf8PathBuf;
     #[cfg(unix)]
     use nix::sys::signal::kill;
     #[cfg(unix)]
     use nix::unistd::Pid;
 
     use super::*;
-
-    fn temp() -> (tempfile::TempDir, Utf8PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = Utf8Path::from_path(dir.path()).unwrap().to_owned();
-        (dir, path)
-    }
+    use crate::test_support::TempRoot;
 
     fn shell(script: &str) -> Vec<String> {
         if cfg!(windows) {
@@ -368,13 +363,14 @@ mod tests {
 
     #[tokio::test]
     async fn run_to_file_captures_output_and_status() {
-        let (_dir, root) = temp();
+        let temp = TempRoot::new();
+        let root = &temp.root;
         let output = root.join("nested/out.txt");
         fs::create_dir_all(output.parent().unwrap()).unwrap();
         fs::write(&output, "old contents\n").unwrap();
         let outcome = run_to_file(
             &shell("echo hello && echo oops 1>&2 && exit 3"),
-            &root,
+            root,
             &output,
             b"header\n",
             &CancellationToken::new(),
@@ -393,12 +389,13 @@ mod tests {
 
     #[tokio::test]
     async fn run_piped_reports_lines() {
-        let (_dir, root) = temp();
+        let temp = TempRoot::new();
+        let root = &temp.root;
         let output = root.join("out.txt");
         let mut lines = Vec::new();
         let outcome = run_piped(
             &shell("echo one && echo two 1>&2 && echo three"),
-            &root,
+            root,
             &output,
             &CancellationToken::new(),
             |line| lines.push(line.to_owned()),
@@ -414,10 +411,11 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_failure_is_an_error() {
-        let (_dir, root) = temp();
+        let temp = TempRoot::new();
+        let root = &temp.root;
         let result = run_to_file(
             &[root.join("missing-program").to_string()],
-            &root,
+            root,
             &root.join("out.txt"),
             b"",
             &CancellationToken::new(),
@@ -426,7 +424,7 @@ mod tests {
         result.unwrap_err();
         run_to_file(
             &[],
-            &root,
+            root,
             &root.join("out.txt"),
             b"",
             &CancellationToken::new(),
@@ -438,7 +436,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancel_kills_the_process_group() {
-        let (_dir, root) = temp();
+        let temp = TempRoot::new();
+        let root = &temp.root;
         let pid_file = root.join("grandchild.pid");
         let cancel = CancellationToken::new();
         let script = format!("sleep 30 & echo $! > {pid_file}; echo started; wait");
@@ -488,7 +487,8 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancel_escalates_to_sigkill() {
-        let (_dir, root) = temp();
+        let temp = TempRoot::new();
+        let root = &temp.root;
         let cancel = CancellationToken::new();
         let started = std::time::Instant::now();
         let task = {

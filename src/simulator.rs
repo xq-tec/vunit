@@ -52,7 +52,7 @@ pub struct Version {
 #[derive(Debug, Error)]
 pub enum DetectError {
     /// The executable can't be inspected or run.
-    #[error("failed to run {path}: {source}")]
+    #[error("failed to run {path}")]
     Io {
         /// The executable.
         path: Utf8PathBuf,
@@ -106,7 +106,7 @@ impl Simulator {
             source,
         };
         let metadata = fs::metadata(path).map_err(io_error)?;
-        let output = process::command(path, &["--version".to_owned()], None)
+        let output = process::command(path, ["--version"], None)
             .output()
             .await
             .map_err(io_error)?;
@@ -190,20 +190,39 @@ impl Simulator {
         })
     }
 
+    /// The beginning of a command line in `mode`, up to the `-P` options.
+    fn base_command(
+        &self,
+        mode: &str,
+        vhdl_standard: VhdlStandard,
+        library: &str,
+        library_dir: &Utf8Path,
+        library_dirs: &[Utf8PathBuf],
+    ) -> Result<Vec<String>, CommandError> {
+        let mut command = vec![
+            self.path().to_string(),
+            mode.to_owned(),
+            format!("--std={}", self.std_flag(vhdl_standard)?),
+            format!("--work={library}"),
+            format!("--workdir={library_dir}"),
+        ];
+        command.extend(library_dirs.iter().map(|dir| format!("-P{dir}")));
+        Ok(command)
+    }
+
     /// The command line analysing one file.
     ///
     /// # Errors
     ///
     /// Fails if the standard isn't supported.
     pub fn compile_command(&self, args: &CompileArgs<'_>) -> Result<Vec<String>, CommandError> {
-        let mut command = vec![
-            self.path().to_string(),
-            "-a".to_owned(),
-            format!("--workdir={}", args.library_dir),
-            format!("--work={}", args.library),
-            format!("--std={}", self.std_flag(args.vhdl_standard)?),
-        ];
-        command.extend(args.library_dirs.iter().map(|dir| format!("-P{dir}")));
+        let mut command = self.base_command(
+            "-a",
+            args.vhdl_standard,
+            args.library,
+            args.library_dir,
+            args.library_dirs,
+        )?;
         command.extend(args.flags.iter().cloned());
         command.push(args.file.to_string());
         Ok(command)
@@ -215,21 +234,20 @@ impl Simulator {
     ///
     /// Fails if the standard isn't supported.
     pub fn simulate_command(&self, args: &SimulateArgs<'_>) -> Result<Vec<String>, CommandError> {
-        let mut command = vec![
-            self.path().to_string(),
-            "--elab-run".to_owned(),
-            format!("--std={}", self.std_flag(args.vhdl_standard)?),
-            format!("--work={}", args.library),
-            format!("--workdir={}", args.library_dir),
-        ];
-        command.extend(args.library_dirs.iter().map(|dir| format!("-P{dir}")));
+        let mut command = self.base_command(
+            "--elab-run",
+            args.vhdl_standard,
+            args.library,
+            args.library_dir,
+            args.library_dirs,
+        )?;
         command.extend(args.elab_flags.iter().cloned());
-        match &args.top {
-            Top::Configuration(name) => command.push((*name).to_owned()),
+        match args.top {
+            Top::Configuration(name) => command.push(name.clone()),
             Top::Entity {
                 entity,
                 architecture,
-            } => command.extend([(*entity).to_owned(), (*architecture).to_owned()]),
+            } => command.extend([entity.clone(), architecture.clone()]),
         }
         command.extend(args.sim_flags.iter().cloned());
         command.extend(
@@ -237,14 +255,7 @@ impl Simulator {
                 .iter()
                 .map(|(name, value)| format!("-g{name}={value}")),
         );
-        command.push(format!(
-            "--assert-level={}",
-            match args.assert_level {
-                AssertLevel::Warning => "warning",
-                AssertLevel::Error => "error",
-                AssertLevel::Failure => "failure",
-            }
-        ));
+        command.push(format!("--assert-level={}", args.assert_level));
         if args.disable_ieee_asserts {
             command.push("--ieee-asserts=disable".to_owned());
         }
@@ -275,15 +286,15 @@ pub struct CompileArgs<'a> {
 
 /// The top-level unit of a simulation.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Top<'a> {
+pub enum Top {
     /// A VHDL configuration.
-    Configuration(&'a str),
+    Configuration(String),
     /// An entity and its architecture.
     Entity {
         /// The entity name.
-        entity: &'a str,
+        entity: String,
         /// The architecture name.
-        architecture: &'a str,
+        architecture: String,
     },
 }
 
@@ -301,7 +312,7 @@ pub struct SimulateArgs<'a> {
     /// Extra elaboration flags.
     pub elab_flags: &'a [String],
     /// The unit to elaborate.
-    pub top: Top<'a>,
+    pub top: &'a Top,
     /// Extra simulation flags.
     pub sim_flags: &'a [String],
     /// Generic values.
@@ -319,18 +330,13 @@ pub struct SimulateArgs<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::simulator_identity;
 
     const VERSION_OUTPUT: &str = "GHDL 6.4.0-risim (tarball) [simulation adapter]\n \
                                   Compiled with GNAT Version: 10.5.0\n";
 
     fn simulator(version_output: &str) -> Simulator {
-        Simulator::from_identity(SimulatorIdentity {
-            path: "/opt/bin/risim-ghdl".into(),
-            size: 1,
-            modified: None,
-            version_output: version_output.to_owned(),
-        })
-        .unwrap()
+        Simulator::from_identity(simulator_identity(version_output)).unwrap()
     }
 
     #[test]
@@ -348,13 +354,7 @@ mod tests {
             "something else",
             "GHDL 6.4.0\n[simulation adapter]",
         ] {
-            Simulator::from_identity(SimulatorIdentity {
-                path: "/ghdl".into(),
-                size: 0,
-                modified: None,
-                version_output: output.to_owned(),
-            })
-            .unwrap_err();
+            Simulator::from_identity(simulator_identity(output)).unwrap_err();
         }
     }
 
@@ -392,11 +392,11 @@ mod tests {
         assert_eq!(
             command,
             [
-                "/opt/bin/risim-ghdl",
+                "/bin/risim-ghdl",
                 "-a",
-                "--workdir=/out/libraries/lib",
-                "--work=lib",
                 "--std=08",
+                "--work=lib",
+                "--workdir=/out/libraries/lib",
                 "-P/out/libraries/vunit_lib",
                 "-P/out/libraries/lib",
                 "-fsynopsys",
@@ -419,9 +419,9 @@ mod tests {
             library_dir: Utf8Path::new("/out/libraries/lib"),
             library_dirs: &library_dirs,
             elab_flags: &["-frelaxed".to_owned()],
-            top: Top::Entity {
-                entity: "tb",
-                architecture: "a",
+            top: &Top::Entity {
+                entity: "tb".to_owned(),
+                architecture: "a".to_owned(),
             },
             sim_flags: &["--stop-time=1ms".to_owned()],
             generics: &generics,
@@ -433,7 +433,7 @@ mod tests {
         assert_eq!(
             simulator.simulate_command(&args).unwrap(),
             [
-                "/opt/bin/risim-ghdl",
+                "/bin/risim-ghdl",
                 "--elab-run",
                 "--std=08",
                 "--work=lib",
@@ -450,7 +450,8 @@ mod tests {
             ]
         );
 
-        args.top = Top::Configuration("cfg");
+        let configuration = Top::Configuration("cfg".to_owned());
+        args.top = &configuration;
         args.assert_level = AssertLevel::Warning;
         args.disable_ieee_asserts = true;
         args.wait = true;

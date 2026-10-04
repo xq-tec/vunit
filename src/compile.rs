@@ -41,6 +41,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use crate::dependency_graph::CircularDependency;
 use crate::dependency_graph::DependencyGraph;
 use crate::diagnostics::Diagnostic;
 use crate::diagnostics::GhdlMessage;
@@ -320,26 +321,21 @@ impl CompilePlan {
             })
             .collect();
 
-        // `depends_on[a]` holds the libraries that library `a` directly depends on.
-        let mut depends_on: Vec<FxHashSet<usize>> = vec![FxHashSet::default(); libraries.len()];
+        let mut library_graph = DependencyGraph::new();
+        for library in 0..libraries.len() {
+            library_graph.add_node(library);
+        }
         for (index, file) in self.files.iter().enumerate() {
             for &dependency in &file.dependencies {
                 if library_of[dependency] != library_of[index] {
-                    depends_on[library_of[index]].insert(library_of[dependency]);
+                    library_graph.add_dependency(library_of[dependency], library_of[index]);
                 }
             }
         }
+        // `reachable[a]` holds library `a` and the libraries it depends on, directly or
+        // indirectly.
         let reachable: Vec<FxHashSet<usize>> = (0..libraries.len())
-            .map(|start| {
-                let mut visited = FxHashSet::default();
-                let mut pending = vec![start];
-                while let Some(library) = pending.pop() {
-                    if visited.insert(library) {
-                        pending.extend(depends_on[library].iter().copied());
-                    }
-                }
-                visited
-            })
+            .map(|library| library_graph.dependencies([library]))
             .collect();
 
         // Libraries that reach each other are strongly connected. Units are numbered in the
@@ -403,7 +399,7 @@ fn file_key(project: &Project, id: FileId, path: &Utf8Path) -> FileKey {
 fn compile_order(
     graph: &DependencyGraph<FileId>,
     selected: &FxHashSet<FileId>,
-) -> Result<Vec<FileId>, crate::dependency_graph::CircularDependency<FileId>> {
+) -> Result<Vec<FileId>, CircularDependency<FileId>> {
     let mut subgraph = DependencyGraph::new();
     for &id in graph.nodes() {
         if selected.contains(&id) {
@@ -617,6 +613,15 @@ struct FileResult {
     diagnostics: Vec<Diagnostic>,
 }
 
+impl FileResult {
+    const fn without_diagnostics(status: FileStatus) -> Self {
+        Self {
+            status,
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
 /// Runs the compile processes of `plan` and updates `state`; doesn't save it.
 pub async fn execute(
     compile_plan: CompilePlan,
@@ -721,10 +726,7 @@ fn finish(
     let mut invalid = Vec::new();
     let mut compiled = FxHashSet::default();
     for (file, result) in plan.files.iter().zip(results) {
-        let result = result.unwrap_or(FileResult {
-            status: FileStatus::Failed,
-            diagnostics: Vec::new(),
-        });
+        let result = result.unwrap_or(FileResult::without_diagnostics(FileStatus::Failed));
         match result.status {
             FileStatus::UpToDate => {
                 if let Some(stored) = state.files.get(&file.key) {
@@ -790,19 +792,13 @@ async fn run_unit(shared: &Shared, unit: usize, mut bad: FxHashSet<usize>) -> Un
             .iter()
             .any(|dependency| bad.contains(dependency))
         {
-            FileResult {
-                status: if shared.context.cancel.is_cancelled() {
-                    FileStatus::NotStarted
-                } else {
-                    FileStatus::Skipped
-                },
-                diagnostics: Vec::new(),
-            }
+            FileResult::without_diagnostics(if shared.context.cancel.is_cancelled() {
+                FileStatus::NotStarted
+            } else {
+                FileStatus::Skipped
+            })
         } else if !file.needs_compile {
-            FileResult {
-                status: FileStatus::UpToDate,
-                diagnostics: Vec::new(),
-            }
+            FileResult::without_diagnostics(FileStatus::UpToDate)
         } else {
             compile_file(shared, file).await
         };
@@ -826,10 +822,7 @@ async fn run_unit(shared: &Shared, unit: usize, mut bad: FxHashSet<usize>) -> Un
 
 async fn compile_file(shared: &Shared, file: &PlannedFile) -> FileResult {
     let context = &shared.context;
-    let not_started = || FileResult {
-        status: FileStatus::NotStarted,
-        diagnostics: Vec::new(),
-    };
+    let not_started = || FileResult::without_diagnostics(FileStatus::NotStarted);
     if context.cancel.is_cancelled() {
         return not_started();
     }
@@ -855,32 +848,31 @@ async fn compile_file(shared: &Shared, file: &PlannedFile) -> FileResult {
 
     let mut diagnostics = Vec::new();
     let mut output = Vec::new();
-    let result = match fs::create_dir_all(&file.library_dir) {
-        Ok(()) => {
-            process::run_piped(
-                &file.command,
-                &context.workspace_root,
-                &file.output_file,
-                &context.cancel,
-                |line| {
-                    if let Some(message) = GhdlMessage::parse(line) {
-                        let diagnostic = message.to_diagnostic(&context.workspace_root);
-                        emit(
-                            &context.events,
-                            CompileEvent::Diagnostic {
-                                key: file.key.clone(),
-                                diagnostic: diagnostic.clone(),
-                            },
-                        );
-                        diagnostics.push(diagnostic);
-                    }
-                    output.push(line.to_owned());
-                },
-            )
-            .await
-        },
-        Err(error) => Err(error),
-    };
+    let result = async {
+        fs::create_dir_all(&file.library_dir)?;
+        process::run_piped(
+            &file.command,
+            &context.workspace_root,
+            &file.output_file,
+            &context.cancel,
+            |line| {
+                if let Some(message) = GhdlMessage::parse(line) {
+                    let diagnostic = message.to_diagnostic(&context.workspace_root);
+                    emit(
+                        &context.events,
+                        CompileEvent::Diagnostic {
+                            key: file.key.clone(),
+                            diagnostic: diagnostic.clone(),
+                        },
+                    );
+                    diagnostics.push(diagnostic);
+                }
+                output.push(line.to_owned());
+            },
+        )
+        .await
+    }
+    .await;
 
     let status = match result {
         Ok(process::Outcome::Exited(status)) if status.success() => FileStatus::Compiled,

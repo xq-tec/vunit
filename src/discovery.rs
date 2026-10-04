@@ -54,7 +54,7 @@ use crate::project::Project;
 use crate::spec::AssertLevel;
 use crate::spec::SimOptions;
 use crate::spec::TestConfigSpec;
-use crate::vhdl_parser::Flags;
+use crate::vhdl_parser::NO_FLAGS;
 use crate::vhdl_parser::VhdlEntity;
 use crate::vhdl_parser::latin1;
 use crate::vhdl_parser::python_regex;
@@ -119,13 +119,8 @@ pub struct ScannedAttribute {
 
 /// The first character of a file.
 const FILE_START: Range = Range {
-    start: Position { line: 1, column: 1 },
-    end: Position { line: 1, column: 1 },
-};
-
-const NO_FLAGS: Flags = Flags {
-    multi_line: false,
-    dot_all: false,
+    start: Position::new(1, 1),
+    end: Position::new(1, 1),
 };
 
 static TEST_CASE_RE: LazyLock<Regex> =
@@ -224,8 +219,8 @@ fn bench_tests(
 
     check_duplicate_tests(&scan.tests, file, diagnostics);
 
-    // Tests with their offsets, in file order.
-    let mut tests: Vec<(usize, BenchTest, Vec<&ScannedAttribute>)> = if scan.tests.is_empty() {
+    // In file order.
+    let mut tests: Vec<LocatedTest<'_>> = if scan.tests.is_empty() {
         let (offset, range) = scan.suite.as_ref().map_or_else(
             || {
                 report(
@@ -237,25 +232,26 @@ fn bench_tests(
             },
             |suite| (suite.offset, suite.range),
         );
-        vec![(
+        vec![LocatedTest {
             offset,
-            BenchTest {
+            test: BenchTest {
                 name: None,
                 range,
                 attributes: Vec::new(),
             },
-            Vec::new(),
-        )]
+            attributes: Vec::new(),
+        }]
     } else {
         scan.tests
             .iter()
-            .map(|test| {
-                let bench_test = BenchTest {
+            .map(|test| LocatedTest {
+                offset: test.offset,
+                test: BenchTest {
                     name: Some(test.name.clone()),
                     range: test.range,
                     attributes: Vec::new(),
-                };
-                (test.offset, bench_test, Vec::new())
+                },
+                attributes: Vec::new(),
             })
             .collect()
     };
@@ -263,15 +259,15 @@ fn bench_tests(
     // An attribute belongs to the closest preceding test; legacy pragmas are always global.
     let mut global = Vec::new();
     for attribute in &scan.attributes {
-        let index = tests.partition_point(|(offset, ..)| *offset <= attribute.offset);
+        let index = tests.partition_point(|test| test.offset <= attribute.offset);
         match index.checked_sub(1) {
-            Some(test_index) if !attribute.legacy => tests[test_index].2.push(attribute),
+            Some(test_index) if !attribute.legacy => tests[test_index].attributes.push(attribute),
             _ => global.push(attribute),
         }
     }
 
-    for (_, test, attributes) in &tests {
-        check_duplicate_attributes(attributes, Some(test), file, diagnostics);
+    for located in &tests {
+        check_duplicate_attributes(&located.attributes, Some(&located.test), file, diagnostics);
     }
     check_duplicate_attributes(&global, None, file, diagnostics);
 
@@ -290,7 +286,10 @@ fn bench_tests(
             fail_on_warning = true;
         }
     }
-    for (_, test, attributes) in &mut tests {
+    for LocatedTest {
+        test, attributes, ..
+    } in &mut tests
+    {
         for attribute in attributes.iter() {
             if is_builtin_attribute(&attribute.name) {
                 report(
@@ -309,9 +308,17 @@ fn bench_tests(
     }
 
     (count_errors(diagnostics) == errors_before).then(|| BenchTests {
-        tests: tests.into_iter().map(|(_, test, _)| test).collect(),
+        tests: tests.into_iter().map(|located| located.test).collect(),
         fail_on_warning,
     })
+}
+
+/// A test of a testbench file, with its position and the attributes that belong to it.
+struct LocatedTest<'scan> {
+    /// The byte offset of the test in the file.
+    offset: usize,
+    test: BenchTest,
+    attributes: Vec<&'scan ScannedAttribute>,
 }
 
 fn is_builtin_attribute(name: &str) -> bool {
@@ -496,6 +503,15 @@ fn tb_filter(entity: &VhdlEntity, file: &Utf8Path, diagnostics: &mut Vec<Diagnos
     has_runner_cfg
 }
 
+fn testbench_info<'a>(testbench: &'a Testbench, entity_path: &'a Utf8Path) -> TestbenchInfo<'a> {
+    TestbenchInfo {
+        library: &testbench.library_name,
+        entity: &testbench.entity,
+        generic_names: &testbench.generic_names,
+        file: entity_path,
+    }
+}
+
 /// A testbench while its configurations are built.
 struct BenchState {
     testbench: Testbench,
@@ -508,12 +524,7 @@ struct BenchState {
 
 impl BenchState {
     fn info(&self) -> TestbenchInfo<'_> {
-        TestbenchInfo {
-            library: &self.testbench.library_name,
-            entity: &self.testbench.entity,
-            generic_names: &self.testbench.generic_names,
-            file: &self.entity_path,
-        }
+        testbench_info(&self.testbench, &self.entity_path)
     }
 
     fn is_implicit(&self) -> bool {
@@ -772,12 +783,8 @@ fn apply_test_config(
         },
     };
 
-    let info = TestbenchInfo {
-        library: &bench.testbench.library_name,
-        entity: &bench.testbench.entity,
-        generic_names: &bench.testbench.generic_names,
-        file: &bench.entity_path,
-    };
+    // Not `bench.info()`: the configurations are borrowed mutably below.
+    let info = testbench_info(&bench.testbench, &bench.entity_path);
     let mut warnings = Vec::new();
     for (name, value) in &spec.generics {
         for &index in &indices {

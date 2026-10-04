@@ -250,6 +250,23 @@ pub enum AssertLevel {
     Failure,
 }
 
+impl AssertLevel {
+    /// The name used in configuration files and by GHDL's `--assert-level`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Warning => "warning",
+            Self::Error => "error",
+            Self::Failure => "failure",
+        }
+    }
+}
+
+impl fmt::Display for AssertLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// Configurations of a testbench (`lib.tb`) or of one of its tests (`lib.tb.test`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TestConfigSpec {

@@ -10,12 +10,10 @@
 //! AI NOTICE: Generated, minimally reviewed.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use super::*;
-use crate::sources::ContentHash;
 use crate::spec::ConfigurationSpec;
-use crate::vhdl_parser::VhdlDesignFile;
+use crate::test_support::add_vhdl;
 
 struct TestProject {
     project: Project,
@@ -31,15 +29,7 @@ impl TestProject {
     }
 
     fn add(&mut self, path: &str, code: &str) -> FileId {
-        let library = self.project.find_library("lib").unwrap();
-        let design_file = VhdlDesignFile::parse(code.as_bytes()).unwrap();
-        self.project.add_source_file(
-            library,
-            Utf8Path::new(path),
-            None,
-            ContentHash::of(code.as_bytes()),
-            Some(Arc::new(design_file)),
-        )
+        add_vhdl(&mut self.project, "lib", Utf8Path::new(path), code)
     }
 
     fn discover(&self) -> Discovery {
@@ -102,10 +92,6 @@ fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         .collect()
 }
 
-fn pos(line: u32, column: u32) -> Position {
-    Position { line, column }
-}
-
 #[test]
 fn single_implicit_test_is_created() {
     let discovery = single_project(&testbench("tb_entity", ""));
@@ -114,8 +100,8 @@ fn single_implicit_test_is_created() {
     let testcase = &discovery.runs[0].testcase;
     assert_eq!(testcase.file, "/src/file.vhd");
     // `test_runner_setup` on line 8.
-    assert_eq!(testcase.range.start, pos(8, 5));
-    assert_eq!(testcase.range.end, pos(8, 21));
+    assert_eq!(testcase.range.start, Position::new(8, 5));
+    assert_eq!(testcase.range.end, Position::new(8, 21));
     assert_eq!(discovery.runs[0].test, None);
     let testbench = &discovery.testbenches[0];
     assert_eq!(testbench.entity, "tb_entity");
@@ -125,17 +111,11 @@ fn single_implicit_test_is_created() {
 #[test]
 fn names_keep_declared_case() {
     let mut project = Project::new();
-    let library = project
+    project
         .add_library("MyLib", VhdlStandard::Vhdl2008, None)
         .unwrap();
     let code = testbench("TB_Entity", "if run(\"Test One\") then end if;");
-    project.add_source_file(
-        library,
-        Utf8Path::new("/src/file.vhd"),
-        None,
-        ContentHash::of(code.as_bytes()),
-        Some(Arc::new(VhdlDesignFile::parse(code.as_bytes()).unwrap())),
-    );
+    add_vhdl(&mut project, "MyLib", Utf8Path::new("/src/file.vhd"), &code);
     let discovery = discover(&project, &[]);
     assert_eq!(names(&discovery), ["MyLib.TB_Entity.Test One"]);
 }
@@ -150,7 +130,7 @@ fn no_architecture_is_an_error() {
     );
     assert_eq!(
         discovery.project_diagnostics[0].range.unwrap().start,
-        pos(1, 8)
+        Position::new(1, 8)
     );
 }
 
@@ -244,7 +224,7 @@ fn assert_test_1_location(code: &str) {
         scan.tests[0].range,
         lines.range(offset..offset + "Test_1".len())
     );
-    assert_eq!(scan.tests[0].range.start, pos(3, 10));
+    assert_eq!(scan.tests[0].range.start, Position::new(3, 10));
 }
 
 #[test]
@@ -587,7 +567,7 @@ fn global_user_attributes_are_not_supported_yet() {
     );
     assert_eq!(
         discovery.project_diagnostics[0].range.unwrap().start,
-        pos(9, 11)
+        Position::new(9, 11)
     );
 }
 
@@ -669,7 +649,7 @@ fn invalid_attributes_are_errors() {
     );
     assert_eq!(
         discovery.project_diagnostics[0].range.unwrap().start,
-        pos(11, 11)
+        Position::new(11, 11)
     );
 }
 
