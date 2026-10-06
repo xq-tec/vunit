@@ -51,6 +51,18 @@ impl Operation {
         }
     }
 
+    /// Removes `tag` from the merged requests' tags.
+    ///
+    /// The requests of a simulate stay: they can't be told apart once merged, and the other
+    /// requests may have asked for the same testcases.
+    pub(super) fn remove_tag(&mut self, tag: &RequestTag) {
+        match self {
+            Self::Compile { tags } | Self::Simulate { tags, .. } => {
+                tags.retain(|other| other != tag);
+            },
+        }
+    }
+
     /// The patterns of a simulate operation; `None` for a compile operation.
     pub(super) fn simulation_patterns(&self) -> Option<Vec<String>> {
         match self {

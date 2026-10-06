@@ -200,6 +200,35 @@ impl<'text> LineIndex<'text> {
         }
     }
 
+    /// Converts a GHDL position to a [`Position`] of this text.
+    ///
+    /// GHDL counts columns in bytes and expands tabs to multiples of [`GHDL_TAB_STOP`]
+    /// (`Files_Map.Coord_To_Col`). A column past the end of the line is clamped to the end; a
+    /// line past the end of the text is returned unchanged.
+    pub fn ghdl_position(&self, position: Position) -> Position {
+        let Some(&line_start) = self
+            .line_starts
+            .get((position.line as usize).saturating_sub(1))
+        else {
+            return position;
+        };
+        let line_end = self.text[line_start..]
+            .iter()
+            .position(|&byte| byte == b'\n' || byte == b'\r')
+            .map_or(self.text.len(), |length| line_start + length);
+        let target = position.column as usize;
+        let mut column = 1;
+        let mut offset = line_start;
+        while offset < line_end && column < target {
+            if self.text[offset] == b'\t' {
+                column += GHDL_TAB_STOP - column % GHDL_TAB_STOP;
+            }
+            column += 1;
+            offset += 1;
+        }
+        self.position(offset)
+    }
+
     /// Returns the range covering the bytes in `span`; an empty span covers one character.
     pub fn range(&self, span: std::ops::Range<usize>) -> Range {
         Range {
@@ -227,6 +256,9 @@ pub fn error_chain(error: &dyn Error) -> String {
     }
     message
 }
+
+/// The tab width GHDL assumes when it computes columns (`-ftabstop`, default 8).
+pub const GHDL_TAB_STOP: usize = 8;
 
 /// A diagnostic line of GHDL output: `<file>:<line>:<column>:<severity>:<message>`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,12 +306,18 @@ impl GhdlMessage<'_> {
     }
 
     /// Converts the message into a [`Diagnostic`], resolving a relative file against `cwd`.
-    pub fn to_diagnostic(&self, cwd: &Utf8Path) -> Diagnostic {
+    ///
+    /// `source` is the contents of the file, if it could be read; it is needed to convert GHDL's
+    /// column (see [`LineIndex::ghdl_position`]). Without it, the column is kept.
+    pub fn to_diagnostic(&self, cwd: &Utf8Path, source: Option<&[u8]>) -> Diagnostic {
+        let position = source.map_or(self.position, |source| {
+            LineIndex::new(source).ghdl_position(self.position)
+        });
         Diagnostic::new(self.severity, self.message)
             .in_file(cwd.join(self.file))
             .at(Some(Range {
-                start: self.position,
-                end: self.position,
+                start: position,
+                end: position,
             }))
     }
 }
@@ -323,6 +361,34 @@ mod tests {
         let index = LineIndex::new(text);
         assert_eq!(index.position(1), Position::new(1, 2));
         assert_eq!(index.position(3), Position::new(2, 1));
+    }
+
+    #[test]
+    fn ghdl_positions_expand_tabs_and_count_bytes() {
+        // risim-ghdl reports `x` at 6:17 and `y` at 10:21 for these lines.
+        let text = "line 1\n\t\tx <= 1;\n    report \"äää\" & y;\r\nlast".as_bytes();
+        let index = LineIndex::new(text);
+        assert_eq!(
+            index.ghdl_position(Position::new(2, 17)),
+            Position::new(2, 3)
+        );
+        assert_eq!(
+            index.ghdl_position(Position::new(3, 23)),
+            Position::new(3, 20)
+        );
+        // Past the end of the line, or of the text.
+        assert_eq!(
+            index.ghdl_position(Position::new(1, 99)),
+            Position::new(1, 7)
+        );
+        assert_eq!(
+            index.ghdl_position(Position::new(4, 99)),
+            Position::new(4, 5)
+        );
+        assert_eq!(
+            index.ghdl_position(Position::new(9, 3)),
+            Position::new(9, 3)
+        );
     }
 
     #[test]
@@ -373,9 +439,19 @@ mod tests {
 
     #[test]
     fn ghdl_message_resolves_relative_paths() {
-        let message = GhdlMessage::parse("src/a.vhd:1:2:note: hello").unwrap();
-        let diagnostic = message.to_diagnostic(Utf8Path::new("/root"));
-        assert_eq!(diagnostic.to_string(), "/root/src/a.vhd:1:2: note: hello");
+        let root = Utf8Path::new("/root");
+        let in_tab = GhdlMessage::parse("src/a.vhd:1:2:note: hello").unwrap();
+        let after_tab = GhdlMessage::parse("src/a.vhd:1:9:note: hello").unwrap();
+        let expected = "/root/src/a.vhd:1:2: note: hello";
+        assert_eq!(in_tab.to_diagnostic(root, None).to_string(), expected);
+        assert_eq!(
+            in_tab.to_diagnostic(root, Some(b"\tx")).to_string(),
+            expected
+        );
+        assert_eq!(
+            after_tab.to_diagnostic(root, Some(b"\tx")).to_string(),
+            expected
+        );
     }
 
     #[test]

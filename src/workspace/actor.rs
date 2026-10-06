@@ -76,6 +76,7 @@ pub(super) enum Command {
         tag: Option<RequestTag>,
     },
     CancelAll,
+    Cancel(RequestTag),
     Close(oneshot::Sender<()>),
 }
 
@@ -99,15 +100,21 @@ enum Internal {
 #[derive(Debug)]
 struct RunningCompile {
     operation: Operation,
+    /// The project being compiled; a simulate runs the testcases of this project, even if the
+    /// project changes during the compile.
+    model: Arc<Model>,
     cancel: CancellationToken,
 }
 
 /// A simulate operation running its tests.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct RunningSimulation {
     tags: Vec<RequestTag>,
+    /// The number of tests to run.
+    total: usize,
     finished: bool,
     counts: TestCounts,
+    cancel: CancellationToken,
 }
 
 /// How the actor is shutting down.
@@ -158,7 +165,7 @@ pub(super) struct Actor {
     plan_diagnostics: Vec<Diagnostic>,
     watcher_diagnostics: Vec<Diagnostic>,
     compile_diagnostics: BTreeMap<FileKey, Vec<Diagnostic>>,
-    /// Per testcase; `None` holds the patterns of the last simulation that match nothing.
+    /// Per testcase; `None` holds the problems with the patterns of the last simulation.
     simulation_diagnostics: BTreeMap<Option<String>, Vec<Diagnostic>>,
 
     /// The sets that changed since the last publish.
@@ -312,6 +319,7 @@ impl Actor {
                 self.request(Operation::simulate(requests, tag)).await;
             },
             Command::CancelAll => self.cancel_all(),
+            Command::Cancel(tag) => self.cancel_request(&tag),
             Command::Close(reply) => {
                 self.cancel.cancel();
                 self.drop_queued();
@@ -341,6 +349,72 @@ impl Actor {
         self.operations_cancel.cancel();
         self.operations_cancel = self.cancel.child_token();
         self.drop_queued();
+    }
+
+    /// Cancels what the request with `tag` asked for (see [`Workspace::cancel`]).
+    ///
+    /// [`Workspace::cancel`]: super::Workspace::cancel
+    fn cancel_request(&mut self, tag: &RequestTag) {
+        tracing::debug!(root = %self.root, ?tag, "cancelling a request");
+        let only_tag = |tags: &[RequestTag]| tags.len() == 1 && tags[0] == *tag;
+        let mut ended = Vec::new();
+        if let Some(queued) = &mut self.queued
+            && queued.tags().contains(tag)
+        {
+            if only_tag(queued.tags()) {
+                self.drop_queued();
+            } else {
+                queued.remove_tag(tag);
+                ended.push(WorkspaceEventKind::CompileFinished {
+                    tags: vec![tag.clone()],
+                    success: false,
+                    simulation_patterns: queued.simulation_patterns(),
+                });
+            }
+        }
+        if let Some(running) = &mut self.running_compile
+            && running.operation.tags().contains(tag)
+        {
+            if only_tag(running.operation.tags()) {
+                // The compile reports its end with this tag.
+                running.cancel.cancel();
+            } else {
+                running.operation.remove_tag(tag);
+                ended.push(WorkspaceEventKind::CompileFinished {
+                    tags: vec![tag.clone()],
+                    success: false,
+                    simulation_patterns: running.operation.simulation_patterns(),
+                });
+            }
+        }
+        for simulation in self.simulations.values_mut() {
+            if simulation.finished || !simulation.tags.contains(tag) {
+                continue;
+            }
+            if only_tag(&simulation.tags) {
+                // The simulation reports its end with this tag.
+                simulation.cancel.cancel();
+            } else {
+                simulation.tags.retain(|other| other != tag);
+                let TestCounts {
+                    passed,
+                    failed,
+                    cancelled,
+                } = simulation.counts;
+                let unfinished = simulation.total.saturating_sub(passed + failed + cancelled);
+                ended.push(WorkspaceEventKind::SimulationFinished {
+                    tags: vec![tag.clone()],
+                    counts: TestCounts {
+                        passed,
+                        failed,
+                        cancelled: cancelled + unfinished,
+                    },
+                });
+            }
+        }
+        for kind in ended {
+            self.emit(kind);
+        }
     }
 
     /// Drops the queued operation; its requests end without success.
@@ -383,6 +457,7 @@ impl Actor {
         });
         let cancel = self.operations_cancel.child_token();
         let (events, mut receiver) = mpsc::unbounded_channel();
+        let compiled_model = Arc::clone(&model);
         let context = CompileContext {
             workspace_root: self.root.to_path_buf(),
             semaphore: Arc::clone(self.runtime.compile_semaphore()),
@@ -419,7 +494,11 @@ impl Actor {
             let (report, ()) = tokio::join!(compile, forward);
             done.message = Some(Internal::CompileDone(Some(Box::new((state, report)))));
         });
-        self.running_compile = Some(RunningCompile { operation, cancel });
+        self.running_compile = Some(RunningCompile {
+            operation,
+            model: compiled_model,
+            cancel,
+        });
     }
 
     fn handle_compile_event(&mut self, event: CompileEvent) {
@@ -478,7 +557,7 @@ impl Actor {
         let success = if let Some(result) = result {
             let (state, report) = *result;
             self.compile_state = Some(state);
-            self.compile_diagnostics = report.diagnostics;
+            self.update_compile_diagnostics(&report);
             self.plan_diagnostics = report.project_diagnostics;
             report.status == CompileStatus::Succeeded && !running.cancel.is_cancelled()
         } else {
@@ -491,27 +570,52 @@ impl Actor {
         };
         self.dirty.insert(DiagnosticSource::Compile);
         self.dirty.insert(DiagnosticSource::Project);
+        // Closing saves the parse cache too, but a crash would lose it.
+        let loader = Arc::clone(&self.loader);
+        tokio::task::spawn_blocking(move || lock_loader(&loader).save_cache());
         self.emit(WorkspaceEventKind::CompileFinished {
             tags: running.operation.tags().to_vec(),
             success,
             simulation_patterns: running.operation.simulation_patterns(),
         });
         if success && let Operation::Simulate { requests, tags } = running.operation {
-            self.start_simulation(&requests, tags);
+            self.start_simulation(&running.model, &requests, tags);
         }
         if let Some(queued) = self.queued.take() {
             self.start(queued).await;
         }
     }
 
+    /// Replaces the compile diagnostics with those of `report`.
+    ///
+    /// Files that weren't compiled keep their diagnostics: all files if the compile couldn't be
+    /// planned, and the files that a cancel kept from starting. Their problems are still there.
+    fn update_compile_diagnostics(&mut self, report: &CompileReport) {
+        if report.files.is_empty() && report.status != CompileStatus::Succeeded {
+            return;
+        }
+        let mut diagnostics = report.diagnostics.clone();
+        for (key, status) in &report.files {
+            if *status == FileStatus::NotStarted
+                && let Some(previous) = self.compile_diagnostics.remove(key)
+            {
+                diagnostics.insert(key.clone(), previous);
+            }
+        }
+        self.compile_diagnostics = diagnostics;
+    }
+
     // ---------------------------------------------------------------------------------------------
     // Simulation
     // ---------------------------------------------------------------------------------------------
 
-    fn start_simulation(&mut self, requests: &[SimulationRequest], tags: Vec<RequestTag>) {
-        let Some(model) = self.model.clone() else {
-            return;
-        };
+    /// Runs the testcases of `model` that match `requests`.
+    fn start_simulation(
+        &mut self,
+        model: &Model,
+        requests: &[SimulationRequest],
+        tags: Vec<RequestTag>,
+    ) {
         let plan = SimulationPlan::new(
             &SimulationInput {
                 layout: &self.layout,
@@ -523,11 +627,15 @@ impl Actor {
         );
         let id = self.next_simulation_id;
         self.next_simulation_id += 1;
+        let cancel = self.operations_cancel.child_token();
         self.simulations.insert(
             id,
             RunningSimulation {
                 tags,
-                ..RunningSimulation::default()
+                total: plan.tests.len(),
+                finished: false,
+                counts: TestCounts::default(),
+                cancel: cancel.clone(),
             },
         );
         let internal = self.internal_sender.clone();
@@ -544,7 +652,7 @@ impl Actor {
             results: Arc::clone(&self.results),
             testcase_locks: Arc::clone(&self.testcase_locks),
             events,
-            cancel: self.operations_cancel.child_token(),
+            cancel,
         };
         tokio::spawn(async move {
             let _done = DoneGuard {
@@ -586,7 +694,12 @@ impl Actor {
                 {
                     self.dirty.insert(DiagnosticSource::Simulation);
                 }
-                self.emit(WorkspaceEventKind::TestStarted { name, output_path });
+                let tags = simulation.tags.clone();
+                self.emit(WorkspaceEventKind::TestStarted {
+                    tags,
+                    name,
+                    output_path,
+                });
             },
             SimulationEvent::TestFinished {
                 name,
@@ -595,8 +708,10 @@ impl Actor {
                 duration,
             } => {
                 simulation.counts.record(outcome);
+                let tags = simulation.tags.clone();
                 self.results_dirty = true;
                 self.emit(WorkspaceEventKind::TestFinished {
+                    tags,
                     name,
                     outcome,
                     output_path,

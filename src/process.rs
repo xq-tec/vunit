@@ -7,7 +7,9 @@
 //! Every process runs in its own process tree, which cancelling terminates as a whole:
 //!
 //! - On Unix, the process gets its own process group. Cancelling sends `SIGTERM` to the group,
-//!   and `SIGKILL` after [`KILL_GRACE_PERIOD`].
+//!   and `SIGKILL` after [`KILL_GRACE_PERIOD`]. On Linux, the process also gets `SIGKILL` when
+//!   the thread that spawned it ends, so that it doesn't outlive a crashed or killed parent.
+//!   Only the spawned process gets it, not its children; risim-ghdl doesn't spawn any.
 //! - On Windows, the process is assigned to a job object that kills its processes when it is
 //!   closed. Cancelling terminates the job. A grandchild spawned before the assignment escapes,
 //!   which is acceptable because risim-ghdl doesn't spawn children for `-a` or `--elab-run`.
@@ -24,6 +26,10 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use camino::Utf8Path;
+#[cfg(target_os = "linux")]
+use nix::sys::prctl;
+#[cfg(target_os = "linux")]
+use nix::sys::signal::Signal;
 use tokio::io::AsyncBufReadExt as _;
 use tokio::io::AsyncRead;
 use tokio::io::BufReader;
@@ -193,6 +199,25 @@ impl Supervised {
         #[cfg(unix)]
         {
             command.process_group(0);
+            #[cfg(target_os = "linux")]
+            {
+                let parent = nix::unistd::getpid();
+                // SAFETY: The closure runs in the child between `fork` and `exec`, where only
+                // async-signal-safe functions may be called. It only makes the `prctl` and
+                // `getppid` system calls and doesn't allocate.
+                unsafe {
+                    command.pre_exec(move || {
+                        // The signal is tied to the spawning thread. That is a tokio worker
+                        // thread, which lives as long as the runtime.
+                        prctl::set_pdeathsig(Signal::SIGKILL)?;
+                        // The parent may have ended before the signal was set up.
+                        if nix::unistd::getppid() != parent {
+                            return Err(io::Error::other("the parent process ended"));
+                        }
+                        Ok(())
+                    });
+                }
+            }
             let child = command.spawn()?;
             let process_group = child
                 .id()

@@ -164,28 +164,41 @@ pub struct Resolution {
     pub entries: Vec<(String, bool)>,
     /// The patterns that matched no testcase, in request order.
     pub unmatched: Vec<String>,
+    /// The GUI-mode patterns that matched several testcases, with the number of matches, in
+    /// request order. GUI mode needs exactly one testcase, so their matches run without it.
+    pub ambiguous_gui: Vec<(String, usize)>,
 }
 
 /// Matches `(pattern, gui)` requests against testcase names.
 ///
 /// A testcase matched by several requests runs once, in GUI mode if any of them asks for it.
+/// A GUI-mode request that matches several testcases runs them without GUI mode: every paused
+/// simulation holds a simulation permit, so a wildcard would block all other simulations.
 pub fn resolve(
     requests: impl IntoIterator<Item = (impl AsRef<str>, bool)>,
     names: &[&str],
 ) -> Resolution {
     let mut entries: BTreeMap<&str, bool> = BTreeMap::new();
     let mut unmatched = Vec::new();
+    let mut ambiguous_gui = Vec::new();
     for (pattern_text, gui) in requests {
         let pattern = Pattern::new(pattern_text.as_ref());
-        let mut matched = false;
-        for &name in names {
-            if pattern.matches(name) {
-                matched = true;
-                *entries.entry(name).or_default() |= gui;
-            }
-        }
-        if !matched {
+        let matched: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|name| pattern.matches(name))
+            .collect();
+        if matched.is_empty() {
             unmatched.push(pattern_text.as_ref().to_owned());
+        }
+        let gui = if gui && matched.len() > 1 {
+            ambiguous_gui.push((pattern_text.as_ref().to_owned(), matched.len()));
+            false
+        } else {
+            gui
+        };
+        for name in matched {
+            *entries.entry(name).or_default() |= gui;
         }
     }
     Resolution {
@@ -194,6 +207,7 @@ pub fn resolve(
             .map(|(name, gui)| (name.to_owned(), gui))
             .collect(),
         unmatched,
+        ambiguous_gui,
     }
 }
 
@@ -274,5 +288,21 @@ mod tests {
             ]
         );
         assert_eq!(resolution.unmatched, ["nothing*"]);
+        assert!(resolution.ambiguous_gui.is_empty());
+    }
+
+    #[test]
+    fn resolve_runs_ambiguous_gui_requests_without_gui() {
+        let names = ["lib.tb.t1", "lib.tb.t2", "lib.tb.t3"];
+        let resolution = resolve([("lib.tb.*", true), ("lib.tb.t3", true)], &names);
+        assert_eq!(
+            resolution.entries,
+            [
+                ("lib.tb.t1".to_owned(), false),
+                ("lib.tb.t2".to_owned(), false),
+                ("lib.tb.t3".to_owned(), true)
+            ]
+        );
+        assert_eq!(resolution.ambiguous_gui, [("lib.tb.*".to_owned(), 3)]);
     }
 }

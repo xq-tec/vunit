@@ -6,7 +6,7 @@
 name = "risim-vunit-frontend"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.97.1"
+rust-version = "1.97"
 authors = ["xq-Tec GmbH <info@xq-tec.com>"]
 license = "MPL-2.0"
 description = "Rust replacement for the VUnit Python frontend, for the riSim simulator."
@@ -60,7 +60,7 @@ tracing = "0.1"
 walkdir = "2.5"
 
 [target.'cfg(unix)'.dependencies]
-nix = { version = "0.31", features = ["signal"] }
+nix = { version = "0.31", features = ["process", "signal"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [

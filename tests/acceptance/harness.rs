@@ -162,7 +162,9 @@ pub async fn simulate_all(runtime: &Runtime, root: &Utf8Path, spec: &ProjectSpec
             .expect("checked above")
             .expect("the workspace closed early");
         match event.kind {
-            WorkspaceEventKind::TestStarted { name, output_path } => {
+            WorkspaceEventKind::TestStarted {
+                name, output_path, ..
+            } => {
                 running.insert(name, output_path);
             },
             WorkspaceEventKind::TestFinished {

@@ -371,8 +371,8 @@ pub enum LockError {
 ///
 /// The lock file holds the PID of its owner while it is locked, and is empty after
 /// [`release`](Self::release). Dropping the lock without releasing it leaves the PID behind, so
-/// the next owner treats the state as left behind by a crash. The file is never deleted:
-/// deleting it would let a process lock the deleted file while another locks a new one.
+/// the next owner knows that the previous one crashed. The file is never deleted: deleting it
+/// would let a process lock the deleted file while another locks a new one.
 #[derive(Debug)]
 pub struct OutputLock {
     path: Utf8PathBuf,
@@ -384,16 +384,21 @@ pub struct OutputLock {
 pub enum PreviousOwner {
     /// The lock file was missing or empty.
     Released,
-    /// The lock file still held a PID: the previous owner crashed, and the compile state, the
-    /// parse cache and the libraries have been deleted.
+    /// The lock file still held a PID: the previous owner crashed, but not while compiling.
+    /// The compile state matches the libraries and is kept.
     Crashed,
+    /// The previous owner crashed while compiling (see [`CompileState::compiling`]): the
+    /// compile state and the libraries have been deleted.
+    CrashedWhileCompiling,
 }
 
 impl OutputLock {
     /// Locks `risim-out/`, creating it if needed.
     ///
-    /// If the previous owner crashed, the compile state, the parse cache and the compiled
-    /// libraries are deleted, so everything is recompiled. Test results are kept.
+    /// If the previous owner crashed while compiling, the compile state and the compiled
+    /// libraries are deleted, so everything is recompiled. Otherwise the compile state was
+    /// saved after the last compile and matches the libraries. The parse cache and the test
+    /// results are always kept: the cache entries are validated against the files.
     ///
     /// # Errors
     ///
@@ -424,21 +429,22 @@ impl OutputLock {
             reason = "on Windows, the lock blocks reading through another handle"
         )]
         let _length = file.read_to_end(&mut previous_owner).map_err(io_error)?;
+        let pid = String::from_utf8_lossy(&previous_owner);
+        let pid = pid.trim();
         let previous = if previous_owner.is_empty() {
             PreviousOwner::Released
-        } else {
+        } else if CompileState::load(layout).compiling {
             tracing::warn!(
                 %path,
-                pid = %String::from_utf8_lossy(&previous_owner).trim(),
-                "the previous owner didn't release the lock; discarding the compile state"
+                pid,
+                "the previous owner crashed while compiling; discarding the compile state"
             );
-            for stale in [
-                layout.state_file(),
-                layout.parse_cache_file(),
-                layout.libraries_dir(),
-            ] {
+            for stale in [layout.state_file(), layout.libraries_dir()] {
                 remove_path(&stale).map_err(io_error)?;
             }
+            PreviousOwner::CrashedWhileCompiling
+        } else {
+            tracing::info!(%path, pid, "the previous owner didn't release the lock");
             PreviousOwner::Crashed
         };
 
@@ -543,6 +549,10 @@ pub struct CompileState {
     pub simulator: Option<SimulatorIdentity>,
     /// The successfully compiled files.
     pub files: BTreeMap<FileKey, FileState>,
+    /// Set in the saved state while compile processes may change the libraries, so that the
+    /// next owner can tell whether a crash left the libraries inconsistent with `files`.
+    #[serde(default)]
+    pub compiling: bool,
 }
 
 const STATE_VERSION: u32 = 1;
@@ -915,19 +925,37 @@ mod tests {
         assert_eq!(after_release, PreviousOwner::Released);
         released_lock.release();
 
-        // A dropped lock leaves its PID behind, like a crash.
+        // A dropped lock leaves its PID behind, like a crash. Without a compile running, the
+        // state is kept.
         let (crashed_lock, _) = OutputLock::acquire(&layout).unwrap();
-        write_atomic(&layout.state_file(), b"{}").unwrap();
+        CompileState::default().save(&layout).unwrap();
         fs::create_dir_all(layout.library_dir("lib")).unwrap();
         write_atomic(&layout.results_file(), b"{}").unwrap();
+        write_atomic(&layout.parse_cache_file(), b"{}").unwrap();
         drop(crashed_lock);
 
         let (recovered_lock, recovered) = OutputLock::acquire(&layout).unwrap();
         assert_eq!(recovered, PreviousOwner::Crashed);
+        assert!(layout.state_file().exists());
+        assert!(layout.libraries_dir().exists());
+        recovered_lock.release();
+
+        // A crash while compiling discards the compile state and the libraries.
+        let (compiling_lock, _) = OutputLock::acquire(&layout).unwrap();
+        let compiling = CompileState {
+            compiling: true,
+            ..CompileState::default()
+        };
+        compiling.save(&layout).unwrap();
+        drop(compiling_lock);
+
+        let (wiped_lock, wiped) = OutputLock::acquire(&layout).unwrap();
+        assert_eq!(wiped, PreviousOwner::CrashedWhileCompiling);
         assert!(!layout.state_file().exists());
         assert!(!layout.libraries_dir().exists());
         assert!(layout.results_file().exists());
-        recovered_lock.release();
+        assert!(layout.parse_cache_file().exists());
+        wiped_lock.release();
     }
 
     #[test]

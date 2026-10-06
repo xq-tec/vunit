@@ -42,7 +42,7 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 | `discovery`                 | `test/bench.py`, `test/bench_list.py`, `test/list.py`               | Testbenches, tests, attributes, pragmas, locations                          |
 | `configuration`             | `configuration.py`                                                  | Configurations (generics, sim options, attributes, VHDL configuration name) |
 | `pattern`                   | `fnmatch` usage in `ui/__init__.py`                                 | Testcase pattern matching                                                   |
-| `simulator`                 | `sim_if/__init__.py`, `sim_if/ghdl.py`                              | risim-ghdl version/capabilities, compile and simulate command lines         |
+| `simulator`                 | `sim_if/__init__.py`, `sim_if/ghdl.py`, `sim_if/risim_ghdl.py` (\*) | risim-ghdl version/capabilities, compile and simulate command lines         |
 | `compile`                   | `sim_if/__init__.py` (`compile_source_files`), `project.py`         | Compile set, recompile decision, library scheduling, cancellation           |
 | `runner`                    | `test/suites.py`, `test/runner.py`, `ui/__init__.py` (output paths) | `runner_cfg`, seed, output directories, `vunit_results` parsing, outcomes   |
 | `diagnostics`               | — (new)                                                             | `Diagnostic` type, GHDL message parsing                                     |
@@ -52,6 +52,8 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 | `workspace`                 | — (new)                                                             | Per-workspace actor: state, request merging, operations, events             |
 | `runtime`                   | — (new)                                                             | Shared limits and risim-ghdl detection across workspaces                    |
 | `verilog_parser` (deferred) | `parsing/verilog/*`                                                 | Deferred                                                                    |
+
+(\*) Only on the fork's `risim` branch, which held the Python risim-ghdl support.
 
 ## Intentional deviations
 
@@ -67,6 +69,7 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - Files that are independent of each other compile in the order they were added. VUnit sorts them by path. Both orders respect the dependencies.
 - An ambiguous direct entity instantiation is an error for the instantiating file instead of aborting. Dependency cycles are reported only when they involve files that a testbench needs.
 - Mixed VHDL standards are checked among the files to compile, not among all files of the project.
+- Compiler warnings and notes in the files of VUnit and OSVVM themselves are dropped; errors are kept.
 - A compile that fails without a parsable error message gets an error diagnostic with the compiler output, even if it printed parsable warnings.
 - Library work directories are `risim-out/libraries/<lowercase library name>`.
 - The VHDL parser skips enumeration, record and array types, which VUnit only uses for com codec generation. Word boundaries (`\b`) only treat ASCII characters as word characters.

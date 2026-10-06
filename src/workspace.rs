@@ -18,7 +18,8 @@
 //!   merge into one queued operation (see `operation.rs`). After its compile, a simulate runs its
 //!   tests while the next operation may already compile.
 //! - **Cancel:** [`Workspace::cancel_all`] cancels the running compile, the queued operation, and
-//!   all running and waiting tests.
+//!   all running and waiting tests. [`Workspace::cancel`] cancels only what one request asked
+//!   for: an operation that serves other requests too keeps running for them.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -207,6 +208,8 @@ pub enum WorkspaceEventKind {
     },
     /// The simulator of a testcase is about to be spawned.
     TestStarted {
+        /// The tags of the simulate operation.
+        tags: Vec<RequestTag>,
         /// The testcase name.
         name: String,
         /// The simulator output file.
@@ -214,6 +217,8 @@ pub enum WorkspaceEventKind {
     },
     /// A testcase finished, failed to start, or was cancelled.
     TestFinished {
+        /// The tags of the simulate operation.
+        tags: Vec<RequestTag>,
         /// The testcase name.
         name: String,
         /// How it ended.
@@ -276,6 +281,18 @@ impl Workspace {
     /// Cancels the running compile, the queued operation, and all running and waiting tests.
     pub fn cancel_all(&self) {
         self.send(Command::CancelAll);
+    }
+
+    /// Cancels what the request with `tag` asked for.
+    ///
+    /// An operation whose only tag is `tag` is cancelled like by [`cancel_all`](Self::cancel_all).
+    /// An operation that has other tags too keeps running for them and loses `tag`; for `tag`,
+    /// the operation ends right away: with
+    /// [`CompileFinished`](WorkspaceEventKind::CompileFinished) without success during its compile,
+    /// or with [`SimulationFinished`](WorkspaceEventKind::SimulationFinished) counting its
+    /// unfinished tests as cancelled afterwards. Operations without `tag` aren't affected.
+    pub fn cancel(&self, tag: RequestTag) {
+        self.send(Command::Cancel(tag));
     }
 
     /// Cancels everything, waits for the processes to end, saves the state and releases the

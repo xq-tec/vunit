@@ -148,6 +148,8 @@ pub struct CompilePlan {
     graph: DependencyGraph<FileId>,
     /// The keys of all files of the project.
     all_keys: FxHashMap<FileId, FileKey>,
+    /// The directory with the extracted builtins; their warnings and notes are dropped.
+    builtins_root: Utf8PathBuf,
     /// Errors that prevent compiling: dependency cycles, mixed or unsupported standards.
     pub errors: Vec<Diagnostic>,
     /// Problems with the dependencies that don't prevent compiling.
@@ -173,7 +175,10 @@ impl CompilePlan {
     /// Plans compiling `input.targets` given the compile `state`.
     pub fn new(input: &PlanInput<'_>, state: &CompileState) -> Self {
         let project = input.project;
-        let mut plan = Self::default();
+        let mut plan = Self {
+            builtins_root: input.layout.builtins_root(),
+            ..Self::default()
+        };
 
         let analysis = project.dependency_graph(false);
         let implementation = project.dependency_graph(true);
@@ -417,6 +422,10 @@ fn compile_order(
     subgraph.toposort()
 }
 
+/// What a compile key is computed from.
+///
+/// The `-P` paths of external libraries aren't part of it. Their libraries can't be configured
+/// yet; once they can, a changed path or a recompiled external library must change the key.
 struct CompileKeyInput<'a> {
     content_hash: ContentHash,
     library: &'a str,
@@ -568,6 +577,9 @@ pub struct CompileContext {
 
 /// Compiles the compile set of `input`: adopts the simulator, plans, runs the compile
 /// processes, updates `state` and saves it.
+///
+/// While compile processes run, the saved state has [`CompileState::compiling`] set, so that a
+/// crash in the meantime discards the libraries.
 pub async fn compile(
     input: &PlanInput<'_>,
     state: &mut CompileState,
@@ -580,8 +592,16 @@ pub async fn compile(
         )));
     }
     let plan = CompilePlan::new(input, state);
+    if plan.compile_count() > 0 {
+        // Marks the libraries as changing, so that a crash before the end discards them.
+        state.compiling = true;
+        if let Err(error) = state.save(input.layout) {
+            tracing::warn!(%error, "failed to save the compile state");
+        }
+    }
     let mut report = execute(plan, state, context).await;
     prune_state(state, input.project);
+    state.compiling = false;
     if let Err(error) = state.save(input.layout) {
         tracing::warn!(%error, "failed to save the compile state");
     }
@@ -847,7 +867,9 @@ async fn compile_file(shared: &Shared, file: &PlannedFile) -> FileResult {
     );
 
     let mut diagnostics = Vec::new();
-    let mut output = Vec::new();
+    let mut output = FailureOutput::default();
+    // The sources the messages refer to, for converting their columns.
+    let mut sources: FxHashMap<Utf8PathBuf, Option<Vec<u8>>> = FxHashMap::default();
     let result = async {
         fs::create_dir_all(&file.library_dir)?;
         process::run_piped(
@@ -856,18 +878,30 @@ async fn compile_file(shared: &Shared, file: &PlannedFile) -> FileResult {
             &file.output_file,
             &context.cancel,
             |line| {
-                if let Some(message) = GhdlMessage::parse(line) {
-                    let diagnostic = message.to_diagnostic(&context.workspace_root);
-                    emit(
-                        &context.events,
-                        CompileEvent::Diagnostic {
-                            key: file.key.clone(),
-                            diagnostic: diagnostic.clone(),
-                        },
-                    );
-                    diagnostics.push(diagnostic);
+                output.push(line);
+                let Some(message) = GhdlMessage::parse(line) else {
+                    return;
+                };
+                let path = context.workspace_root.join(message.file);
+                // VUnit's and OSVVM's sources trigger hundreds of warnings (mostly `-Whide`)
+                // that users can't do anything about.
+                if message.severity != Severity::Error
+                    && path.starts_with(&shared.plan.builtins_root)
+                {
+                    return;
                 }
-                output.push(line.to_owned());
+                let source = sources
+                    .entry(path)
+                    .or_insert_with_key(|path| fs::read(path).ok());
+                let diagnostic = message.to_diagnostic(&context.workspace_root, source.as_deref());
+                emit(
+                    &context.events,
+                    CompileEvent::Diagnostic {
+                        key: file.key.clone(),
+                        diagnostic: diagnostic.clone(),
+                    },
+                );
+                diagnostics.push(diagnostic);
             },
         )
         .await
@@ -881,13 +915,9 @@ async fn compile_file(shared: &Shared, file: &PlannedFile) -> FileResult {
                 .iter()
                 .any(|diagnostic| diagnostic.severity == Severity::Error)
             {
-                let output = output.join("\n");
-                let output = output.trim();
-                let message = if output.is_empty() {
-                    format!("risim-ghdl failed ({status})")
-                } else {
-                    output.to_owned()
-                };
+                let message = output
+                    .message(&file.output_file)
+                    .unwrap_or_else(|| format!("risim-ghdl failed ({status})"));
                 diagnostics.push(Diagnostic::error(message).in_file(&file.path));
             }
             FileStatus::Failed
@@ -911,5 +941,49 @@ async fn compile_file(shared: &Shared, file: &PlannedFile) -> FileResult {
     FileResult {
         status,
         diagnostics,
+    }
+}
+
+/// The beginning of the output of a compile process, which becomes the message of a failure
+/// without a parsable error. The output file has all of it.
+#[derive(Debug, Default)]
+struct FailureOutput {
+    text: String,
+    lines: usize,
+    truncated: bool,
+}
+
+impl FailureOutput {
+    /// At most this many lines are kept…
+    const MAX_LINES: usize = 50;
+    /// …and at most about this many bytes.
+    const MAX_BYTES: usize = 8 * 1024;
+
+    fn push(&mut self, line: &str) {
+        if self.truncated {
+            return;
+        }
+        if self.lines == Self::MAX_LINES || self.text.len() + line.len() > Self::MAX_BYTES {
+            self.truncated = true;
+            return;
+        }
+        if self.lines > 0 {
+            self.text.push('\n');
+        }
+        self.text.push_str(line);
+        self.lines += 1;
+    }
+
+    /// The trimmed output, pointing to `output_file` if it was cut off; `None` if it is empty.
+    fn message(&self, output_file: &Utf8Path) -> Option<String> {
+        let text = self.text.trim();
+        if self.truncated {
+            let separator = if text.is_empty() { "" } else { "\n" };
+            Some(format!(
+                "{text}{separator}… (see {output_file} for the full output)"
+            ))
+        } else {
+            (!text.is_empty()).then(|| text.to_owned())
+        }
     }
 }

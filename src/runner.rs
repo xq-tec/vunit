@@ -285,7 +285,8 @@ impl PlannedTest {
 pub struct SimulationPlan {
     /// The tests, sorted by name.
     pub tests: Vec<PlannedTest>,
-    /// Warnings about patterns that match no testcase.
+    /// Warnings about patterns that match no testcase, or that ask for GUI mode but match
+    /// several.
     pub diagnostics: Vec<Diagnostic>,
 }
 
@@ -361,11 +362,20 @@ impl SimulationPlan {
                 })
             })
             .collect();
-        let diagnostics = resolution
+        let unmatched = resolution
             .unmatched
             .into_iter()
-            .map(|pattern| Diagnostic::warning(format!("no testcase matches '{pattern}'")))
-            .collect();
+            .map(|pattern| Diagnostic::warning(format!("no testcase matches '{pattern}'")));
+        let ambiguous_gui = resolution
+            .ambiguous_gui
+            .into_iter()
+            .map(|(pattern, count)| {
+                Diagnostic::warning(format!(
+                    "GUI mode needs a pattern that matches one testcase, but '{pattern}' matches \
+                     {count}; they run without GUI mode"
+                ))
+            });
+        let diagnostics = unmatched.chain(ambiguous_gui).collect();
         Self { tests, diagnostics }
     }
 
@@ -407,9 +417,9 @@ pub enum SimulationEvent {
         duration: Duration,
     },
     /// A problem with a simulation: a spawn failure, an unreadable results file, or a pattern
-    /// that matches nothing.
+    /// that matches nothing or can't run in GUI mode.
     Diagnostic {
-        /// The testcase the problem belongs to; `None` for a pattern that matches nothing.
+        /// The testcase the problem belongs to; `None` for a problem with a pattern.
         testcase: Option<String>,
         /// The problem.
         diagnostic: Diagnostic,
@@ -674,7 +684,14 @@ async fn run_test(
         finished_at: Timestamp::now(),
         output_path: test.paths.output_file.clone(),
     };
-    if let Err(error) = context.results.record(&test.name, result) {
+    // Recording writes and syncs `results.json`, which mustn't block the runtime.
+    let results = Arc::clone(&context.results);
+    let name = test.name.clone();
+    let recorded = tokio::task::spawn_blocking(move || results.record(&name, result))
+        .await
+        .map_err(io::Error::other)
+        .flatten();
+    if let Err(error) = recorded {
         diagnostics.push(Diagnostic::warning(format!(
             "failed to save the test results: {error}"
         )));

@@ -424,3 +424,28 @@ fn targets_are_testbench_files() {
         [entity, architecture, configuration]
     );
 }
+
+#[test]
+fn failure_output_is_capped() {
+    let output_file = Utf8Path::new("/out/a.txt");
+    let mut short = FailureOutput::default();
+    assert_eq!(short.message(output_file), None);
+    short.push("  first");
+    short.push("second  ");
+    assert_eq!(short.message(output_file).as_deref(), Some("first\nsecond"));
+
+    let mut long = FailureOutput::default();
+    for index in 0..1000 {
+        long.push(&format!("line {index}"));
+    }
+    let message = long.message(output_file).unwrap();
+    assert_eq!(message.lines().count(), FailureOutput::MAX_LINES + 1);
+    assert!(message.ends_with("… (see /out/a.txt for the full output)"));
+
+    let mut wide = FailureOutput::default();
+    wide.push(&"x".repeat(FailureOutput::MAX_BYTES + 1));
+    assert_eq!(
+        wide.message(output_file).as_deref(),
+        Some("… (see /out/a.txt for the full output)")
+    );
+}

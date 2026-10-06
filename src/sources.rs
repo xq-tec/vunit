@@ -330,8 +330,12 @@ pub fn expand_glob(
                 .compile_matcher(),
         )
     };
-    let is_excluded =
-        |path: &Utf8Path| path.starts_with(excluded) || path.file_name() == Some(".git");
+    // The output directories of nested workspaces hold extracted builtins too.
+    let is_excluded = |path: &Utf8Path| {
+        path.starts_with(excluded)
+            || path.file_name() == Some(".git")
+            || (path.file_name() == Some(OUTPUT_DIR) && path.join(".lock").is_file())
+    };
     if base.ancestors().any(is_excluded) {
         return Ok(Vec::new());
     }
@@ -728,7 +732,15 @@ mod tests {
         workspace.write("risim-out/builtins/x/b.vhd", "");
         workspace.write(".git/c.vhd", "");
         workspace.write("sub/.git/d.vhd", "");
-        assert_eq!(glob(&workspace, "**/*.vhd"), ["a.vhd"]);
+        // The output directory of a nested workspace, recognized by its lock file.
+        workspace.write("nested/risim-out/.lock", "");
+        workspace.write("nested/risim-out/builtins/x/e.vhd", "");
+        // Without a lock file, a directory named like it is an ordinary directory.
+        workspace.write("other/risim-out/f.vhd", "");
+        assert_eq!(
+            glob(&workspace, "**/*.vhd"),
+            ["a.vhd", "other/risim-out/f.vhd"]
+        );
         assert!(glob(&workspace, "risim-out/**/*.vhd").is_empty());
     }
 

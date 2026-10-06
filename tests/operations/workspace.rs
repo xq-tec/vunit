@@ -27,6 +27,7 @@ use risim_vunit_frontend::Workspace as Handle;
 use risim_vunit_frontend::WorkspaceEvent;
 use risim_vunit_frontend::WorkspaceEventKind;
 use risim_vunit_frontend::diagnostics::Severity;
+use risim_vunit_frontend::store::CompileState;
 use tokio::sync::mpsc;
 
 use crate::Workspace;
@@ -46,6 +47,18 @@ pub fn trials() -> Vec<Trial> {
             workspace_merges_requests_while_compiling,
         ),
         trial("workspace_cancel_all", workspace_cancel_all),
+        trial(
+            "workspace_cancels_one_request",
+            workspace_cancels_one_request,
+        ),
+        trial(
+            "workspace_simulates_the_compiled_project",
+            workspace_simulates_the_compiled_project,
+        ),
+        trial(
+            "workspace_keeps_diagnostics_of_files_not_compiled",
+            workspace_keeps_diagnostics_of_files_not_compiled,
+        ),
         trial(
             "workspace_runs_a_testcase_once_at_a_time",
             workspace_runs_a_testcase_once_at_a_time,
@@ -477,6 +490,232 @@ async fn workspace_cancel_all() {
     session.handle.close().await;
 }
 
+async fn workspace_cancels_one_request() {
+    let mut fixture = Workspace::new().await;
+    simulation_project(&mut fixture);
+    fixture.write(
+        "tb/tb_implicit.vhd",
+        &format!("-- fake: hang\n{}", testbench("tb_implicit", "")),
+    );
+    let runtime = runtime().await;
+    let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
+
+    // A hanging compile, and three requests merged into the queued operation.
+    session.handle.compile(tag("a"));
+    session.handle.simulate(requests(&["*"]), tag("b"));
+    session
+        .handle
+        .simulate(requests(&["lib.tb_tests.slow"]), tag("e"));
+    session.handle.compile(tag("c"));
+    session
+        .until(|event| matches!(event, WorkspaceEventKind::FileCompiling { .. }))
+        .await;
+
+    // Cancelling a request of the queued operation ends only that request.
+    session.handle.cancel(RequestTag("c".to_owned()));
+    assert_eq!(
+        summary(&session.operation("c").await),
+        ["compile_finished c false Some([\"*\", \"lib.tb_tests.slow\"])"]
+    );
+
+    // Cancelling the only request of the running compile cancels it; the queued operation
+    // starts.
+    fixture.write("tb/tb_implicit.vhd", &testbench("tb_implicit", ""));
+    fixture.sim_directive("lib.tb_tests.slow", "hang");
+    session.handle.cancel(RequestTag("a".to_owned()));
+    assert_eq!(
+        summary(&session.operation("a").await),
+        ["compile_finished a false None"]
+    );
+    let started = session
+        .until(|event| {
+            matches!(event, WorkspaceEventKind::TestStarted { name, .. } if name == "lib.tb_tests.slow")
+        })
+        .await;
+    assert!(
+        matches!(
+            started.last(),
+            Some(WorkspaceEventKind::TestStarted { tags, .. }) if tags_text(tags) == "b,e"
+        ),
+        "{started:#?}"
+    );
+
+    // A request that shares the simulation with another one ends, and the simulation goes on.
+    session.handle.cancel(RequestTag("e".to_owned()));
+    let detached = session.operation("e").await;
+    assert!(
+        matches!(
+            detached.last(),
+            Some(WorkspaceEventKind::SimulationFinished { tags, counts })
+                if tags_text(tags) == "e"
+                    && counts.cancelled >= 1
+                    && counts.passed + counts.failed + counts.cancelled == 4
+        ),
+        "{detached:#?}"
+    );
+
+    // Cancelling the last request cancels the simulation.
+    session.handle.cancel(RequestTag("b".to_owned()));
+    let cancelled = session.operation("b").await;
+    for event in &cancelled {
+        if let WorkspaceEventKind::TestFinished {
+            tags: test_tags, ..
+        } = event
+        {
+            assert_eq!(tags_text(test_tags), "b");
+        }
+    }
+    let cancelled = summary(&cancelled);
+    assert!(
+        cancelled.contains(&"test_finished lib.tb_tests.slow Cancelled".to_owned()),
+        "{cancelled:#?}"
+    );
+    let finished = cancelled.last().expect("events");
+    assert!(
+        finished.starts_with("simulation_finished b ") && !finished.ends_with("/0"),
+        "{finished}"
+    );
+
+    // A request of another client isn't affected.
+    fixture.write(crate::fake_ghdl::SIM_DIRECTIVES, "");
+    fixture.sim_directive("lib.tb_tests.slow", "sleep 300");
+    session
+        .handle
+        .simulate(requests(&["lib.tb_tests.slow"]), tag("f"));
+    session.handle.cancel(RequestTag("other".to_owned()));
+    assert_eq!(
+        summary(&session.operation("f").await)
+            .last()
+            .map(String::as_str),
+        Some("simulation_finished f 1/0/0")
+    );
+    session.handle.close().await;
+}
+
+async fn workspace_simulates_the_compiled_project() {
+    let mut fixture = Workspace::new().await;
+    simulation_project(&mut fixture);
+    fixture.write(
+        "tb/tb_implicit.vhd",
+        &format!("-- fake: sleep 3000\n{}", testbench("tb_implicit", "")),
+    );
+    let runtime = runtime().await;
+    let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
+
+    session.handle.simulate(requests(&["*"]), tag("a"));
+    session
+        .until(|event| matches!(event, WorkspaceEventKind::FileCompiling { .. }))
+        .await;
+    // A testbench added during the compile isn't compiled, so it doesn't run either.
+    fixture.write("tb/tb_new.vhd", &testbench("tb_new", ""));
+    let events = session.operation("a").await;
+    assert!(
+        events
+            .iter()
+            .any(|event| testcase_names(event)
+                .is_some_and(|names| names.contains(&"lib.tb_new.all"))),
+        "the watcher didn't report the new testbench during the compile: {events:#?}"
+    );
+    let events = summary(&events);
+    assert!(
+        events.contains(
+            &"simulation_started a [lib.tb_implicit.all; lib.tb_tests.fail, really; \
+              lib.tb_tests.pass; lib.tb_tests.slow]"
+                .to_owned()
+        ),
+        "{events:#?}"
+    );
+    assert_eq!(
+        events.last().map(String::as_str),
+        Some("simulation_finished a 4/0/0")
+    );
+
+    // The next request compiles and runs it.
+    session
+        .handle
+        .simulate(requests(&["lib.tb_new.*"]), tag("b"));
+    assert_eq!(
+        summary(&session.operation("b").await)
+            .last()
+            .map(String::as_str),
+        Some("simulation_finished b 1/0/0")
+    );
+    session.handle.close().await;
+}
+
+async fn workspace_keeps_diagnostics_of_files_not_compiled() {
+    let mut fixture = Workspace::new().await;
+    simulation_project(&mut fixture);
+    let tests_file = fixture.root.join("tb/tb_tests.vhd");
+    let tests_source = fs::read_to_string(&tests_file).expect("read");
+    fixture.write(
+        "tb/tb_tests.vhd",
+        &format!("-- fake: error broken\n{tests_source}"),
+    );
+    let runtime = runtime().await;
+    let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
+    let compile_messages = |current: &Session| {
+        current
+            .handle
+            .snapshot()
+            .diagnostics
+            .get(DiagnosticSource::Compile)
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>()
+    };
+
+    session.handle.compile(tag("a"));
+    session.operation("a").await;
+    assert_eq!(compile_messages(&session), ["broken"]);
+
+    // tb_implicit compiles first and hangs; the cancel keeps tb_tests from starting, and its
+    // error stays.
+    fixture.write(
+        "tb/tb_implicit.vhd",
+        &format!("-- fake: hang\n{}", testbench("tb_implicit", "")),
+    );
+    session.handle.compile(tag("b"));
+    session
+        .until(|event| matches!(event, WorkspaceEventKind::FileCompiling { .. }))
+        .await;
+    session.handle.cancel_all();
+    session.operation("b").await;
+    assert_eq!(compile_messages(&session), ["broken"]);
+
+    // A compile that can't be planned keeps all of them.
+    fixture.write("tb/tb_implicit.vhd", &testbench("tb_implicit", ""));
+    fixture.write(
+        "tb/tb_tests.vhd",
+        &format!("-- fake: error broken\nuse work.pkg_a.all;\n{tests_source}"),
+    );
+    fixture.write(
+        "tb/pkg_a.vhd",
+        "use work.pkg_b.all;\npackage pkg_a is end package;\n",
+    );
+    fixture.write(
+        "tb/pkg_b.vhd",
+        "use work.pkg_a.all;\npackage pkg_b is end package;\n",
+    );
+    session.handle.compile(tag("c"));
+    assert_eq!(
+        summary(&session.operation("c").await),
+        ["compile_started c 0", "compile_finished c false None"]
+    );
+    assert!(
+        session
+            .handle
+            .snapshot()
+            .diagnostics
+            .get(DiagnosticSource::Project)
+            .iter()
+            .any(|diagnostic| diagnostic.severity == Severity::Error),
+        "the cycle isn't reported"
+    );
+    assert_eq!(compile_messages(&session), ["broken"]);
+    session.handle.close().await;
+}
+
 async fn workspace_runs_a_testcase_once_at_a_time() {
     let mut fixture = Workspace::new().await;
     simulation_project(&mut fixture);
@@ -603,9 +842,16 @@ async fn workspace_recovers_from_a_crash() {
 
     assert_eq!(compiled_files("a").await, 2);
     assert_eq!(compiled_files("b").await, 0);
-    // A PID in the lock file means that its owner crashed: everything is compiled again.
+    // A PID in the lock file means that its owner crashed. The state saved after its last
+    // compile matches the libraries, so nothing is compiled again…
     fs::write(fixture.layout.lock_file(), "12345\n").expect("write the lock file");
-    assert_eq!(compiled_files("c").await, 2);
+    assert_eq!(compiled_files("c").await, 0);
+    // …unless it crashed while compiling: then everything is compiled again.
+    let mut state = CompileState::load(&fixture.layout);
+    state.compiling = true;
+    state.save(&fixture.layout).expect("save the compile state");
+    fs::write(fixture.layout.lock_file(), "12345\n").expect("write the lock file");
+    assert_eq!(compiled_files("d").await, 2);
 }
 
 async fn workspace_reports_config_errors() {
