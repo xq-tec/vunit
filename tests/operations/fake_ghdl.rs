@@ -15,7 +15,7 @@
 //!   - `-- fake: output <text>`: print `text` to stderr;
 //!   - `-- fake: exit <code>`: set the exit code;
 //!   - `-- fake: sleep <ms>`: sleep;
-//!   - `-- fake: hang`: sleep for an hour;
+//!   - `-- fake: hang`: append `hang` to the log, then sleep for an hour;
 //!   - `-- fake: spawn-sleeper <file>`: start a sleeping grandchild and write its PID to `file`.
 //! - `--elab-run … --name=<testcase>` "simulates" the testcase: it appends `simstart <testcase>`
 //!   and `simend <testcase>` to the log, writes its arguments to `args.txt` in the output path
@@ -138,7 +138,12 @@ fn shared_directive(command: &str, argument: &str, code: &mut u8) -> bool {
     match command {
         "exit" => *code = argument.parse().unwrap_or(1),
         "sleep" => thread::sleep(Duration::from_millis(argument.parse().unwrap_or(0))),
-        "hang" => thread::sleep(Duration::from_secs(3600)),
+        "hang" => {
+            // After the source or directive file has been read, so a later rewrite can't
+            // release a compile or simulation that is already hanging.
+            log("hang");
+            thread::sleep(Duration::from_secs(3600));
+        },
         _ => return false,
     }
     true

@@ -285,6 +285,23 @@ fn lock_contents(fixture: &Workspace) -> String {
     fs::read_to_string(fixture.layout.lock_file()).expect("read the lock file")
 }
 
+/// Waits until `line` appears in the fake simulator log.
+async fn wait_for_log_line(fixture: &Workspace, line: &str) {
+    let path = fixture.root.join(crate::fake_ghdl::LOG);
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let log = fs::read_to_string(&path).unwrap_or_default();
+        if log.lines().any(|entry| entry == line) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {line:?} in {log:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 // -------------------------------------------------------------------------------------------------
 // Trials
 // -------------------------------------------------------------------------------------------------
@@ -519,7 +536,10 @@ async fn workspace_cancels_one_request() {
     );
 
     // Cancelling the only request of the running compile cancels it; the queued operation
-    // starts.
+    // starts. `FileCompiling` is sent before the process reads the file, so wait until the
+    // hang directive has been taken: replacing the source earlier lets this compile continue
+    // into the next file.
+    wait_for_log_line(&fixture, "hang").await;
     fixture.write("tb/tb_implicit.vhd", &testbench("tb_implicit", ""));
     fixture.sim_directive("lib.tb_tests.slow", "hang");
     session.handle.cancel(RequestTag("a".to_owned()));
