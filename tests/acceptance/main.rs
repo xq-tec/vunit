@@ -3,7 +3,7 @@
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
 //! Acceptance tests: real projects compiled and simulated with risim-ghdl through the workspace
-//! API, ported from `VUnit`'s `tests/acceptance` and the `run.py` scripts of its VHDL libraries.
+//! API, ported from VUnit's `tests/acceptance` and the `run.py` scripts of its VHDL libraries.
 //!
 //! The trials use the risim-ghdl named by `RISIM_GHDL` and are ignored without it. With
 //! `ACCEPTANCE_KEEP` set, the temporary workspaces aren't deleted, for debugging.

@@ -4,7 +4,7 @@
 
 //! A directed graph of dependencies with deterministic topological sorting.
 //!
-//! A port of `dependency_graph.py`. Unlike `VUnit`, ties in the topological order are broken by
+//! A port of `dependency_graph.py`. Unlike VUnit, ties in the topological order are broken by
 //! insertion order instead of by sorting the nodes, and only sorting reports cycles.
 //!
 //! AI NOTICE: Generated, minimally reviewed.

@@ -97,7 +97,7 @@ async fn open(
     (workspace, events)
 }
 
-/// The names of the testcases of `spec`, like `VUnit`'s `get_tests()` before any configuration
+/// The names of the testcases of `spec`, like VUnit's `get_tests()` before any configuration
 /// is added.
 pub async fn testcase_names(runtime: &Runtime, root: &Utf8Path, spec: &ProjectSpec) -> Vec<String> {
     let (workspace, _events) = open(runtime, root, spec).await;

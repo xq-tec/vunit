@@ -15,12 +15,12 @@
 //! - creates the configurations of every test from the project's
 //!   [`TestConfigSpec`]s and names the resulting testcases.
 //!
-//! Differences from `VUnit`:
+//! Differences from VUnit:
 //!
 //! - Problems are reported as diagnostics. A testbench with errors (duplicate tests, invalid
 //!   attributes, no or several architectures) is skipped instead of aborting the run.
 //! - Every test runs in its own simulation; `run_all_in_same_sim` is accepted and ignored.
-//! - Testcase names keep the case of the entity declaration (`VUnit` lowercases them).
+//! - Testcase names keep the case of the entity declaration (VUnit lowercases them).
 //! - Test names that differ only in case produce a warning, since patterns can't tell them apart.
 //!
 //! AI NOTICE: Generated, minimally reviewed.

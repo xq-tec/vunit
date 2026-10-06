@@ -8,7 +8,7 @@
 //! # Flags for analysis (risim-ghdl.a_flags) and elaboration (risim-ghdl.elab_flags).
 //! options = ["-fsynopsys", "-frelaxed"]
 //!
-//! # Optional VUnit features on top of the defaults (VUnit builtins, com, OSVVM).
+//! # Optional VUnit features on top of the defaults (VUnit core, com, OSVVM).
 //! [vunit]
 //! features = ["random", "verification_components"]
 //!

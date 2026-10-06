@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! The test benches of the `VUnit` VHDL libraries (`vunit/vhdl/*/test`), with each `run.py`
+//! The test benches of the VUnit VHDL libraries (`vunit/vhdl/*/test`), with each `run.py`
 //! translated into a [`ProjectSpec`].
 //!
 //! Left out, because the frontend doesn't support what they need (see `UPSTREAM.md`):

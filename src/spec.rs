@@ -4,7 +4,7 @@
 
 //! The programmatic description of a project: libraries, features, options and configurations.
 //!
-//! This replaces the setters of `VUnit`'s Python API (`ui/__init__.py`, `ui/library.py`,
+//! This replaces the setters of VUnit's Python API (`ui/__init__.py`, `ui/library.py`,
 //! `ui/testbench.py`). A `risim-config.toml` is turned into a [`ProjectSpec`] by the `config`
 //! module; tests and other embedders can build one directly.
 //!
@@ -28,7 +28,7 @@ use crate::vhdl_standard::VhdlStandard;
 pub struct ProjectSpec {
     /// The standard for all files that don't override it.
     pub vhdl_standard: VhdlStandard,
-    /// Optional `VUnit` features. The `VUnit` core libraries, com and OSVVM are always added.
+    /// Optional VUnit features. The VUnit core libraries, com and OSVVM are always added.
     pub features: BTreeSet<Feature>,
     /// User libraries, in the order they are added to the project.
     pub libraries: Vec<LibrarySpec>,
@@ -73,16 +73,16 @@ impl ProjectSpec {
         self
     }
 
-    /// Enables an optional `VUnit` feature.
+    /// Enables an optional VUnit feature.
     pub fn add_feature(&mut self, feature: Feature) -> &mut Self {
         self.features.insert(feature);
         self
     }
 }
 
-/// An optional part of `VUnit`, on top of the core libraries, com and OSVVM.
+/// An optional part of VUnit, on top of the core libraries, com and OSVVM.
 ///
-/// `array_util` and `json4vhdl` don't exist anymore in `VUnit` 5.
+/// `array_util` and `json4vhdl` don't exist anymore in VUnit 5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Feature {
@@ -131,7 +131,7 @@ impl FromStr for Feature {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LibrarySpec {
     /// A library compiled from source files. For `vunit_lib`, the files are added to the
-    /// `VUnit` library.
+    /// VUnit library.
     Sources {
         /// The library name.
         name: String,
@@ -198,8 +198,9 @@ pub struct CompileOptions {
 
 /// Options for elaboration and simulation (`risim-ghdl --elab-run`).
 ///
-/// Unset fields take their value from a less specific level: test configuration, then project,
-/// then the default.
+/// A test configuration overrides the project, and still-unset fields take their defaults when
+/// the command line is built: empty flag lists, assert stop level `error`, IEEE assertions left
+/// enabled, and a new seed per run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SimOptions {
     /// Extra elaboration flags (`risim-ghdl.elab_flags`).

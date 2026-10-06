@@ -9,7 +9,9 @@
 use super::RequestTag;
 use crate::runner::SimulationRequest;
 
-/// A requested operation. A simulate operation compiles first.
+/// A requested operation.
+///
+/// A simulate operation compiles first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Operation {
     /// Compile the testbenches.

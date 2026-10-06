@@ -61,8 +61,9 @@ pub(super) struct ProjectConfig {
 }
 
 impl ProjectConfig {
-    /// The configuration of a project from `source`, whose configuration file path, if any, is
-    /// absolute. A configuration file isn't read yet.
+    /// Creates a configuration from `source`.
+    ///
+    /// The configuration file path, if any, is absolute. A configuration file isn't read yet.
     pub(super) fn new(source: ProjectSource) -> Self {
         let (config_file, spec) = match source {
             ProjectSource::ConfigFile(path) => (Some(path), None),
@@ -75,8 +76,9 @@ impl ProjectConfig {
         }
     }
 
-    /// Reads the configuration file, if there is one. A valid specification replaces the
-    /// previous one; otherwise the previous one stays.
+    /// Reads the configuration file, if there is one.
+    ///
+    /// A valid specification replaces the previous one; otherwise the previous one stays.
     ///
     /// # Errors
     ///

@@ -4,8 +4,6 @@
 
 //! The risim-ghdl simulator: its identity and version, and its command lines.
 //!
-//! A port of `sim_if/risim_ghdl.py` from the `risim` branch, without the `-e` elaboration mode.
-//!
 //! AI NOTICE: Generated, minimally reviewed.
 
 use std::collections::BTreeMap;
@@ -25,8 +23,9 @@ use crate::spec::AssertLevel;
 use crate::store::FileTime;
 use crate::vhdl_standard::VhdlStandard;
 
-/// What identifies a risim-ghdl installation. Libraries compiled with another identity are
-/// discarded.
+/// What identifies a risim-ghdl installation.
+///
+/// Libraries compiled with another identity are discarded.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SimulatorIdentity {
     /// The executable.

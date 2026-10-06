@@ -4,7 +4,8 @@
 
 //! Collecting, reading and parsing the source files of a project.
 //!
-//! Replaces the globbing of `ui/common.py` and the caching of `cached.py`:
+//! Replaces the globbing of `ui/common.py`, the file reading of `ostools.py` and the caching of
+//! `cached.py`:
 //!
 //! - [`collect`] expands the file patterns of a [`ProjectSpec`] and adds the builtin libraries.
 //! - [`SourceCache`] reads, hashes and parses files, reusing earlier results while a file's

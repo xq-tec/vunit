@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! Testcase patterns, as `VUnit` matches them with Python's `fnmatch`.
+//! Testcase patterns, as VUnit matches them with Python's `fnmatch`.
 //!
 //! Syntax: `*` matches any text including dots, `?` matches one character, `[seq]` matches a
 //! character in `seq`, and `[!seq]` matches a character not in `seq`. Ranges like `a-z` are
@@ -53,7 +53,9 @@ impl Token {
 }
 
 impl Pattern {
-    /// Compiles a pattern. Every string is a valid pattern.
+    /// Compiles a pattern.
+    ///
+    /// Every string is a valid pattern.
     pub fn new(pattern: &str) -> Self {
         let chars: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
         let mut tokens = Vec::new();

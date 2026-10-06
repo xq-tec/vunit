@@ -2,20 +2,28 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! Rust replacement for the `VUnit` Python frontend, for the riSim simulator.
+//! Rust replacement for the VUnit Python frontend, to be used with the riSim simulator.
 //!
-//! The VHDL libraries under `vunit/vhdl` stay upstream `VUnit` sources.
-//! This crate has no command-line interface; event-cache drives it.
+//! The testbench detection stays compatible with the original VUnit, so existing test suites are
+//! usable with both frontends.
+//! The VHDL libraries under `vunit/vhdl` stay upstream VUnit sources.
 //!
-//! The crate covers reading the configuration ([`config`], [`spec`]), collecting and parsing
-//! sources ([`sources`], [`vhdl_parser`]), the builtin libraries ([`builtins`]), the project
-//! model with dependency analysis ([`project`], [`dependency_graph`]), test discovery with
-//! configurations and testcase patterns ([`discovery`], [`configuration`], [`pattern`]), the
-//! `risim-out/` directory ([`store`]), the simulator interface ([`simulator`], [`process`]),
-//! incremental parallel compilation ([`compile`]), simulation runs with persisted results
-//! ([`runner`]), and the entry points: a [`Runtime`] shared by all workspaces of a process, and
-//! [`Workspace`]s that load and watch their project ([`watch`]) and run compile and simulate
-//! operations with live events ([`workspace`]).
+//! # Crate organization
+//!
+//! - configuration: [`config`], [`spec`]
+//! - collecting and parsing sources: [`sources`], [`vhdl_parser`], [`vhdl_standard`]
+//! - builtin libraries: [`builtins`]
+//! - project model with dependency analysis: [`project`], [`dependency_graph`]
+//! - test discovery with configurations and testcase patterns: [`discovery`], [`configuration`], [`pattern`]
+//! - diagnostics: [`diagnostics`]
+//! - `risim-out/` directory: [`store`]
+//! - simulator interface: [`simulator`], [`process`]
+//! - incremental parallel compilation: [`compile`]
+//! - simulation runs with persisted results: [`runner`]
+//! - workspace management and monitoring: [`workspace`], [`watch`], [`runtime`]
+//!
+//! Entry points: a [`Runtime`] shared by all workspaces of a process,
+//! and [`Workspace`]s that load and watch their project.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 

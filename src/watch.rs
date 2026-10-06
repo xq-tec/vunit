@@ -301,7 +301,9 @@ impl DirectoryWatcher {
         }
     }
 
-    /// Watches exactly `targets`. Returns the directories that can't be watched.
+    /// Watches exactly `targets`.
+    ///
+    /// Returns the directories that can't be watched.
     pub fn update(&mut self, targets: &WatchTargets) -> Vec<(Utf8PathBuf, notify::Error)> {
         let removed: Vec<Utf8PathBuf> = self
             .watched

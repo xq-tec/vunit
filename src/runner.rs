@@ -21,9 +21,9 @@
 //! - **Results:** every finished test is recorded in the [`ResultStore`]. A test cancelled
 //!   before it started keeps its previous result, since its output directory is unchanged.
 //!
-//! Differences from `VUnit`:
+//! Differences from VUnit:
 //!
-//! - A test that never started counts as failed (`VUnit`: skipped).
+//! - A test that never started counts as failed (VUnit: skipped).
 //! - No `pre_config`/`post_check` hooks, no seed "repeat", no elaborate-only mode.
 //! - Problems that prevent a simulation (unsupported standard, spawn failure, output directory
 //!   errors) fail the test, are written to its `output.txt`, and are reported as diagnostics.
@@ -87,7 +87,7 @@ pub fn encode_test_case(name: &str) -> String {
     name.replace(',', ",,")
 }
 
-/// Encodes a dictionary for `VUnit`'s VHDL dictionary parser (`encode_dict`): entries sorted by
+/// Encodes a dictionary for VUnit's VHDL dictionary parser (`encode_dict`): entries sorted by
 /// key, `key : value`, separated by commas, with `:` and `,` doubled in keys and values.
 pub fn encode_dict<'entry>(
     entries: impl IntoIterator<Item = (&'entry str, &'entry str)>,

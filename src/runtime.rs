@@ -5,9 +5,8 @@
 //! The resources shared by all workspaces of a process: the detected risim-ghdl and the limits
 //! on concurrent compile and simulation processes.
 //!
-//! Replaces the global simulation semaphore of event-cache's `tb_manager.rs`. Every workspace
-//! of a process should be opened through the same [`Runtime`], so that the limits apply across
-//! workspaces.
+//! Every workspace of a process should be opened through the same [`Runtime`],
+//! so that the limits apply across workspaces.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 

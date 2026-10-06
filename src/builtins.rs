@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! The `VUnit` and OSVVM VHDL libraries that every project gets.
+//! The VUnit and OSVVM VHDL libraries that every project gets.
 //!
 //! The files are embedded at build time (see `build.rs`). [`select`] ports the selection
 //! logic of `builtins.py` for risim-ghdl, which supports context declarations and package
@@ -26,7 +26,7 @@ use crate::vhdl_standard::VhdlStandard;
 /// An embedded builtin file.
 #[derive(Debug)]
 pub struct BuiltinFile {
-    /// The path relative to `VUnit`'s `vunit/` directory, with `/` separators, for example
+    /// The path relative to VUnit's `vunit/` directory, with `/` separators, for example
     /// `vhdl/check/src/check.vhd`.
     pub rel_path: &'static str,
     /// The file contents.
@@ -49,7 +49,7 @@ impl BuiltinFile {
 
 include!(concat!(env!("OUT_DIR"), "/builtin_files.rs"));
 
-/// The name of the library with the `VUnit` VHDL packages.
+/// The name of the library with the VUnit VHDL packages.
 pub const VUNIT_LIB: &str = "vunit_lib";
 
 /// The name of the OSVVM library.
@@ -65,7 +65,7 @@ pub const fn hash() -> &'static str {
     BUILTINS_HASH
 }
 
-/// A builtin library and its files, in the order `VUnit` adds them.
+/// A builtin library and its files, in the order VUnit adds them.
 #[derive(Debug)]
 pub struct BuiltinLibrary {
     /// The library name.
@@ -97,7 +97,7 @@ const OSVVM_WITHOUT_PACKAGE_GENERICS: [&str; 4] = [
 
 /// Selects the builtin files for a project.
 ///
-/// The `VUnit` core libraries are always selected, and so are com (from VHDL-2008 on) and OSVVM
+/// The VUnit core libraries are always selected, and so are com (from VHDL-2008 on) and OSVVM
 /// unless `include_osvvm` is false because the project defines its own `osvvm` library.
 pub fn select(
     standard: VhdlStandard,
@@ -145,7 +145,7 @@ pub fn select(
         add_files(&mut vunit_lib, standard, files_in("vhdl/com/src"));
     }
     if features.contains(&Feature::Random) && requires_2008(Feature::Random, &mut diagnostics) {
-        // `VUnit` adds these without filtering by standard.
+        // VUnit adds these without filtering by standard.
         vunit_lib.extend(files_in("vhdl/random/src"));
     }
     if features.contains(&Feature::VerificationComponents)
@@ -211,7 +211,9 @@ fn file(rel_path: &str) -> Option<&'static BuiltinFile> {
 }
 
 /// Writes the builtin files to `builtins_root/<hash>/` unless that directory exists, and
-/// deletes other entries of `builtins_root`. Returns the directory with the files.
+/// deletes other entries of `builtins_root`.
+///
+/// Returns the directory with the files.
 ///
 /// The files are written to a temporary directory first and then renamed, so a crash never
 /// leaves an incomplete directory behind.

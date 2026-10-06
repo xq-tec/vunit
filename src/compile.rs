@@ -7,9 +7,9 @@
 //! Replaces `compile_source_files` of `sim_if/__init__.py` and the recompile logic of
 //! `project.py`:
 //!
-//! - **Compile set:** the testbench files, the VHDL configurations that runs elaborate, and
-//!   everything they need, following implementation dependencies. Files no testbench uses
-//!   aren't compiled.
+//! - **Compile set:** the testbench files, the files that declare the VHDL configurations the
+//!   test runs elaborate, and everything they need, following implementation dependencies.
+//!   Files no testbench uses aren't compiled.
 //! - **Recompile decision:** every file gets a compile key, a Merkle-style hash over its
 //!   contents, standard, options, the simulator identity and the keys of its direct
 //!   dependencies. A file is compiled if its stored key differs, its library directory is
@@ -70,8 +70,8 @@ mod tests;
 /// The files a compile starts from.
 ///
 /// These are the entity and architecture files of all testbenches, and the files declaring the
-/// VHDL configurations that runs elaborate. Nothing depends on a configuration declaration, so
-/// it must be a target itself.
+/// VHDL configurations the test runs elaborate. Nothing depends on a configuration declaration,
+/// so it must be a target itself.
 pub fn targets(project: &Project, discovery: &Discovery) -> Vec<FileId> {
     let mut seen = FxHashSet::default();
     let testbench_files = discovery
@@ -477,7 +477,7 @@ pub enum CompileEvent {
         library: String,
         /// The source file.
         file: Utf8PathBuf,
-        /// The 1-based number of this file among the files compiled so far.
+        /// The 1-based count of files whose compilation has started, including this one.
         index: usize,
         /// The number of files to compile. Files skipped after failures are never started, so
         /// `index` may not reach `total`.

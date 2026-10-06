@@ -3,7 +3,7 @@
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
 //! Diagnostics reported to the client, conversion of byte offsets to positions, and parsing of
-//! GHDL messages (ported from event-cache's `compile_output.rs`).
+//! GHDL messages.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -37,7 +37,9 @@ impl fmt::Display for Severity {
     }
 }
 
-/// The producer of a set of diagnostics. Each source replaces only its own set.
+/// The producer of a set of diagnostics.
+///
+/// Each source replaces only its own set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticSource {

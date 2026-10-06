@@ -55,7 +55,7 @@ impl VhdlStandard {
         }
     }
 
-    /// The name `VUnit` uses: `93` for VHDL-93 (for legacy reasons), the year otherwise.
+    /// The name VUnit uses: `93` for VHDL-93 (for legacy reasons), the year otherwise.
     ///
     /// This is also the tag that builtin file names carry.
     pub const fn vunit_name(self) -> &'static str {

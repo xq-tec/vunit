@@ -4,7 +4,7 @@
 
 //! Tests ported from `tests/unit/test_project.py`.
 //!
-//! `VUnit` checks dependencies by marking a file as recompiled and checking which files then
+//! VUnit checks dependencies by marking a file as recompiled and checking which files then
 //! need recompilation. Here, `assert_compiles` checks the dependency graph and the compile
 //! order directly. Recompilation tests belong to the `compile` module.
 //!
@@ -328,7 +328,7 @@ fn finds_use_package_dependencies() {
 
 #[test]
 fn finds_extra_package_body_dependencies() {
-    // `VUnit` adds these with `depend_on_package_body`; here they are implementation
+    // VUnit adds these with `depend_on_package_body`; here they are implementation
     // dependencies.
     let (test, package, body, module) = module_package_and_body(true);
     let body = body.unwrap();

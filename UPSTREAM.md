@@ -31,9 +31,9 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 
 | Module                      | Ported from                                                         | Responsibility                                                              |
 | --------------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| `config`                    | event-cache `tb_manager/config.rs`                                  | `risim-config.toml` → `ProjectSpec`, with spans for diagnostics             |
+| `config`                    | — (new)                                                             | `risim-config.toml` → `ProjectSpec`, with spans for diagnostics             |
 | `spec`                      | `ui/__init__.py`, `ui/library.py`, `ui/testbench.py` (setters only) | Programmatic `ProjectSpec` (libraries, options, configurations, features)   |
-| `sources`                   | `ostools.py` (globs), `cached.py`                                   | Glob expansion, file reading (Latin-1), content hashing, parse cache        |
+| `sources`                   | `ui/common.py` (globs), `ostools.py` (file reading), `cached.py`    | Glob expansion, file reading (Latin-1), content hashing, parse cache        |
 | `vhdl_parser`               | `vhdl_parser.py`                                                    | Regex-based design-unit/reference/generic extraction                        |
 | `vhdl_standard`             | `vhdl_standard.py`                                                  | `VhdlStandard` and file-name tags (`2008p`, `93m`, …)                       |
 | `project`                   | `project.py`, `library.py`, `source_file.py`, `design_unit.py`      | Libraries, source files, design units, dependency extraction                |
@@ -42,15 +42,15 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 | `discovery`                 | `test/bench.py`, `test/bench_list.py`, `test/list.py`               | Testbenches, tests, attributes, pragmas, locations                          |
 | `configuration`             | `configuration.py`                                                  | Configurations (generics, sim options, attributes, VHDL configuration name) |
 | `pattern`                   | `fnmatch` usage in `ui/__init__.py`                                 | Testcase pattern matching                                                   |
-| `simulator`                 | `sim_if/__init__.py`, `sim_if/risim_ghdl.py` (`origin/risim`)       | risim-ghdl version/capabilities, compile and simulate command lines         |
+| `simulator`                 | `sim_if/__init__.py`, `sim_if/ghdl.py`                              | risim-ghdl version/capabilities, compile and simulate command lines         |
 | `compile`                   | `sim_if/__init__.py` (`compile_source_files`), `project.py`         | Compile set, recompile decision, library scheduling, cancellation           |
 | `runner`                    | `test/suites.py`, `test/runner.py`, `ui/__init__.py` (output paths) | `runner_cfg`, seed, output directories, `vunit_results` parsing, outcomes   |
-| `diagnostics`               | event-cache `tb_manager/compile_output.rs`                          | `Diagnostic` type, GHDL message parsing                                     |
-| `process`                   | event-cache `tb_manager/subprocess_output.rs`                       | Spawning, output capture, process-tree termination                          |
+| `diagnostics`               | — (new)                                                             | `Diagnostic` type, GHDL message parsing                                     |
+| `process`                   | — (new)                                                             | Spawning, output capture, process-tree termination                          |
 | `store`                     | `database.py`, `hashing.py` (replaced)                              | `risim-out/` layout, JSON state files, atomic writes, lock                  |
 | `watch`                     | — (new)                                                             | `notify` watcher, debouncing, change classification                         |
-| `workspace`                 | event-cache `tb_manager.rs` (`PendingAction`)                       | Per-workspace actor: state, request merging, operations, events             |
-| `runtime`                   | event-cache `tb_manager.rs` (semaphore)                             | Shared limits and risim-ghdl detection across workspaces                    |
+| `workspace`                 | — (new)                                                             | Per-workspace actor: state, request merging, operations, events             |
+| `runtime`                   | — (new)                                                             | Shared limits and risim-ghdl detection across workspaces                    |
 | `verilog_parser` (deferred) | `parsing/verilog/*`                                                 | Deferred                                                                    |
 
 ## Intentional deviations
@@ -58,8 +58,8 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - Every test runs in its own simulation (`run_all_in_same_sim` is ignored).
 - No test history; no seed "repeat"; no xUnit/JUnit reports; no elaborate-only mode; no `pre_config`/`post_check` hooks.
 - A test that never started counts as failed (VUnit: skipped).
-- `runner_cfg` has no `run script path`, so `run_script_path(runner_cfg)` is empty. Tests of a simulation start in name order. A test cancelled before it started keeps its previous result.
-- The compile set includes the files declaring the VHDL configurations that runs elaborate. VUnit's `--minimal` compiles only the testbench files and their dependencies, which misses them.
+- `runner_cfg` has no `run script path`, so `run_script_path(runner_cfg)` is empty. Simulations start in testcase name order. A test cancelled before it started keeps its previous result.
+- The compile set includes the files declaring the VHDL configurations the test runs elaborate. VUnit's `--minimal` compiles only the testbench files and their dependencies, which misses them.
 - Recompilation uses compile keys instead of timestamps. Independent libraries compile in parallel and continue after unrelated failures.
 - Duplicate tests, invalid attributes, and testbenches with no or several architectures disable only the affected testbench instead of aborting. Configuration errors (duplicate or empty names, invalid attributes) skip only that configuration.
 - Testcase patterns are case-insensitive on all platforms (Python's `fnmatch` is case-insensitive only on Windows).
@@ -73,5 +73,5 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - The files of a user library named `vunit_lib` are added to the VUnit library, like `ui.library("vunit_lib").add_source_files(…)`; a precompiled library can't be named `vunit_lib`. A user library named `osvvm` replaces the builtin OSVVM library, with a warning. Library names, including `work`, are compared case-insensitively.
 - com is always added from VHDL-2008 on, and left out for older standards instead of raising an error.
 - In file patterns, `*` also matches hidden files, and `risim-out/` and `.git/` directories are never searched. Files with unknown extensions are skipped with a warning instead of raising an error.
-- Testcase names keep the case of the entity declaration; `VUnit` uses the lowercase entity name. Test names that differ only in case produce a warning.
-- Test configurations are declarative: each `TestConfigSpec` first sets its generics, simulation options and VHDL configuration in all configurations of its target, then adds its configurations as copies of the target's default configuration. Generic names are compared case-insensitively, and generics of a configuration that the entity doesn't declare produce a warning and are skipped (`VUnit` sets them silently). A `fail_on_warning` attribute of a configuration only affects that configuration instead of the whole testbench.
+- Testcase names keep the case of the entity declaration; VUnit uses the lowercase entity name. Test names that differ only in case produce a warning.
+- Test configurations are declarative: each `TestConfigSpec` first sets its generics, simulation options and VHDL configuration in all configurations of its target, then adds its configurations as copies of the target's default configuration. Generic names are compared case-insensitively, and generics of a configuration that the entity doesn't declare produce a warning and are skipped (VUnit sets them silently). A `fail_on_warning` attribute of a configuration only affects that configuration instead of the whole testbench.

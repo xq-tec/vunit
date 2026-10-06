@@ -14,11 +14,11 @@ This is a fork of VUnit. The VHDL libraries under `vunit/vhdl` (the testbench ru
 
 ## Scope
 
-The crate covers what riSim needs, and nothing more:
+The scope of this crate is intentionally limited:
 
-- The only supported simulator is `risim-ghdl`, riSim's build of GHDL.
+- The only supported simulator is `risim-ghdl`, riSim's fork of GHDL.
 - VHDL only. Verilog is not supported yet.
-- There is no command-line interface. The crate is a library used by riSim's event-cache, which drives it over its control protocol; riSim's `risim-vunit` CLI is a client of that protocol.
+- There is no command-line interface. Callers open a `Runtime` and drive workspaces through the library API.
 
 The crate provides:
 
@@ -32,7 +32,7 @@ The crate provides:
 
 ## Usage
 
-A workspace is opened from a `risim-config.toml`:
+A workspace is opened from a `risim-config.toml`. The `options` list is passed both to analysis (`risim-ghdl -a`) and to elaboration (`risim-ghdl --elab-run`):
 
 ```toml
 # Flags for analysis and elaboration.
@@ -47,7 +47,7 @@ features = ["random", "verification_components"]
 files = ["src/**/*.vhd", "tb/*.vhd"]
 ```
 
-Embedders can also build a `ProjectSpec` in code, which additionally supports configurations, generics and simulation options per testbench or test:
+A `ProjectSpec` built in code describes the same project, and can also set external libraries, a VHDL standard per library, and configurations, generics and simulation options per testbench or test. Pass it as `ProjectSource::Spec` instead of `ProjectSource::ConfigFile`.
 
 ```rust
 use risim_vunit_frontend::{ProjectSource, Runtime, RuntimeOptions, SimulationRequest};

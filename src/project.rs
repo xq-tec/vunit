@@ -5,10 +5,10 @@
 //! Libraries, source files and design units, and the dependencies between files.
 //!
 //! A port of `project.py`, `library.py`, `source_file.py` and `design_unit.py`, restricted to
-//! VHDL. Differences from `VUnit`:
+//! VHDL. Differences from VUnit:
 //!
 //! - An ambiguous direct entity instantiation is reported as a diagnostic instead of aborting.
-//! - Missing libraries, units and architectures are only logged, as in `VUnit`.
+//! - Missing libraries, units and architectures are only logged, as in VUnit.
 //! - Recompilation isn't decided here (see the `compile` module).
 //!
 //! AI NOTICE: Generated, minimally reviewed.
@@ -131,7 +131,7 @@ pub struct SourceFile {
     pub content_hash: ContentHash,
     /// The parse result; `None` if the file couldn't be parsed.
     pub design_file: Option<Arc<VhdlDesignFile>>,
-    /// Design units, in the order `VUnit` registers them.
+    /// Design units, in the order VUnit registers them.
     pub design_units: Vec<DesignUnit>,
     /// References to other units, with `work` replaced by the file's library.
     pub dependencies: Vec<VhdlReference>,

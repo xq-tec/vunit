@@ -4,7 +4,7 @@
 
 //! Tests ported from `tests/unit/test_test_bench.py` and `tests/unit/test_test_bench_list.py`.
 //!
-//! `VUnit` raises exceptions where discovery reports diagnostics and skips the testbench, and
+//! VUnit raises exceptions where discovery reports diagnostics and skips the testbench, and
 //! has no `run_all_in_same_sim` suites; those tests are adapted accordingly.
 //!
 //! AI NOTICE: Generated, minimally reviewed.

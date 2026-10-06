@@ -144,7 +144,7 @@ fn shared_directive(command: &str, argument: &str, code: &mut u8) -> bool {
     true
 }
 
-/// Decodes `VUnit`'s dictionary encoding (`encode_dict`).
+/// Decodes VUnit's dictionary encoding (`encode_dict`).
 fn decode_dict(encoded: &str) -> Vec<(String, String)> {
     let mut entries = Vec::new();
     let mut entry = String::new();

@@ -402,7 +402,7 @@ fn targets_are_testbench_files() {
         [entity, architecture]
     );
 
-    // VHDL configurations that runs elaborate are targets too; nothing depends on them.
+    // VHDL configurations the test runs elaborate are targets too; nothing depends on them.
     let configuration = fixture.add(
         "lib",
         "cfg.vhd",

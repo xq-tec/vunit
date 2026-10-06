@@ -4,16 +4,16 @@
 
 //! Regex-based extraction of design units and references from VHDL source files.
 //!
-//! A port of `vhdl_parser.py`. Like `VUnit`, the parser doesn't understand VHDL; it finds
+//! A port of `vhdl_parser.py`. Like VUnit, the parser doesn't understand VHDL; it finds
 //! design units, generics, ports, references and component instantiations with regular
 //! expressions on the source text after comments are blanked out and the text is lowercased.
 //!
-//! Source files are Latin-1 (`VUnit`'s `HDL_FILE_ENCODING`), so the regular expressions run on
+//! Source files are Latin-1 (VUnit's `HDL_FILE_ENCODING`), so the regular expressions run on
 //! bytes with Unicode disabled, and offsets are byte offsets. `\w` and `\s` are expanded to the
 //! Latin-1 characters Python matches for them. Word boundaries (`\b`) only treat ASCII
 //! characters as word characters, unlike Python.
 //!
-//! Not ported: parsing of enumeration, record and array types in packages. `VUnit` only uses
+//! Not ported: parsing of enumeration, record and array types in packages. VUnit only uses
 //! them for com codec generation, which isn't supported.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
@@ -194,13 +194,17 @@ impl VhdlReference {
     }
 }
 
-/// The file can't be parsed. `VUnit` then treats it as having no design units.
+/// The file can't be parsed.
+///
+/// VUnit then treats it as having no design units.
 #[derive(Debug, Clone, PartialEq, Eq, Error, Serialize, Deserialize)]
 #[error("{0}")]
 pub struct ParseError(String);
 
-/// The version of the parser output. Persistent parse caches with another version are
-/// discarded, so increment it whenever the parser's results change.
+/// The version of the parser output.
+///
+/// Persistent parse caches with another version are discarded, so increment it whenever the
+/// parser's results change.
 pub const PARSER_VERSION: u32 = 1;
 
 impl VhdlDesignFile {
@@ -208,7 +212,7 @@ impl VhdlDesignFile {
     ///
     /// # Errors
     ///
-    /// Fails like `VUnit` does, for example on an unbalanced generic or port clause.
+    /// Fails like VUnit does, for example on an unbalanced generic or port clause.
     pub fn parse(source: &[u8]) -> Result<Self, ParseError> {
         let mut code = remove_comments(source);
         let lines = LineIndex::new(source);
@@ -343,7 +347,7 @@ const MULTILINE_DOTALL: Flags = Flags {
 /// Compiles a Python regular expression.
 ///
 /// `<ID>` stands for [`ID_PATTERN`]; `\w` and `\s` get Python's Latin-1 meaning. All
-/// expressions are case-insensitive, as in `VUnit` (the parsed code is lowercase anyway).
+/// expressions are case-insensitive, as in VUnit (the parsed code is lowercase anyway).
 #[expect(
     clippy::unwrap_used,
     reason = "the patterns are constants; a broken one fails every test"
@@ -531,8 +535,9 @@ static CONFIGURATION_REFERENCE_RE: LazyLock<Regex> =
 static PACKAGE_INSTANCE_REFERENCE_RE: LazyLock<Regex> =
     LazyLock::new(|| python_regex(PACKAGE_INSTANCE_PATTERN, MULTILINE));
 
-/// Replaces comments with spaces, so offsets stay the same. String literals are skipped, so
-/// `"--"` inside a string isn't a comment.
+/// Replaces comments with spaces, so offsets stay the same.
+///
+/// String literals are skipped, so `"--"` inside a string isn't a comment.
 pub fn remove_comments(code: &[u8]) -> Vec<u8> {
     let mut result = code.to_vec();
     for captures in COMMENT_RE.captures_iter(code) {

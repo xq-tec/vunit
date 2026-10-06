@@ -4,9 +4,9 @@
 
 //! An open workspace: a project, its compile and simulation operations, and its events.
 //!
-//! Replaces event-cache's `tb_manager.rs` (`PendingAction`). One actor task per workspace owns
-//! the project, the compile state and the results. [`Workspace`] handles send it commands, and
-//! it publishes a [`Snapshot`] after every change and a [`WorkspaceEvent`] for every step.
+//! One actor task per workspace owns the project, the compile state and the results.
+//! [`Workspace`] handles send it commands, and it publishes a [`Snapshot`] after every change
+//! and a [`WorkspaceEvent`] for every step.
 //!
 //! - **Project:** loaded at open, again whenever the watcher reports a change of the
 //!   configuration file or the sources, and again before every operation, so that a file saved
@@ -151,7 +151,9 @@ pub struct WorkspaceEvent {
     pub kind: WorkspaceEventKind,
 }
 
-/// What happened in a workspace. The snapshot is updated before the event is sent.
+/// What happened in a workspace.
+///
+/// The snapshot is updated before the event is sent.
 ///
 /// A simulate operation whose compile phase fails or is cancelled ends with
 /// [`CompileFinished`](Self::CompileFinished) without success, and sends neither
@@ -182,7 +184,7 @@ pub enum WorkspaceEventKind {
         library: String,
         /// The source file.
         file: Utf8PathBuf,
-        /// The 1-based number of this file among the files compiled so far.
+        /// The 1-based count of files whose compilation has started, including this one.
         index: usize,
         /// The number of files to compile.
         total: usize,
@@ -216,9 +218,12 @@ pub enum WorkspaceEventKind {
         name: String,
         /// How it ended.
         outcome: TestOutcome,
-        /// The simulator output file.
+        /// The simulator output file (`output.txt`). For a test cancelled before it started,
+        /// the file belongs to an earlier run, if any.
         output_path: Utf8PathBuf,
         /// How long the simulator ran.
+        ///
+        /// Zero if it never started.
         duration: Duration,
     },
     /// All testcases of a simulate operation are done.

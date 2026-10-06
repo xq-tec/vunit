@@ -100,7 +100,7 @@ fn started_test_fails_when_the_suite_is_not_done() {
 
 #[test]
 fn test_that_never_started_fails() {
-    // `VUnit` reports this test as skipped.
+    // VUnit reports this test as skipped.
     let results = "test_start:test1\ntest_suite_done\n";
     assert!(!results_show_pass(results, Some("test2")));
     // Names are compared exactly.

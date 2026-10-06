@@ -1044,7 +1044,7 @@ async fn simulation_spawn_failure_fails_the_test() {
     );
 }
 
-/// Compiles the UART example of `VUnit` (`tests/operations/uart`) with the real risim-ghdl, then
+/// Compiles the UART example of VUnit (`tests/operations/uart`) with the real risim-ghdl, then
 /// recompiles after edits.
 #[expect(clippy::print_stderr, reason = "reports timings")]
 async fn real_risim_ghdl_compiles_uart() {

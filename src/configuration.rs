@@ -5,14 +5,14 @@
 //! Configurations of testbenches and tests: generics, simulation options, attributes and the
 //! VHDL configuration to elaborate.
 //!
-//! A port of `configuration.py` without `pre_config` and `post_check` hooks. `VUnit` changes
+//! A port of `configuration.py` without `pre_config` and `post_check` hooks. VUnit changes
 //! configurations through imperative setters; here, [`ConfigurationSet`] applies the
 //! declarative [`ConfigurationSpec`]s of a [`ProjectSpec`](crate::spec::ProjectSpec) in order.
 //!
-//! Differences from `VUnit`:
+//! Differences from VUnit:
 //!
 //! - Generic names are compared case-insensitively, since VHDL identifiers are.
-//! - A `fail_on_warning` attribute of a configuration only affects that configuration; `VUnit`
+//! - A `fail_on_warning` attribute of a configuration only affects that configuration; VUnit
 //!   applies it to the whole testbench. `run_all_in_same_sim` is ignored.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
@@ -140,7 +140,7 @@ impl Configuration {
     }
 }
 
-/// Formats a directory for a generic: forward slashes and a trailing `/`, as `VUnit` does.
+/// Formats a directory for a generic: forward slashes and a trailing `/`, as VUnit does.
 pub fn directory_generic(path: &Utf8Path) -> String {
     let mut value = path.as_str().replace('\\', "/");
     if !value.ends_with('/') {

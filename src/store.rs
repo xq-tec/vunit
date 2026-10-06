@@ -124,7 +124,7 @@ impl OutputLayout {
     /// The output directory of `testcase`: `<safe-name>_<hash>`.
     ///
     /// The safe name replaces every character except `[A-Za-z0-9._]` with `_`. On Windows, it is
-    /// shortened like `VUnit` does, so that paths stay below 260 characters with a margin of 100
+    /// shortened like VUnit does, so that paths stay below 260 characters with a margin of 100
     /// characters for the files inside.
     pub fn test_output_dir(&self, testcase: &str) -> Utf8PathBuf {
         let root = self.test_output_root();
@@ -132,7 +132,7 @@ impl OutputLayout {
             const MAX_PATH: usize = 260;
             const MARGIN: usize = 100;
             const HASH_LEN: usize = 16;
-            // `VUnit` measures the root without the separator before the directory name.
+            // VUnit measures the root without the separator before the directory name.
             Some(MAX_PATH.saturating_sub(MARGIN + root.as_str().len() + HASH_LEN))
         } else {
             None
@@ -170,7 +170,7 @@ pub struct TestOutputPaths {
     pub dir: Utf8PathBuf,
     /// The simulator output (stdout and stderr).
     pub output_file: Utf8PathBuf,
-    /// The file the `VUnit` runner writes its progress to.
+    /// The file the VUnit runner writes its progress to.
     pub results_file: Utf8PathBuf,
 }
 
@@ -187,7 +187,7 @@ impl TestOutputPaths {
         }
     }
 
-    /// Recreates the directory empty, with an empty results file, as `VUnit`'s
+    /// Recreates the directory empty, with an empty results file, as VUnit's
     /// `_prepare_test_suite_output_path` and `TestRun.run` do.
     ///
     /// # Errors
@@ -694,8 +694,9 @@ impl TestResults {
     }
 }
 
-/// The test results of a workspace, shared by concurrent simulations. Every change is written
-/// to `results.json` right away.
+/// The test results of a workspace, shared by concurrent simulations.
+///
+/// Every change is written to `results.json` right away.
 #[derive(Debug)]
 pub struct ResultStore {
     layout: OutputLayout,
