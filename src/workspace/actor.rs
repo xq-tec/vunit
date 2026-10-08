@@ -13,12 +13,14 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 
 use camino::Utf8Path;
 use rustc_hash::FxHashMap;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio::sync::watch;
@@ -52,6 +54,7 @@ use crate::runner::SimulationInput;
 use crate::runner::SimulationPlan;
 use crate::runner::SimulationRequest;
 use crate::runner::TestcaseLocks;
+use crate::runtime::ProcessLimit;
 use crate::runtime::Runtime;
 use crate::store::CompileState;
 use crate::store::FileKey;
@@ -70,10 +73,12 @@ use crate::watch::classify;
 pub(super) enum Command {
     Compile {
         tag: Option<RequestTag>,
+        max_parallel: Option<NonZeroUsize>,
     },
     Simulate {
         requests: Vec<SimulationRequest>,
         tag: Option<RequestTag>,
+        max_parallel: Option<NonZeroUsize>,
     },
     CancelAll,
     Cancel(RequestTag),
@@ -103,6 +108,9 @@ struct RunningCompile {
     /// The project being compiled; a simulate runs the testcases of this project, even if the
     /// project changes during the compile.
     model: Arc<Model>,
+    /// Limits the processes of the operation, if it has its own limit; the simulations of a
+    /// simulate use it too.
+    operation_semaphore: Option<Arc<Semaphore>>,
     cancel: CancellationToken,
 }
 
@@ -314,9 +322,16 @@ impl Actor {
 
     async fn handle_command(&mut self, command: Command) {
         match command {
-            Command::Compile { tag } => self.request(Operation::compile(tag)).await,
-            Command::Simulate { requests, tag } => {
-                self.request(Operation::simulate(requests, tag)).await;
+            Command::Compile { tag, max_parallel } => {
+                self.request(Operation::compile(tag, max_parallel)).await;
+            },
+            Command::Simulate {
+                requests,
+                tag,
+                max_parallel,
+            } => {
+                self.request(Operation::simulate(requests, tag, max_parallel))
+                    .await;
             },
             Command::CancelAll => self.cancel_all(),
             Command::Cancel(tag) => self.cancel_request(&tag),
@@ -458,9 +473,15 @@ impl Actor {
         let cancel = self.operations_cancel.child_token();
         let (events, mut receiver) = mpsc::unbounded_channel();
         let compiled_model = Arc::clone(&model);
+        let operation_semaphore = operation
+            .max_parallel()
+            .map(|max_parallel| Arc::new(Semaphore::new(max_parallel.get())));
         let context = CompileContext {
             workspace_root: self.root.to_path_buf(),
-            semaphore: Arc::clone(self.runtime.compile_semaphore()),
+            limit: ProcessLimit::new(
+                Arc::clone(self.runtime.compile_semaphore()),
+                operation_semaphore.clone(),
+            ),
             events,
             cancel: cancel.clone(),
         };
@@ -497,6 +518,7 @@ impl Actor {
         self.running_compile = Some(RunningCompile {
             operation,
             model: compiled_model,
+            operation_semaphore,
             cancel,
         });
     }
@@ -578,8 +600,8 @@ impl Actor {
             success,
             simulation_patterns: running.operation.simulation_patterns(),
         });
-        if success && let Operation::Simulate { requests, tags } = running.operation {
-            self.start_simulation(&running.model, &requests, tags);
+        if success && let Operation::Simulate { requests, tags, .. } = running.operation {
+            self.start_simulation(&running.model, &requests, tags, running.operation_semaphore);
         }
         if let Some(queued) = self.queued.take() {
             self.start(queued).await;
@@ -609,12 +631,14 @@ impl Actor {
     // Simulation
     // ---------------------------------------------------------------------------------------------
 
-    /// Runs the testcases of `model` that match `requests`.
+    /// Runs the testcases of `model` that match `requests`, limited by the runtime and, if
+    /// given, by `operation_semaphore`.
     fn start_simulation(
         &mut self,
         model: &Model,
         requests: &[SimulationRequest],
         tags: Vec<RequestTag>,
+        operation_semaphore: Option<Arc<Semaphore>>,
     ) {
         let plan = SimulationPlan::new(
             &SimulationInput {
@@ -648,7 +672,10 @@ impl Actor {
         let context = SimulationContext {
             workspace_root: self.root.to_path_buf(),
             simulator: self.runtime.simulator().clone(),
-            semaphore: Arc::clone(self.runtime.simulation_semaphore()),
+            limit: ProcessLimit::new(
+                Arc::clone(self.runtime.simulation_semaphore()),
+                operation_semaphore,
+            ),
             results: Arc::clone(&self.results),
             testcase_locks: Arc::clone(&self.testcase_locks),
             events,

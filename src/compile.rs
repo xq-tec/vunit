@@ -36,7 +36,6 @@ use camino::Utf8Path;
 use camino::Utf8PathBuf;
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
-use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -52,6 +51,7 @@ use crate::project::FileId;
 use crate::project::LibraryId;
 use crate::project::Project;
 use crate::project::UnitKind;
+use crate::runtime::ProcessLimit;
 use crate::simulator::CompileArgs;
 use crate::simulator::Simulator;
 use crate::simulator::SimulatorIdentity;
@@ -568,7 +568,7 @@ pub struct CompileContext {
     /// The working directory of the compile processes.
     pub workspace_root: Utf8PathBuf,
     /// Limits the number of concurrent compile processes.
-    pub semaphore: Arc<Semaphore>,
+    pub limit: ProcessLimit,
     /// Receives the progress.
     pub events: mpsc::UnboundedSender<CompileEvent>,
     /// Cancels the compile.
@@ -847,7 +847,7 @@ async fn compile_file(shared: &Shared, file: &PlannedFile) -> FileResult {
         return not_started();
     }
     let _permit = tokio::select! {
-        permit = Arc::clone(&context.semaphore).acquire_owned() => match permit {
+        permit = context.limit.acquire() => match permit {
             Ok(permit) => permit,
             Err(_closed) => return not_started(),
         },

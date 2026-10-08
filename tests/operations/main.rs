@@ -47,6 +47,7 @@ use risim_vunit_frontend::runner::SimulationInput;
 use risim_vunit_frontend::runner::SimulationPlan;
 use risim_vunit_frontend::runner::SimulationReport;
 use risim_vunit_frontend::runner::SimulationRequest;
+use risim_vunit_frontend::runtime::ProcessLimit;
 use risim_vunit_frontend::simulator::Simulator;
 use risim_vunit_frontend::sources;
 use risim_vunit_frontend::sources::SourceCache;
@@ -318,7 +319,7 @@ impl Workspace {
         };
         let context = CompileContext {
             workspace_root: self.root.clone(),
-            semaphore: Arc::clone(&self.semaphore),
+            limit: ProcessLimit::from(Arc::clone(&self.semaphore)),
             events,
             cancel,
         };
@@ -386,7 +387,7 @@ impl Workspace {
         let context = SimulationContext {
             workspace_root: self.root.clone(),
             simulator: self.simulator.clone(),
-            semaphore: Arc::clone(&self.semaphore),
+            limit: ProcessLimit::from(Arc::clone(&self.semaphore)),
             results: Arc::clone(results),
             testcase_locks: Arc::default(),
             events: events.into(),

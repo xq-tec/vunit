@@ -7,6 +7,8 @@
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
+use tokio::sync::Semaphore;
+
 use super::*;
 use crate::discovery;
 use crate::spec::ConfigurationSpec;
@@ -397,7 +399,7 @@ async fn cancelled_simulation_starts_nothing_despite_free_permits() {
     let context = SimulationContext {
         workspace_root: "/ws".into(),
         simulator: simulator(),
-        semaphore: Arc::new(Semaphore::new(8)),
+        limit: ProcessLimit::from(Arc::new(Semaphore::new(8))),
         results: Arc::new(ResultStore::load(&fixture.layout)),
         testcase_locks: Arc::default(),
         events: events.into(),

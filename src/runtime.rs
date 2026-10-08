@@ -6,7 +6,8 @@
 //! on concurrent compile and simulation processes.
 //!
 //! Every workspace of a process should be opened through the same [`Runtime`],
-//! so that the limits apply across workspaces.
+//! so that the limits apply across workspaces. An operation can lower them for its own
+//! processes with a [`ProcessLimit`].
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -16,6 +17,8 @@ use std::sync::Arc;
 use camino::Utf8Path;
 use camino::Utf8PathBuf;
 use thiserror::Error;
+use tokio::sync::AcquireError;
+use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 
@@ -117,5 +120,54 @@ impl Runtime {
         events: mpsc::UnboundedSender<WorkspaceEvent>,
     ) -> Result<Workspace, OpenError> {
         workspace::open(self.clone(), root, source, events).await
+    }
+}
+
+/// Limits the concurrent processes of an operation: by the shared semaphore of the [`Runtime`]
+/// and, optionally, by a semaphore of the operation; cheap to clone.
+#[derive(Debug, Clone)]
+pub struct ProcessLimit {
+    shared: Arc<Semaphore>,
+    operation: Option<Arc<Semaphore>>,
+}
+
+/// Permission to run a process; released when dropped.
+#[derive(Debug)]
+pub struct ProcessPermit {
+    _operation: Option<OwnedSemaphorePermit>,
+    _shared: OwnedSemaphorePermit,
+}
+
+impl ProcessLimit {
+    /// A limit by `shared` and, if given, by `operation` too.
+    pub const fn new(shared: Arc<Semaphore>, operation: Option<Arc<Semaphore>>) -> Self {
+        Self { shared, operation }
+    }
+
+    /// Waits for a permit of both semaphores.
+    ///
+    /// The permit of the operation comes first, so that a process waiting for it doesn't hold a
+    /// shared permit that other operations could use.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a semaphore is closed.
+    pub async fn acquire(&self) -> Result<ProcessPermit, AcquireError> {
+        let operation = match &self.operation {
+            Some(semaphore) => Some(Arc::clone(semaphore).acquire_owned().await?),
+            None => None,
+        };
+        let shared = Arc::clone(&self.shared).acquire_owned().await?;
+        Ok(ProcessPermit {
+            _operation: operation,
+            _shared: shared,
+        })
+    }
+}
+
+impl From<Arc<Semaphore>> for ProcessLimit {
+    /// A limit by `shared` alone.
+    fn from(shared: Arc<Semaphore>) -> Self {
+        Self::new(shared, None)
     }
 }

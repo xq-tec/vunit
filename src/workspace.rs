@@ -29,6 +29,7 @@ mod operation;
 
 use std::collections::BTreeMap;
 use std::io;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -269,13 +270,28 @@ impl Workspace {
     }
 
     /// Compiles the files that the testbenches need.
-    pub fn compile(&self, tag: Option<RequestTag>) {
-        self.send(Command::Compile { tag });
+    ///
+    /// `max_parallel` limits the compile processes of the request, in addition to the limit of
+    /// the [`Runtime`](crate::Runtime). Merged requests use the smallest limit.
+    pub fn compile(&self, tag: Option<RequestTag>, max_parallel: Option<NonZeroUsize>) {
+        self.send(Command::Compile { tag, max_parallel });
     }
 
     /// Compiles, then runs the testcases matching `requests`.
-    pub fn simulate(&self, requests: Vec<SimulationRequest>, tag: Option<RequestTag>) {
-        self.send(Command::Simulate { requests, tag });
+    ///
+    /// `max_parallel` limits the compile and simulation processes of the request, in addition
+    /// to the limits of the [`Runtime`](crate::Runtime). Merged requests use the smallest limit.
+    pub fn simulate(
+        &self,
+        requests: Vec<SimulationRequest>,
+        tag: Option<RequestTag>,
+        max_parallel: Option<NonZeroUsize>,
+    ) {
+        self.send(Command::Simulate {
+            requests,
+            tag,
+            max_parallel,
+        });
     }
 
     /// Cancels the running compile, the queued operation, and all running and waiting tests.

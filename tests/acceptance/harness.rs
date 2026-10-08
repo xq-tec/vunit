@@ -139,6 +139,7 @@ pub async fn simulate_all(runtime: &Runtime, root: &Utf8Path, spec: &ProjectSpec
             gui: false,
         }],
         Some(RequestTag(TAG.to_owned())),
+        None,
     );
 
     let mut outcome = Outcome {

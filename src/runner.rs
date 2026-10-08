@@ -10,7 +10,7 @@
 //! - **Resolution:** [`SimulationPlan::new`] matches the requested patterns against the
 //!   testcases and prepares a [`PlannedTest`] per match.
 //! - **Run:** each test first takes its testcase lock, so the same testcase never runs twice at
-//!   once, and then a permit of the simulation semaphore. Tests whose lock is free get permits
+//!   once, and then a permit of the simulation limit. Tests whose lock is free get permits
 //!   in name order; a test whose lock is held by another simulation waits for it without
 //!   holding up the others. Each test with a permit recreates its output directory, gets a seed
 //!   and its `runner_cfg` generic, and runs `risim-ghdl --elab-run` with stdout and stderr
@@ -44,8 +44,6 @@ use camino::Utf8Path;
 use camino::Utf8PathBuf;
 use rustc_hash::FxHashMap;
 use tokio::sync::OwnedMutexGuard;
-use tokio::sync::OwnedSemaphorePermit;
-use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -57,6 +55,8 @@ use crate::discovery::Discovery;
 use crate::pattern;
 use crate::process;
 use crate::project::Project;
+use crate::runtime::ProcessLimit;
+use crate::runtime::ProcessPermit;
 use crate::simulator::CommandError;
 use crate::simulator::SimulateArgs;
 use crate::simulator::Simulator;
@@ -509,7 +509,7 @@ pub struct SimulationContext {
     /// The simulator.
     pub simulator: Simulator,
     /// Limits the number of concurrent simulations; a paused GUI simulation holds its permit.
-    pub semaphore: Arc<Semaphore>,
+    pub limit: ProcessLimit,
     /// Receives the results.
     pub results: Arc<ResultStore>,
     /// The testcase locks of the workspace.
@@ -526,7 +526,7 @@ impl SimulationContext {
     }
 }
 
-/// Runs all tests of `plan` concurrently, bounded by the semaphore of `context`.
+/// Runs all tests of `plan` concurrently, bounded by the limit of `context`.
 pub async fn simulate(plan: SimulationPlan, context: &SimulationContext) -> SimulationReport {
     context.emit(SimulationEvent::Started {
         testcases: plan.testcases(),
@@ -620,12 +620,12 @@ pub async fn simulate(plan: SimulationPlan, context: &SimulationContext) -> Simu
     report
 }
 
-/// A permit of the simulation semaphore, or `None` if the simulation is cancelled first.
-async fn acquire_permit(context: &SimulationContext) -> Option<OwnedSemaphorePermit> {
+/// A permit of the simulation limit, or `None` if the simulation is cancelled first.
+async fn acquire_permit(context: &SimulationContext) -> Option<ProcessPermit> {
     tokio::select! {
         biased;
         () = context.cancel.cancelled() => None,
-        permit = Arc::clone(&context.semaphore).acquire_owned() => permit.ok(),
+        permit = context.limit.acquire() => permit.ok(),
     }
 }
 
@@ -634,7 +634,7 @@ async fn run_locked(
     test: &PlannedTest,
     context: &SimulationContext,
     guard: OwnedMutexGuard<()>,
-    permit: OwnedSemaphorePermit,
+    permit: ProcessPermit,
 ) -> (TestOutcome, Vec<Diagnostic>) {
     let result = run_test(test, context).await;
     drop(permit);

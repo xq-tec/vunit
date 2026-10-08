@@ -46,6 +46,10 @@ pub fn trials() -> Vec<Trial> {
             "workspace_merges_requests_while_compiling",
             workspace_merges_requests_while_compiling,
         ),
+        trial(
+            "workspace_limits_processes_per_request",
+            workspace_limits_processes_per_request,
+        ),
         trial("workspace_cancel_all", workspace_cancel_all),
         trial(
             "workspace_cancels_one_request",
@@ -281,6 +285,21 @@ fn simulation_log(fixture: &Workspace) -> Vec<String> {
         .collect()
 }
 
+/// The largest number of processes running at once in `log`, by their start and end lines.
+fn max_running(log: &[String], start: &str, end: &str) -> usize {
+    let mut running = 0_usize;
+    let mut max = 0;
+    for line in log {
+        if line.starts_with(start) {
+            running += 1;
+            max = max.max(running);
+        } else if line.starts_with(end) {
+            running = running.saturating_sub(1);
+        }
+    }
+    max
+}
+
 fn lock_contents(fixture: &Workspace) -> String {
     fs::read_to_string(fixture.layout.lock_file()).expect("read the lock file")
 }
@@ -328,7 +347,7 @@ async fn workspace_compiles_and_simulates_with_events() {
 
     session
         .handle
-        .simulate(requests(&["lib.tb_tests.*", "nothing*"]), tag("s"));
+        .simulate(requests(&["lib.tb_tests.*", "nothing*"]), tag("s"), None);
     let events = summary(&session.operation("s").await);
     assert_eq!(
         events[..5],
@@ -415,15 +434,16 @@ async fn workspace_merges_requests_while_compiling() {
     let runtime = runtime().await;
     let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
 
-    session.handle.compile(tag("a"));
+    session.handle.compile(tag("a"), None);
     session
         .handle
-        .simulate(requests(&["lib.tb_tests.pass"]), tag("b"));
-    session.handle.compile(tag("c"));
-    session.handle.compile(None);
+        .simulate(requests(&["lib.tb_tests.pass"]), tag("b"), None);
+    session.handle.compile(tag("c"), None);
+    session.handle.compile(None, None);
     session.handle.simulate(
         requests(&["lib.tb_implicit.all", "lib.tb_tests.pass"]),
         tag("d"),
+        None,
     );
     let events = summary(&session.operation("d").await);
     assert_eq!(
@@ -443,6 +463,60 @@ async fn workspace_merges_requests_while_compiling() {
     session.handle.close().await;
 }
 
+async fn workspace_limits_processes_per_request() {
+    let limited = limited_run(NonZeroUsize::new(1)).await;
+    assert_eq!(max_running(&limited, "start ", "end "), 1, "{limited:#?}");
+    assert_eq!(
+        max_running(&limited, "simstart ", "simend "),
+        1,
+        "{limited:#?}"
+    );
+
+    // Without a limit of the request, the runtime's limit of four applies.
+    let unlimited = limited_run(None).await;
+    assert!(
+        max_running(&unlimited, "start ", "end ") > 1,
+        "{unlimited:#?}"
+    );
+    assert!(
+        max_running(&unlimited, "simstart ", "simend ") > 1,
+        "{unlimited:#?}"
+    );
+}
+
+/// Compiles two independent libraries and simulates three testcases with `max_parallel` in a
+/// new workspace, every process taking 300 ms; returns the log of the processes.
+async fn limited_run(max_parallel: Option<NonZeroUsize>) -> Vec<String> {
+    let mut fixture = Workspace::new().await;
+    simulation_project(&mut fixture);
+    for name in ["tb_implicit", "tb_tests"] {
+        let path = format!("tb/{name}.vhd");
+        let contents = fs::read_to_string(fixture.root.join(&path)).expect("read the testbench");
+        fixture.write(&path, &format!("-- fake: sleep 300\n{contents}"));
+    }
+    fixture.write(
+        "other/tb_other.vhd",
+        &format!("-- fake: sleep 300\n{}", testbench("tb_other", "")),
+    );
+    fixture.spec.add_library("other", ["other/*.vhd"]);
+    for test in ["pass", "fail, really", "slow"] {
+        fixture.sim_directive(&format!("lib.tb_tests.{test}"), "sleep 300");
+    }
+    let runtime = runtime().await;
+    let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
+    session
+        .handle
+        .simulate(requests(&["lib.tb_tests.*"]), tag("a"), max_parallel);
+    let events = summary(&session.operation("a").await);
+    assert_eq!(
+        events.last().map(String::as_str),
+        Some("simulation_finished a 3/0/0"),
+        "{events:#?}"
+    );
+    session.handle.close().await;
+    fixture.take_log()
+}
+
 async fn workspace_cancel_all() {
     let mut fixture = Workspace::new().await;
     simulation_project(&mut fixture);
@@ -455,8 +529,8 @@ async fn workspace_cancel_all() {
 
     // A hanging compile with a queued simulation.
     let started = Instant::now();
-    session.handle.compile(tag("a"));
-    session.handle.simulate(requests(&["*"]), tag("b"));
+    session.handle.compile(tag("a"), None);
+    session.handle.simulate(requests(&["*"]), tag("b"), None);
     session
         .until(|event| matches!(event, WorkspaceEventKind::FileCompiling { .. }))
         .await;
@@ -476,7 +550,7 @@ async fn workspace_cancel_all() {
     fixture.sim_directive("lib.tb_tests.slow", "hang");
     session
         .handle
-        .simulate(requests(&["lib.tb_tests.*"]), tag("c"));
+        .simulate(requests(&["lib.tb_tests.*"]), tag("c"), None);
     session
         .until(|event| {
             matches!(event, WorkspaceEventKind::TestStarted { name, .. } if name == "lib.tb_tests.slow")
@@ -498,7 +572,7 @@ async fn workspace_cancel_all() {
     fixture.write(crate::fake_ghdl::SIM_DIRECTIVES, "");
     session
         .handle
-        .simulate(requests(&["lib.tb_tests.slow"]), tag("d"));
+        .simulate(requests(&["lib.tb_tests.slow"]), tag("d"), None);
     let rerun_events = summary(&session.operation("d").await);
     assert_eq!(
         rerun_events.last().map(String::as_str),
@@ -518,12 +592,12 @@ async fn workspace_cancels_one_request() {
     let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
 
     // A hanging compile, and three requests merged into the queued operation.
-    session.handle.compile(tag("a"));
-    session.handle.simulate(requests(&["*"]), tag("b"));
+    session.handle.compile(tag("a"), None);
+    session.handle.simulate(requests(&["*"]), tag("b"), None);
     session
         .handle
-        .simulate(requests(&["lib.tb_tests.slow"]), tag("e"));
-    session.handle.compile(tag("c"));
+        .simulate(requests(&["lib.tb_tests.slow"]), tag("e"), None);
+    session.handle.compile(tag("c"), None);
     session
         .until(|event| matches!(event, WorkspaceEventKind::FileCompiling { .. }))
         .await;
@@ -601,7 +675,7 @@ async fn workspace_cancels_one_request() {
     fixture.sim_directive("lib.tb_tests.slow", "sleep 300");
     session
         .handle
-        .simulate(requests(&["lib.tb_tests.slow"]), tag("f"));
+        .simulate(requests(&["lib.tb_tests.slow"]), tag("f"), None);
     session.handle.cancel(RequestTag("other".to_owned()));
     assert_eq!(
         summary(&session.operation("f").await)
@@ -622,7 +696,7 @@ async fn workspace_simulates_the_compiled_project() {
     let runtime = runtime().await;
     let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
 
-    session.handle.simulate(requests(&["*"]), tag("a"));
+    session.handle.simulate(requests(&["*"]), tag("a"), None);
     session
         .until(|event| matches!(event, WorkspaceEventKind::FileCompiling { .. }))
         .await;
@@ -653,7 +727,7 @@ async fn workspace_simulates_the_compiled_project() {
     // The next request compiles and runs it.
     session
         .handle
-        .simulate(requests(&["lib.tb_new.*"]), tag("b"));
+        .simulate(requests(&["lib.tb_new.*"]), tag("b"), None);
     assert_eq!(
         summary(&session.operation("b").await)
             .last()
@@ -685,7 +759,7 @@ async fn workspace_keeps_diagnostics_of_files_not_compiled() {
             .collect::<Vec<_>>()
     };
 
-    session.handle.compile(tag("a"));
+    session.handle.compile(tag("a"), None);
     session.operation("a").await;
     assert_eq!(compile_messages(&session), ["broken"]);
 
@@ -695,7 +769,7 @@ async fn workspace_keeps_diagnostics_of_files_not_compiled() {
         "tb/tb_implicit.vhd",
         &format!("-- fake: hang\n{}", testbench("tb_implicit", "")),
     );
-    session.handle.compile(tag("b"));
+    session.handle.compile(tag("b"), None);
     session
         .until(|event| matches!(event, WorkspaceEventKind::FileCompiling { .. }))
         .await;
@@ -717,7 +791,7 @@ async fn workspace_keeps_diagnostics_of_files_not_compiled() {
         "tb/pkg_b.vhd",
         "use work.pkg_a.all;\npackage pkg_b is end package;\n",
     );
-    session.handle.compile(tag("c"));
+    session.handle.compile(tag("c"), None);
     assert_eq!(
         summary(&session.operation("c").await),
         ["compile_started c 0", "compile_finished c false None"]
@@ -745,13 +819,13 @@ async fn workspace_runs_a_testcase_once_at_a_time() {
 
     session
         .handle
-        .simulate(requests(&["lib.tb_tests.slow"]), tag("first"));
+        .simulate(requests(&["lib.tb_tests.slow"]), tag("first"), None);
     session
         .until(|event| matches!(event, WorkspaceEventKind::TestStarted { .. }))
         .await;
     session
         .handle
-        .simulate(requests(&["lib.tb_tests.slow"]), tag("second"));
+        .simulate(requests(&["lib.tb_tests.slow"]), tag("second"), None);
     let events = summary(&session.operation("second").await);
     // The lock is released when the test finishes, before its simulation reports the end.
     let first_finished = events
@@ -851,7 +925,7 @@ async fn workspace_recovers_from_a_crash() {
     let runtime = runtime().await;
     let compiled_files = async |name: &str| {
         let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
-        session.handle.compile(tag(name));
+        session.handle.compile(tag(name), None);
         let events = summary(&session.operation(name).await);
         session.handle.close().await;
         events
@@ -905,7 +979,7 @@ async fn workspace_reports_config_errors() {
         .until(|event| has_error(event, DiagnosticSource::Config))
         .await;
     assert_eq!(testcase_names(&opened[0]), Some(Vec::new()));
-    session.handle.compile(tag("a"));
+    session.handle.compile(tag("a"), None);
     assert_eq!(
         summary(&session.operation("a").await),
         ["compile_started a 0", "compile_finished a false None"]
@@ -921,7 +995,7 @@ async fn workspace_close_cancels_simulations() {
     let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
     session
         .handle
-        .simulate(requests(&["lib.tb_tests.slow"]), tag("a"));
+        .simulate(requests(&["lib.tb_tests.slow"]), tag("a"), None);
     session
         .until(|event| matches!(event, WorkspaceEventKind::TestStarted { .. }))
         .await;
@@ -943,7 +1017,7 @@ async fn workspace_close_cancels_simulations() {
         ]
     );
     // Requests to a closed workspace are ignored.
-    other_handle.compile(tag("b"));
+    other_handle.compile(tag("b"), None);
     assert!(
         tokio::time::timeout(Duration::from_millis(300), events.recv())
             .await
@@ -956,7 +1030,7 @@ async fn workspace_sees_edits_right_before_a_compile() {
     simulation_project(&mut fixture);
     let runtime = runtime().await;
     let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
-    session.handle.compile(tag("a"));
+    session.handle.compile(tag("a"), None);
     session.operation("a").await;
 
     // No time for the watcher to report the edit.
@@ -964,7 +1038,7 @@ async fn workspace_sees_edits_right_before_a_compile() {
         "tb/tb_implicit.vhd",
         &format!("-- edited\n{}", testbench("tb_implicit", "")),
     );
-    session.handle.compile(tag("b"));
+    session.handle.compile(tag("b"), None);
     assert_eq!(
         summary(&session.operation("b").await),
         [
@@ -982,7 +1056,7 @@ async fn workspace_without_handles_finishes_and_closes() {
     fixture.sim_directive("lib.tb_tests.slow", "sleep 300");
     let runtime = runtime().await;
     let Session { handle, mut events } = open(&runtime, &fixture, spec_source(&fixture)).await;
-    handle.simulate(requests(&["lib.tb_tests.slow"]), tag("a"));
+    handle.simulate(requests(&["lib.tb_tests.slow"]), tag("a"), None);
     drop(handle);
 
     // The simulation isn't cancelled; the workspace closes once it is done.
