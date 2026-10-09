@@ -131,17 +131,13 @@ pub fn tests_of<'name>(names: &'name [String], testbench: &str) -> Vec<&'name st
 /// risim-runner doesn't run VUnit's libraries yet. The trials name what it fails on:
 ///
 /// - **access:** a shared variable whose initial value holds an access value that GHDL
-///   allocated. risim-runner `doc/todo.md`: "A shared variable of an access type is rejected
-///   …".
-/// - **image:** `T'image` of a type other than `INTEGER` (`todo!()`). risim-runner
-///   `doc/todo.md`: "Type attributes that are not foldable at elaboration: `'image` …".
+///   allocated is rejected.
+/// - **image:** `T'image` of a type other than `INTEGER` panics.
 /// - **physical:** "unsupported VHDL feature: floating physical literal".
 /// - **association:** "illegal VHDL: formal is associated more than once", for legal code.
-/// - **enclosing unit:** "instance … is not enclosed by an architecture or entity", when
-///   translation names the design unit of a report.
-/// - **driver:** `todo!()` "driven signal has no driver prefix in this process".
-///
-/// The last four have no entry in risim-runner's `doc/todo.md` yet.
+/// - **enclosing unit:** "instance … is not enclosed by an architecture or entity", for a
+///   report.
+/// - **driver:** a panic with "driven signal has no driver prefix in this process".
 ///
 /// Every trial fails completely for now. Once risim-runner runs parts of VUnit, a variant that
 /// lists the failing testcases joins [`AllFailing`](Self::AllFailing).
