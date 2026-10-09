@@ -899,6 +899,8 @@ async fn simulates_and_records_results() {
     assert_eq!(failed.outcome, TestOutcome::Failed);
     assert_eq!(failed.output_path, fail_paths.output_file);
     assert!(failed.started_at <= failed.finished_at);
+    // A failed run completed, so it measured the duration.
+    assert!(failed.duration_ms.is_some());
 
     // A rerun replaces the output directory.
     let stale = fail_paths.dir.join("stale.txt");
@@ -1012,6 +1014,8 @@ async fn cancel_terminates_and_skips_simulations() {
         saved["lib.tb_tests.fail, really"].outcome,
         TestOutcome::Cancelled
     );
+    // A cancelled run doesn't measure the duration.
+    assert_eq!(saved["lib.tb_tests.fail, really"].duration_ms, None);
     // The hanging simulation may be killed before it logs its start, but never ends by itself.
     let log = workspace.take_log();
     assert!(
@@ -1038,6 +1042,8 @@ async fn simulation_spawn_failure_fails_the_test() {
     let paths = TestOutputPaths::new(&workspace.layout, "lib.tb_tests.pass");
     let output = fs::read_to_string(&paths.output_file).expect("output.txt");
     assert!(output.contains("failed to run risim-ghdl"), "{output}");
+    // A simulator that didn't run doesn't measure the duration.
+    assert_eq!(results.snapshot()["lib.tb_tests.pass"].duration_ms, None);
     assert!(
         run.events
             .iter()

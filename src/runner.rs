@@ -20,6 +20,8 @@
 //!   non-zero exit code fails a passed test from VHDL-2008 on (`has_valid_exit_code`).
 //! - **Results:** every finished test is recorded in the [`ResultStore`]. A test cancelled
 //!   before it started keeps its previous result, since its output directory is unchanged.
+//!   The recorded duration is that of the last run that completed (passed or failed), so it can
+//!   predict the next run.
 //!
 //! Differences from VUnit:
 //!
@@ -668,12 +670,13 @@ async fn run_test(
     });
     let started = Instant::now();
     let mut diagnostics = Vec::new();
-    let outcome = match execute(test, context).await {
-        Ok(outcome) => outcome,
+    // Only a simulator that ran to an outcome measures the duration of the test.
+    let (outcome, completed) = match execute(test, context).await {
+        Ok(outcome) => (outcome, outcome != TestOutcome::Cancelled),
         Err(message) => {
             append_to_output(&test.paths.output_file, &message);
             diagnostics.push(Diagnostic::error(format!("{}: {message}", test.name)));
-            TestOutcome::Failed
+            (TestOutcome::Failed, false)
         },
     };
     let duration = started.elapsed();
@@ -683,6 +686,7 @@ async fn run_test(
         started_at,
         finished_at: Timestamp::now(),
         output_path: test.paths.output_file.clone(),
+        duration_ms: completed.then(|| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)),
     };
     // Recording writes and syncs `results.json`, which mustn't block the runtime.
     let results = Arc::clone(&context.results);

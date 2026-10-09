@@ -677,6 +677,13 @@ pub struct TestResult {
     pub finished_at: Timestamp,
     /// The simulator output file (`output.txt`).
     pub output_path: Utf8PathBuf,
+    /// How long the simulator of the last completed run took, in milliseconds.
+    ///
+    /// A run is completed if the simulator ran to a passed or failed outcome. A run that was
+    /// cancelled or couldn't start keeps the duration of the previous completed run, so the
+    /// value can predict the duration of the next run. `None` if no run has completed yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 /// The last result of every testcase (`results.json`).
@@ -735,11 +742,19 @@ impl ResultStore {
 
     /// Records the result of `testcase` and saves the results.
     ///
+    /// A result without [`TestResult::duration_ms`] keeps the duration of the previous result.
+    ///
     /// # Errors
     ///
     /// Fails if `results.json` can't be written; the result is recorded in memory anyway.
-    pub fn record(&self, testcase: &str, result: TestResult) -> io::Result<()> {
+    pub fn record(&self, testcase: &str, mut result: TestResult) -> io::Result<()> {
         let mut results = self.lock();
+        if result.duration_ms.is_none() {
+            result.duration_ms = results
+                .results
+                .get(testcase)
+                .and_then(|previous| previous.duration_ms);
+        }
         results.results.insert(testcase.to_owned(), result);
         // Saving under the lock keeps concurrent writes in order.
         results.save(&self.layout)
@@ -872,6 +887,7 @@ mod tests {
             started_at: Timestamp(1_000),
             finished_at: Timestamp(2_500),
             output_path: "/ws/risim-out/test_output/x/output.txt".into(),
+            duration_ms: (outcome != TestOutcome::Cancelled).then_some(1_400),
         }
     }
 
@@ -907,6 +923,46 @@ mod tests {
             .unwrap();
         assert_eq!(reloaded.snapshot().keys().collect::<Vec<_>>(), ["lib.tb.b"]);
         assert_eq!(TestResults::load(&layout).results.len(), 1);
+    }
+
+    #[test]
+    fn result_store_keeps_the_duration_of_the_last_completed_run() {
+        let temp = TempRoot::new();
+        let layout = OutputLayout::new(&temp.root);
+        let store = ResultStore::load(&layout);
+        store
+            .record("lib.tb.a", result(TestOutcome::Cancelled))
+            .unwrap();
+        assert_eq!(store.snapshot()["lib.tb.a"].duration_ms, None);
+
+        store
+            .record("lib.tb.a", result(TestOutcome::Failed))
+            .unwrap();
+        store
+            .record("lib.tb.a", result(TestOutcome::Cancelled))
+            .unwrap();
+        let recorded = &store.snapshot()["lib.tb.a"];
+        assert_eq!(recorded.outcome, TestOutcome::Cancelled);
+        assert_eq!(recorded.duration_ms, Some(1_400));
+        assert_eq!(
+            ResultStore::load(&layout).snapshot()["lib.tb.a"].duration_ms,
+            Some(1_400)
+        );
+    }
+
+    #[test]
+    fn results_without_durations_load() {
+        let temp = TempRoot::new();
+        let layout = OutputLayout::new(&temp.root);
+        fs::create_dir_all(layout.root()).unwrap();
+        fs::write(
+            layout.results_file(),
+            r#"{"version":1,"results":{"lib.tb.a":{"outcome":"passed","started_at":1000,"finished_at":2500,"output_path":"/o.txt"}}}"#,
+        )
+        .unwrap();
+        let results = ResultStore::load(&layout).snapshot();
+        assert_eq!(results["lib.tb.a"].outcome, TestOutcome::Passed);
+        assert_eq!(results["lib.tb.a"].duration_ms, None);
     }
 
     #[test]
