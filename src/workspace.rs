@@ -272,7 +272,7 @@ impl Workspace {
     /// Compiles the files that the testbenches need.
     ///
     /// `max_parallel` limits the compile processes of the request, in addition to the limit of
-    /// the [`Runtime`](crate::Runtime). Merged requests use the smallest limit.
+    /// the [`Runtime`]. Merged requests use the smallest limit.
     pub fn compile(&self, tag: Option<RequestTag>, max_parallel: Option<NonZeroUsize>) {
         self.send(Command::Compile { tag, max_parallel });
     }
@@ -280,7 +280,7 @@ impl Workspace {
     /// Compiles, then runs the testcases matching `requests`.
     ///
     /// `max_parallel` limits the compile and simulation processes of the request, in addition
-    /// to the limits of the [`Runtime`](crate::Runtime). Merged requests use the smallest limit.
+    /// to the limits of the [`Runtime`]. Merged requests use the smallest limit.
     pub fn simulate(
         &self,
         requests: Vec<SimulationRequest>,
