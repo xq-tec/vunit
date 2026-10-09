@@ -6,6 +6,7 @@
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
+use risim_vunit_frontend::SimulatorKind;
 use risim_vunit_frontend::TestOutcome;
 use risim_vunit_frontend::spec::AssertLevel;
 use risim_vunit_frontend::spec::ConfigurationSpec;
@@ -14,18 +15,23 @@ use risim_vunit_frontend::spec::SimOptions;
 use risim_vunit_frontend::spec::TestConfigSpec;
 
 use crate::harness;
+use crate::harness::RisimDeviations;
 use crate::harness::config;
 use crate::harness::generics;
 use crate::harness::target;
 
 /// Compiles and runs all testcases and compares the outcomes with `test_artificial.py`.
-pub async fn artificial() {
+pub async fn artificial(simulator: SimulatorKind) {
     let runtime = harness::runtime().await;
     let root = harness::Root::new();
     let mut spec = ProjectSpec::new();
     artificial_spec(&mut spec);
-    let outcome = harness::simulate_all(&runtime, &root.path, &spec).await;
-    outcome.assert_outcomes(&harness::outcomes(ARTIFICIAL_EXPECTED));
+    let outcome = harness::simulate_all(&runtime, &root.path, &spec, simulator).await;
+    // risim: access, enclosing unit.
+    outcome.assert_outcomes(
+        &harness::outcomes(ARTIFICIAL_EXPECTED),
+        RisimDeviations::AllFailing,
+    );
 }
 
 /// `tests/acceptance/artificial/vhdl/run.py` as a project spec, without hooks, test history,

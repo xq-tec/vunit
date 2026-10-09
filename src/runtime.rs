@@ -2,8 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! The resources shared by all workspaces of a process: the detected risim-ghdl and the limits
-//! on concurrent compile and simulation processes.
+//! The resources shared by all workspaces of a process: the detected risim-ghdl and
+//! risim-runner, and the limits on concurrent compile and simulation processes.
 //!
 //! Every workspace of a process should be opened through the same [`Runtime`],
 //! so that the limits apply across workspaces. An operation can lower them for its own
@@ -22,8 +22,12 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 
+use crate::diagnostics::error_chain;
+use crate::simulator::Backend;
 use crate::simulator::DetectError;
+use crate::simulator::RisimRunner;
 use crate::simulator::Simulator;
+use crate::simulator::SimulatorKind;
 use crate::workspace;
 use crate::workspace::OpenError;
 use crate::workspace::ProjectSource;
@@ -35,6 +39,9 @@ use crate::workspace::WorkspaceEvent;
 pub struct RuntimeOptions {
     /// The risim-ghdl executable.
     pub risim_ghdl: Utf8PathBuf,
+    /// The risim-runner executable of the `risim` backend; `None` if that backend isn't
+    /// available.
+    pub risim_runner: Option<Utf8PathBuf>,
     /// The maximum number of simulations running at once, over all workspaces. A paused GUI
     /// simulation counts as running.
     pub max_parallel_simulations: NonZeroUsize,
@@ -53,6 +60,8 @@ pub enum RuntimeError {
 #[derive(Debug)]
 struct Inner {
     simulator: Simulator,
+    /// The detected risim-runner, or why the `risim` backend is unavailable.
+    risim_runner: Result<RisimRunner, String>,
     simulation_semaphore: Arc<Semaphore>,
     compile_semaphore: Arc<Semaphore>,
 }
@@ -64,7 +73,10 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// Detects the risim-ghdl version (`--version`).
+    /// Detects the risim-ghdl version (`--version`), and the risim-runner version if one is
+    /// given.
+    ///
+    /// A risim-runner that can't be detected only makes the `risim` backend unavailable.
     ///
     /// # Errors
     ///
@@ -76,9 +88,24 @@ impl Runtime {
             version = ?simulator.version(),
             "detected risim-ghdl"
         );
+        let risim_runner = match &options.risim_runner {
+            Some(path) => RisimRunner::detect(path)
+                .await
+                .map_err(|error| error_chain(&error)),
+            None => Err("risim-runner is not configured".to_owned()),
+        };
+        match &risim_runner {
+            Ok(runner) => tracing::info!(
+                path = %runner.path(),
+                version = ?runner.version(),
+                "detected risim-runner"
+            ),
+            Err(reason) => tracing::info!(%reason, "the risim backend is unavailable"),
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 simulator,
+                risim_runner,
                 simulation_semaphore: Arc::new(Semaphore::new(
                     options.max_parallel_simulations.get(),
                 )),
@@ -90,6 +117,24 @@ impl Runtime {
     /// The detected risim-ghdl.
     pub fn simulator(&self) -> &Simulator {
         &self.inner.simulator
+    }
+
+    /// The backend of `kind`.
+    ///
+    /// # Errors
+    ///
+    /// Returns why the backend is unavailable: risim-runner wasn't configured or couldn't be
+    /// detected.
+    pub fn backend(&self, kind: SimulatorKind) -> Result<Backend, String> {
+        let ghdl = self.inner.simulator.clone();
+        match kind {
+            SimulatorKind::Ghdl => Ok(Backend::Ghdl(ghdl)),
+            SimulatorKind::Risim => self
+                .inner
+                .risim_runner
+                .clone()
+                .map(|runner| Backend::Risim { runner, ghdl }),
+        }
     }
 
     /// Limits the number of concurrent simulations.

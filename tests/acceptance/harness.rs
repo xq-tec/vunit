@@ -21,6 +21,7 @@ use risim_vunit_frontend::RequestTag;
 use risim_vunit_frontend::Runtime;
 use risim_vunit_frontend::RuntimeOptions;
 use risim_vunit_frontend::SimulationRequest;
+use risim_vunit_frontend::SimulatorKind;
 use risim_vunit_frontend::TestOutcome;
 use risim_vunit_frontend::Workspace;
 use risim_vunit_frontend::WorkspaceEvent;
@@ -33,6 +34,9 @@ use tokio::sync::mpsc;
 
 /// The environment variable naming the risim-ghdl executable.
 pub const RISIM_GHDL: &str = "RISIM_GHDL";
+
+/// The environment variable naming the risim-runner executable, for the `risim` backend.
+pub const RISIM_RUNNER: &str = "RISIM_RUNNER";
 
 /// How long a whole simulate operation may take.
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(900);
@@ -70,13 +74,15 @@ impl Root {
     }
 }
 
-/// A runtime with the risim-ghdl named by [`RISIM_GHDL`].
+/// A runtime with the risim-ghdl named by [`RISIM_GHDL`] and the risim-runner named by
+/// [`RISIM_RUNNER`], if set.
 pub async fn runtime() -> Runtime {
     let ghdl = Utf8PathBuf::from(env::var(RISIM_GHDL).expect("RISIM_GHDL"));
     let parallelism =
         std::thread::available_parallelism().unwrap_or(NonZeroUsize::new(4).expect("non-zero"));
     Runtime::new(RuntimeOptions {
         risim_ghdl: ghdl,
+        risim_runner: env::var(RISIM_RUNNER).ok().map(Utf8PathBuf::from),
         max_parallel_simulations: parallelism,
         max_parallel_compiles: parallelism,
     })
@@ -120,8 +126,46 @@ pub fn tests_of<'name>(names: &'name [String], testbench: &str) -> Vec<&'name st
         .collect()
 }
 
+/// Testcases whose outcome on the `risim` backend differs from the one on `ghdl`.
+///
+/// risim-runner doesn't run VUnit's libraries yet. The trials name what it fails on:
+///
+/// - **access:** a shared variable whose initial value holds an access value that GHDL
+///   allocated. risim-runner `doc/todo.md`: "A shared variable of an access type is rejected
+///   …".
+/// - **image:** `T'image` of a type other than `INTEGER` (`todo!()`). risim-runner
+///   `doc/todo.md`: "Type attributes that are not foldable at elaboration: `'image` …".
+/// - **physical:** "unsupported VHDL feature: floating physical literal".
+/// - **association:** "illegal VHDL: formal is associated more than once", for legal code.
+/// - **enclosing unit:** "instance … is not enclosed by an architecture or entity", when
+///   translation names the design unit of a report.
+/// - **driver:** `todo!()` "driven signal has no driver prefix in this process".
+///
+/// The last four have no entry in risim-runner's `doc/todo.md` yet.
+///
+/// Every trial fails completely for now. Once risim-runner runs parts of VUnit, a variant that
+/// lists the failing testcases joins [`AllFailing`](Self::AllFailing).
+#[derive(Debug, Clone, Copy)]
+pub enum RisimDeviations {
+    /// Every testcase fails on `risim`.
+    AllFailing,
+}
+
+impl RisimDeviations {
+    /// Changes the `ghdl` outcomes in `expected` into the `risim` ones.
+    fn apply(self, expected: &mut BTreeMap<String, TestOutcome>) {
+        match self {
+            Self::AllFailing => expected
+                .values_mut()
+                .for_each(|outcome| *outcome = TestOutcome::Failed),
+        }
+    }
+}
+
 /// What a simulate operation of all testcases produced.
 pub struct Outcome {
+    /// The backend that ran the testcases.
+    pub simulator: SimulatorKind,
     /// The outcome of every testcase that ran.
     pub outcomes: BTreeMap<String, TestOutcome>,
     /// The simulator output file of every testcase that ran.
@@ -130,8 +174,14 @@ pub struct Outcome {
     pub problems: Vec<String>,
 }
 
-/// Opens a workspace at `root` with `spec`, compiles and simulates all testcases, and closes it.
-pub async fn simulate_all(runtime: &Runtime, root: &Utf8Path, spec: &ProjectSpec) -> Outcome {
+/// Opens a workspace at `root` with `spec`, compiles and simulates all testcases on the backend
+/// `simulator`, and closes it.
+pub async fn simulate_all(
+    runtime: &Runtime,
+    root: &Utf8Path,
+    spec: &ProjectSpec,
+    simulator: SimulatorKind,
+) -> Outcome {
     let (workspace, mut events) = open(runtime, root, spec).await;
     workspace.simulate(
         vec![SimulationRequest {
@@ -139,10 +189,12 @@ pub async fn simulate_all(runtime: &Runtime, root: &Utf8Path, spec: &ProjectSpec
             gui: false,
         }],
         Some(RequestTag(TAG.to_owned())),
+        simulator,
         None,
     );
 
     let mut outcome = Outcome {
+        simulator,
         outcomes: BTreeMap::new(),
         output_paths: BTreeMap::new(),
         problems: Vec::new(),
@@ -212,8 +264,9 @@ fn has_tag(tags: &[RequestTag]) -> bool {
 
 impl Outcome {
     /// Checks that there are no problems, that the testcases in `failing` failed, and that all
-    /// others passed. Prints the end of the output of every unexpected outcome.
-    pub fn assert_all_pass_except(&self, failing: &[&str]) {
+    /// others passed, changed by `risim` on the `risim` backend. Prints the end of the output of
+    /// every unexpected outcome.
+    pub fn assert_all_pass_except(&self, failing: &[&str], risim: RisimDeviations) {
         let expected: BTreeMap<String, TestOutcome> = self
             .outcomes
             .keys()
@@ -232,12 +285,16 @@ impl Outcome {
                 "expected failure {name} didn't run"
             );
         }
-        self.assert_outcomes(&expected);
+        self.assert_outcomes(&expected, risim);
     }
 
-    /// Checks that there are no problems and that exactly the testcases of `expected` ran with
-    /// these outcomes.
-    pub fn assert_outcomes(&self, expected: &BTreeMap<String, TestOutcome>) {
+    /// Checks that there are no problems and that exactly the testcases of `ghdl` ran with
+    /// these outcomes, changed by `risim` on the `risim` backend.
+    pub fn assert_outcomes(&self, ghdl: &BTreeMap<String, TestOutcome>, risim: RisimDeviations) {
+        let mut expected = ghdl.clone();
+        if self.simulator == SimulatorKind::Risim {
+            risim.apply(&mut expected);
+        }
         assert_eq!(self.problems, Vec::<String>::new(), "diagnostics");
         assert!(!self.outcomes.is_empty(), "no testcase ran");
         let mut report = String::new();

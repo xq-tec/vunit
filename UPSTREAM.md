@@ -18,7 +18,7 @@ The fork adds `2ad0add1c51798c4c7d117e585125221ea337ff7`, which rewrites the OSV
 2. Keep `vunit/vhdl/**` and `vunit/verilog/**` from upstream, including their unused `run.py` and `tools/*.py` files.
 3. Resolve conflicts on deleted files (the Python package outside `vunit/vhdl` and `vunit/verilog`, the Python tests, `docs/`, `examples/`, `tools/`, `setup.py`, `pyproject.toml` and the Python workflows) by keeping the deletion. Keep this fork's `README.md`, `.gitignore` and `.github/workflows/ci.yml`.
 4. Review `git diff <recorded>..<new> -- vunit/*.py vunit/**/*.py` for logic to port, using the mapping below. Review the changes to `vunit/vhdl/*/run.py` and `tests/acceptance/test_artificial.py` too, and update their translations in `tests/acceptance/`.
-5. Run the acceptance tests with `RISIM_GHDL` set, and update the expected failures.
+5. Run the acceptance tests with `RISIM_GHDL` and `RISIM_RUNNER` set, and update the expected failures and the risim deviations.
 6. Update the recorded commit in this file.
 
 ## Tests
@@ -42,7 +42,7 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 | `discovery`                 | `test/bench.py`, `test/bench_list.py`, `test/list.py`               | Testbenches, tests, attributes, pragmas, locations                          |
 | `configuration`             | `configuration.py`                                                  | Configurations (generics, sim options, attributes, VHDL configuration name) |
 | `pattern`                   | `fnmatch` usage in `ui/__init__.py`                                 | Testcase pattern matching                                                   |
-| `simulator`                 | `sim_if/__init__.py`, `sim_if/ghdl.py`, `sim_if/risim_ghdl.py` (\*) | risim-ghdl version/capabilities, compile and simulate command lines         |
+| `simulator`                 | `sim_if/__init__.py`, `sim_if/ghdl.py`, `sim_if/risim_ghdl.py` (\*) | risim-ghdl and risim-runner command lines, versions, simulation backends    |
 | `compile`                   | `sim_if/__init__.py` (`compile_source_files`), `project.py`         | Compile set, recompile decision, library scheduling, cancellation           |
 | `runner`                    | `test/suites.py`, `test/runner.py`, `ui/__init__.py` (output paths) | `runner_cfg`, seed, output directories, `vunit_results` parsing, outcomes   |
 | `diagnostics`               | — (new)                                                             | `Diagnostic` type, GHDL message parsing                                     |
@@ -50,7 +50,7 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 | `store`                     | `database.py`, `hashing.py` (replaced)                              | `risim-out/` layout, JSON state files, atomic writes, lock                  |
 | `watch`                     | — (new)                                                             | `notify` watcher, debouncing, change classification                         |
 | `workspace`                 | — (new)                                                             | Per-workspace actor: state, request merging, operations, events             |
-| `runtime`                   | — (new)                                                             | Shared limits and risim-ghdl detection across workspaces                    |
+| `runtime`                   | — (new)                                                             | Shared limits, risim-ghdl and risim-runner detection across workspaces      |
 | `verilog_parser` (deferred) | `parsing/verilog/*`                                                 | Deferred                                                                    |
 
 (\*) Only on the fork's `risim` branch, which held the Python risim-ghdl support.
@@ -64,6 +64,7 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - The compile set includes the files declaring the VHDL configurations the test runs elaborate. VUnit's `--minimal` compiles only the testbench files and their dependencies, which misses them.
 - Recompilation uses compile keys instead of timestamps. Independent libraries compile in parallel and continue after unrelated failures.
 - Duplicate tests, invalid attributes, and testbenches with no or several architectures disable only the affected testbench instead of aborting. Configuration errors (duplicate or empty names, invalid attributes) skip only that configuration.
+- A simulate request selects its backend: `ghdl` (`risim-ghdl --elab-run`) or `risim` (risim-runner). Both use the libraries analysed by risim-ghdl. The `risim` backend has no GUI mode, and its `sim_flags` are risim-runner options.
 - Testcase patterns are case-insensitive on all platforms (Python's `fnmatch` is case-insensitive only on Windows).
 - Compile and simulation processes run with the workspace root as working directory.
 - Files that are independent of each other compile in the order they were added. VUnit sorts them by path. Both orders respect the dependencies.

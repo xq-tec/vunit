@@ -16,7 +16,7 @@ This is a fork of VUnit. The VHDL libraries under `vunit/vhdl` (the testbench ru
 
 The scope of this crate is intentionally limited:
 
-- The only supported simulator is `risim-ghdl`, riSim's fork of GHDL.
+- `risim-ghdl`, riSim's fork of GHDL, analyses all libraries. Two backends simulate: `ghdl` with `risim-ghdl --elab-run`, and `risim` with risim-runner (`risim run`), riSim's own simulator. risim-runner elaborates with the same `risim-ghdl` on the same libraries. Each simulate request selects its backend.
 - VHDL only. Verilog is not supported yet.
 - There is no command-line interface. Callers open a `Runtime` and drive workspaces through the library API.
 
@@ -32,7 +32,7 @@ The crate provides:
 
 ## Usage
 
-A workspace is opened from a `risim-config.toml`. The `options` list is passed both to analysis (`risim-ghdl -a`) and to elaboration (`risim-ghdl --elab-run`):
+A workspace is opened from a `risim-config.toml`. The `options` list is passed both to analysis (`risim-ghdl -a`) and to elaboration (`risim-ghdl --elab-run`, or `--ghdl-option` of `risim run`):
 
 ```toml
 # Flags for analysis and elaboration.
@@ -50,10 +50,12 @@ files = ["src/**/*.vhd", "tb/*.vhd"]
 A `ProjectSpec` built in code describes the same project, and can also set external libraries, a VHDL standard per library, and configurations, generics and simulation options per testbench or test. Pass it as `ProjectSource::Spec` instead of `ProjectSource::ConfigFile`.
 
 ```rust
-use risim_vunit_frontend::{ProjectSource, Runtime, RuntimeOptions, SimulationRequest};
+use risim_vunit_frontend::{ProjectSource, Runtime, RuntimeOptions, SimulationRequest, SimulatorKind};
 
 let runtime = Runtime::new(RuntimeOptions {
     risim_ghdl: "/path/to/risim-ghdl".into(),
+    // Optional; without it, the `risim` backend is unavailable.
+    risim_runner: Some("/path/to/risim".into()),
     max_parallel_simulations: parallelism,
     max_parallel_compiles: parallelism,
 })
@@ -64,6 +66,8 @@ let workspace = runtime
     .await?;
 workspace.simulate(
     vec![SimulationRequest { pattern: "my_lib.tb_*".into(), gui: false }],
+    None,
+    SimulatorKind::Ghdl,
     None,
 );
 while let Some(event) = receiver.recv().await {
@@ -88,11 +92,11 @@ cargo build
 cargo test
 ```
 
-- The unit tests and the `operations` integration tests need no simulator. The `operations` test binary doubles as a fake `risim-ghdl`.
-- The `acceptance` tests run VUnit's acceptance projects and the test benches of the VUnit VHDL libraries with a real simulator. They are skipped unless `RISIM_GHDL` names a `risim-ghdl` executable:
+- The unit tests and the `operations` integration tests need no simulator. The `operations` test binary doubles as a fake `risim-ghdl` and a fake risim-runner.
+- The `acceptance` tests run VUnit's acceptance projects and the test benches of the VUnit VHDL libraries with a real simulator. They are skipped unless `RISIM_GHDL` names a `risim-ghdl` executable. Every trial also runs on the `risim` backend as `<name>_risim`, which is skipped unless `RISIM_RUNNER` names a risim-runner executable too:
 
   ```sh
-  RISIM_GHDL=/path/to/risim-ghdl cargo test --test acceptance
+  RISIM_GHDL=/path/to/risim-ghdl RISIM_RUNNER=/path/to/risim cargo test --test acceptance
   ```
 
 ## License

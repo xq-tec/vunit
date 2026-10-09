@@ -18,6 +18,7 @@
 //! AI NOTICE: Generated, minimally reviewed.
 
 use risim_vunit_frontend::Runtime;
+use risim_vunit_frontend::SimulatorKind;
 use risim_vunit_frontend::pattern::Pattern;
 use risim_vunit_frontend::spec::ConfigurationSpec;
 use risim_vunit_frontend::spec::Feature;
@@ -25,15 +26,24 @@ use risim_vunit_frontend::spec::ProjectSpec;
 use risim_vunit_frontend::spec::TestConfigSpec;
 
 use crate::harness;
+use crate::harness::RisimDeviations;
 use crate::harness::Root;
 use crate::harness::config;
 use crate::harness::generics;
 use crate::harness::target;
 
-/// Runs all testcases of `spec`; the testcases in `failing` must fail and all others pass.
-async fn check(runtime: &Runtime, root: &Root, spec: &ProjectSpec, failing: &[&str]) {
-    let outcome = harness::simulate_all(runtime, &root.path, spec).await;
-    outcome.assert_all_pass_except(failing);
+/// Runs all testcases of `spec`; the testcases in `failing` must fail and all others pass,
+/// changed by `risim` on the `risim` backend.
+async fn check(
+    simulator: SimulatorKind,
+    runtime: &Runtime,
+    root: &Root,
+    spec: &ProjectSpec,
+    failing: &[&str],
+    risim: RisimDeviations,
+) {
+    let outcome = harness::simulate_all(runtime, &root.path, spec, simulator).await;
+    outcome.assert_all_pass_except(failing, risim);
 }
 
 /// The test files of library `name` (`vunit/vhdl/<name>/test`).
@@ -57,7 +67,7 @@ fn configs_of(target_name: &str, configurations: Vec<ConfigurationSpec>) -> Test
     }
 }
 
-pub async fn check_lib() {
+pub async fn check_lib(simulator: SimulatorKind) {
     let runtime = harness::runtime().await;
     let root = Root::new();
     let mut spec = ProjectSpec::new();
@@ -79,7 +89,16 @@ pub async fn check_lib() {
             config_with("using check_true", &[("use_check_not_check_true", "False")]),
         ],
     ));
-    check(&runtime, &root, &spec, CHECK_FAILURES).await;
+    // risim: association, enclosing unit, access.
+    check(
+        simulator,
+        &runtime,
+        &root,
+        &spec,
+        CHECK_FAILURES,
+        RisimDeviations::AllFailing,
+    )
+    .await;
 }
 
 /// Tests of `run_all_in_same_sim` testbenches that rely on the earlier tests of the same
@@ -92,7 +111,7 @@ const CHECK_FAILURES: &[&str] = &[
      allowed",
 ];
 
-pub async fn com() {
+pub async fn com(simulator: SimulatorKind) {
     let runtime = harness::runtime().await;
     let root = Root::new();
     let mut spec = ProjectSpec::new();
@@ -100,10 +119,19 @@ pub async fn com() {
         "tb_com_lib",
         test_files("com", |name| name == "tb_com_codec.vhd"),
     );
-    check(&runtime, &root, &spec, &[]).await;
+    // risim: enclosing unit, image, physical.
+    check(
+        simulator,
+        &runtime,
+        &root,
+        &spec,
+        &[],
+        RisimDeviations::AllFailing,
+    )
+    .await;
 }
 
-pub async fn data_types() {
+pub async fn data_types(simulator: SimulatorKind) {
     let runtime = harness::runtime().await;
     let root = Root::new();
     let mut spec = ProjectSpec::new();
@@ -114,48 +142,75 @@ pub async fn data_types() {
     ];
     files.extend(test_files("data_types", |_| false));
     spec.add_library("vunit_lib", files);
-    check(&runtime, &root, &spec, &[]).await;
+    // risim: access, enclosing unit, image, physical.
+    check(
+        simulator,
+        &runtime,
+        &root,
+        &spec,
+        &[],
+        RisimDeviations::AllFailing,
+    )
+    .await;
 }
 
-pub async fn dictionary() {
-    simple_library("dictionary", "lib").await;
+pub async fn dictionary(simulator: SimulatorKind) {
+    // risim: enclosing unit.
+    simple_library(simulator, "dictionary", "lib", RisimDeviations::AllFailing).await;
 }
 
-pub async fn path() {
-    simple_library("path", "lib").await;
+pub async fn path(simulator: SimulatorKind) {
+    // risim: enclosing unit.
+    simple_library(simulator, "path", "lib", RisimDeviations::AllFailing).await;
 }
 
-pub async fn run() {
-    simple_library("run", "tb_run_lib").await;
+pub async fn run(simulator: SimulatorKind) {
+    // risim: image.
+    simple_library(simulator, "run", "tb_run_lib", RisimDeviations::AllFailing).await;
 }
 
-pub async fn string_ops() {
-    simple_library("string_ops", "lib").await;
+pub async fn string_ops(simulator: SimulatorKind) {
+    // risim: access.
+    simple_library(simulator, "string_ops", "lib", RisimDeviations::AllFailing).await;
 }
 
 /// `UI.add_library(library).add_source_files(ROOT / "test" / "*.vhd")`.
-async fn simple_library(name: &str, library: &str) {
+async fn simple_library(
+    simulator: SimulatorKind,
+    name: &str,
+    library: &str,
+    risim: RisimDeviations,
+) {
     let runtime = harness::runtime().await;
     let root = Root::new();
     let mut spec = ProjectSpec::new();
     spec.add_library(library, test_files(name, |_| false));
-    check(&runtime, &root, &spec, &[]).await;
+    check(simulator, &runtime, &root, &spec, &[], risim).await;
 }
 
-pub async fn random() {
+pub async fn random(simulator: SimulatorKind) {
     let runtime = harness::runtime().await;
     let root = Root::new();
     let mut spec = ProjectSpec::new();
     spec.add_feature(Feature::Random)
         .add_library("vunit_lib", test_files("random", |_| false));
-    check(&runtime, &root, &spec, &[]).await;
+    // risim: image.
+    check(
+        simulator,
+        &runtime,
+        &root,
+        &spec,
+        &[],
+        RisimDeviations::AllFailing,
+    )
+    .await;
 }
 
 // -------------------------------------------------------------------------------------------------
 // logging
 // -------------------------------------------------------------------------------------------------
 
-pub async fn logging() {
+pub async fn logging(simulator: SimulatorKind) {
     let runtime = harness::runtime().await;
     let root = Root::new();
     let mut spec = ProjectSpec::new();
@@ -190,7 +245,16 @@ pub async fn logging() {
         spec.test_configs
             .push(configs_of(&format!("{tb}.{test}"), configurations));
     }
-    check(&runtime, &root, &spec, &[]).await;
+    // risim: image, access.
+    check(
+        simulator,
+        &runtime,
+        &root,
+        &spec,
+        &[],
+        RisimDeviations::AllFailing,
+    )
+    .await;
 }
 
 const NATIVE_UNIT_SCALING: i64 = 0;
@@ -395,7 +459,7 @@ fn expected_time(test_time: u64, scaling: i64, n_decimals: i64) -> (i64, String)
 // -------------------------------------------------------------------------------------------------
 
 #[expect(clippy::too_many_lines, reason = "follows run.py")]
-pub async fn verification_components() {
+pub async fn verification_components(simulator: SimulatorKind) {
     let runtime = harness::runtime().await;
     let root = Root::new();
     let mut spec = ProjectSpec::new();
@@ -561,7 +625,16 @@ pub async fn verification_components() {
     );
     configs.push(no_tkeep);
 
-    check(&runtime, &root, &spec, &[]).await;
+    // risim: enclosing unit, image, access, driver.
+    check(
+        simulator,
+        &runtime,
+        &root,
+        &spec,
+        &[],
+        RisimDeviations::AllFailing,
+    )
+    .await;
 }
 
 /// `gen_wb_tests` of `verification_components/run.py`.

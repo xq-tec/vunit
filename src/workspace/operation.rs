@@ -4,12 +4,16 @@
 
 //! Compile and simulate operations, and how queued requests merge.
 //!
+//! Simulates of different backends don't merge. They queue one after the other, so the second
+//! one finds the libraries compiled by the first.
+//!
 //! AI NOTICE: Generated, minimally reviewed.
 
 use std::num::NonZeroUsize;
 
 use super::RequestTag;
 use crate::runner::SimulationRequest;
+use crate::simulator::SimulatorKind;
 
 /// A requested operation.
 ///
@@ -29,6 +33,8 @@ pub(super) enum Operation {
         requests: Vec<SimulationRequest>,
         /// The tags of the merged requests.
         tags: Vec<RequestTag>,
+        /// The backend that runs the testcases.
+        simulator: SimulatorKind,
         /// The maximum number of processes of the operation at once; `None` for no own limit.
         max_parallel: Option<NonZeroUsize>,
     },
@@ -43,15 +49,17 @@ impl Operation {
         }
     }
 
-    /// A simulate operation with the tag and process limit of its request.
+    /// A simulate operation with the tag, backend and process limit of its request.
     pub(super) fn simulate(
         requests: Vec<SimulationRequest>,
         tag: Option<RequestTag>,
+        simulator: SimulatorKind,
         max_parallel: Option<NonZeroUsize>,
     ) -> Self {
         Self::Simulate {
             requests: merge_requests(Vec::new(), requests),
             tags: tag.into_iter().collect(),
+            simulator,
             max_parallel,
         }
     }
@@ -97,56 +105,78 @@ impl Operation {
         }
     }
 
-    /// The requests of a simulate operation, the tags, and the process limit.
-    fn into_parts(
-        self,
-    ) -> (
-        Option<Vec<SimulationRequest>>,
-        Vec<RequestTag>,
-        Option<NonZeroUsize>,
-    ) {
+    /// The backend of a simulate operation; `None` for a compile operation.
+    const fn simulator(&self) -> Option<SimulatorKind> {
+        match self {
+            Self::Compile { .. } => None,
+            Self::Simulate { simulator, .. } => Some(*simulator),
+        }
+    }
+
+    /// The requests and the backend of a simulate operation, the tags, and the process limit.
+    fn into_parts(self) -> (Option<Simulation>, Vec<RequestTag>, Option<NonZeroUsize>) {
         match self {
             Self::Compile { tags, max_parallel } => (None, tags, max_parallel),
             Self::Simulate {
                 requests,
                 tags,
+                simulator,
                 max_parallel,
-            } => (Some(requests), tags, max_parallel),
+            } => (Some((requests, simulator)), tags, max_parallel),
         }
     }
 
-    /// Merges a later request into this queued one.
+    /// Whether a later request can [merge](Self::merge) into this queued one: anything but two
+    /// simulates of different backends.
+    pub(super) fn can_merge(&self, later: &Self) -> bool {
+        match (self.simulator(), later.simulator()) {
+            (Some(simulator), Some(later_simulator)) => simulator == later_simulator,
+            _ => true,
+        }
+    }
+
+    /// Merges a later request into this queued one; [`can_merge`](Self::can_merge) must hold.
     ///
-    /// Two compiles stay a compile; anything with a simulate becomes a simulate. Tags and
-    /// requests are united, keeping the order they were first requested in; requests with the
-    /// same pattern merge into one that runs paused if either does. The merged operation has
-    /// the smallest process limit of the two, so that it keeps the promise of either request.
+    /// Two compiles stay a compile; anything with a simulate becomes a simulate of its backend.
+    /// Tags and requests are united, keeping the order they were first requested in; requests
+    /// with the same pattern merge into one that runs paused if either does. The merged
+    /// operation has the smallest process limit of the two, so that it keeps the promise of
+    /// either request.
     #[must_use]
     pub(super) fn merge(self, later: Self) -> Self {
-        let (requests, mut merged_tags, max_parallel) = self.into_parts();
-        let (later_requests, later_tags, later_max_parallel) = later.into_parts();
+        debug_assert!(self.can_merge(&later), "simulates of different backends");
+        let (simulation, mut merged_tags, max_parallel) = self.into_parts();
+        let (later_simulation, later_tags, later_max_parallel) = later.into_parts();
         for tag in later_tags {
             if !merged_tags.contains(&tag) {
                 merged_tags.push(tag);
             }
         }
         let max_parallel = min_limit(max_parallel, later_max_parallel);
-        match (requests, later_requests) {
-            (None, None) => Self::Compile {
-                tags: merged_tags,
-                max_parallel,
+        let (requests, later_requests, simulator) = match (simulation, later_simulation) {
+            (None, None) => {
+                return Self::Compile {
+                    tags: merged_tags,
+                    max_parallel,
+                };
             },
-            (requests, later_requests) => Self::Simulate {
-                requests: merge_requests(
-                    requests.unwrap_or_default(),
-                    later_requests.unwrap_or_default(),
-                ),
-                tags: merged_tags,
-                max_parallel,
+            (Some((requests, simulator)), None) => (requests, Vec::new(), simulator),
+            (None, Some((later_requests, simulator))) => (Vec::new(), later_requests, simulator),
+            (Some((requests, simulator)), Some((later_requests, _))) => {
+                (requests, later_requests, simulator)
             },
+        };
+        Self::Simulate {
+            requests: merge_requests(requests, later_requests),
+            tags: merged_tags,
+            simulator,
+            max_parallel,
         }
     }
 }
+
+/// The requests and the backend of a simulate operation.
+type Simulation = (Vec<SimulationRequest>, SimulatorKind);
 
 /// The smaller of two process limits; `None` doesn't limit.
 fn min_limit(limit: Option<NonZeroUsize>, other: Option<NonZeroUsize>) -> Option<NonZeroUsize> {
@@ -217,23 +247,49 @@ mod tests {
 
     #[test]
     fn a_simulate_absorbs_compiles() {
-        let simulate = Operation::simulate(requests(&[("x.*", false)]), tag("s"), None);
-        assert_eq!(
-            Operation::compile(tag("c"), None).merge(simulate.clone()),
-            Operation::Simulate {
-                requests: requests(&[("x.*", false)]),
-                tags: tags(&["c", "s"]),
-                max_parallel: None,
-            }
+        for simulator in [SimulatorKind::Ghdl, SimulatorKind::Risim] {
+            let simulate =
+                Operation::simulate(requests(&[("x.*", false)]), tag("s"), simulator, None);
+            let compile = Operation::compile(tag("c"), None);
+            assert!(compile.can_merge(&simulate));
+            assert!(simulate.can_merge(&compile));
+            assert_eq!(
+                compile.merge(simulate.clone()),
+                Operation::Simulate {
+                    requests: requests(&[("x.*", false)]),
+                    tags: tags(&["c", "s"]),
+                    simulator,
+                    max_parallel: None,
+                }
+            );
+            assert_eq!(
+                simulate.merge(Operation::compile(tag("c"), None)),
+                Operation::Simulate {
+                    requests: requests(&[("x.*", false)]),
+                    tags: tags(&["s", "c"]),
+                    simulator,
+                    max_parallel: None,
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn simulates_of_different_backends_dont_merge() {
+        let simulate =
+            |simulator| Operation::simulate(requests(&[("x", false)]), None, simulator, None);
+        let ghdl = simulate(SimulatorKind::Ghdl);
+        let risim = simulate(SimulatorKind::Risim);
+        assert!(ghdl.can_merge(&simulate(SimulatorKind::Ghdl)));
+        assert!(risim.can_merge(&simulate(SimulatorKind::Risim)));
+        assert!(!ghdl.can_merge(&risim));
+        assert!(!risim.can_merge(&ghdl));
+        assert!(
+            Operation::compile(None, None)
+                .merge(risim.clone())
+                .can_merge(&risim)
         );
-        assert_eq!(
-            simulate.merge(Operation::compile(tag("c"), None)),
-            Operation::Simulate {
-                requests: requests(&[("x.*", false)]),
-                tags: tags(&["s", "c"]),
-                max_parallel: None,
-            }
-        );
+        assert!(!Operation::compile(None, None).merge(risim).can_merge(&ghdl));
     }
 
     #[test]
@@ -241,11 +297,13 @@ mod tests {
         let merged = Operation::simulate(
             requests(&[("a", false), ("b", true), ("a", false)]),
             None,
+            SimulatorKind::Risim,
             None,
         )
         .merge(Operation::simulate(
             requests(&[("c", false), ("a", true), ("b", false)]),
             tag("t"),
+            SimulatorKind::Risim,
             None,
         ));
         assert_eq!(
@@ -253,6 +311,7 @@ mod tests {
             Operation::Simulate {
                 requests: requests(&[("a", true), ("b", true), ("c", false)]),
                 tags: tags(&["t"]),
+                simulator: SimulatorKind::Risim,
                 max_parallel: None,
             }
         );
@@ -270,6 +329,7 @@ mod tests {
             .merge(Operation::simulate(
                 requests(&[("x", false)]),
                 tag("c"),
+                SimulatorKind::Ghdl,
                 limit(2),
             ))
             .merge(Operation::compile(tag("d"), limit(3)));

@@ -203,9 +203,10 @@ pub struct CompileOptions {
 /// enabled, and a new seed per run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SimOptions {
-    /// Extra elaboration flags (`risim-ghdl.elab_flags`).
+    /// Extra elaboration flags (`risim-ghdl.elab_flags`), passed to risim-ghdl by both backends.
     pub elab_flags: Option<Vec<String>>,
-    /// Extra simulation flags (`risim-ghdl.sim_flags`).
+    /// Extra simulation flags (`risim-ghdl.sim_flags`), passed to the simulator of the backend:
+    /// GHDL runtime options for `ghdl`, risim-runner options for `risim`.
     pub sim_flags: Option<Vec<String>>,
     /// The lowest assertion severity that stops the simulation; default `error`.
     pub vhdl_assert_stop_level: Option<AssertLevel>,

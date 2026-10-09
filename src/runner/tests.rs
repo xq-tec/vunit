@@ -11,9 +11,12 @@ use tokio::sync::Semaphore;
 
 use super::*;
 use crate::discovery;
+use crate::simulator::RisimRunner;
+use crate::simulator::Simulator;
 use crate::spec::ConfigurationSpec;
 use crate::spec::TestConfigSpec;
 use crate::test_support::add_vhdl;
+use crate::test_support::backend;
 use crate::test_support::simulator;
 use crate::test_support::simulator_identity;
 
@@ -147,6 +150,7 @@ struct Fixture {
     layout: OutputLayout,
     sim_options: SimOptions,
     test_configs: Vec<TestConfigSpec>,
+    gui_supported: bool,
 }
 
 impl Fixture {
@@ -163,6 +167,7 @@ impl Fixture {
             layout: OutputLayout::new(Utf8Path::new("/ws")),
             sim_options: SimOptions::default(),
             test_configs: Vec::new(),
+            gui_supported: true,
         }
     }
 
@@ -187,6 +192,7 @@ impl Fixture {
                 project: &self.project,
                 discovery: &discovery,
                 sim_options: &self.sim_options,
+                gui_supported: self.gui_supported,
             },
             &requests,
         )
@@ -252,7 +258,7 @@ fn command_of_an_explicit_test() {
         test.paths.dir,
         fixture.layout.test_output_dir("Lib.Tb_A.Test, 1")
     );
-    let command = test.command(&simulator(), "abc").unwrap();
+    let command = test.command(&backend(), "abc").unwrap();
     assert_eq!(
         command[..7],
         [
@@ -293,7 +299,7 @@ fn output_path_generic_is_filled_unless_set() {
     );
     let plan = fixture.plan(&[("*", false)]);
     let test = &plan.tests[0];
-    let command = test.command(&simulator(), "1").unwrap();
+    let command = test.command(&backend(), "1").unwrap();
     let expected = directory_generic(&test.paths.dir);
     assert_eq!(
         generic_arg(&command, "output_path"),
@@ -308,7 +314,7 @@ fn output_path_generic_is_filled_unless_set() {
         ..TestConfigSpec::default()
     });
     let overridden = fixture.plan(&[("*", false)]).tests[0]
-        .command(&simulator(), "1")
+        .command(&backend(), "1")
         .unwrap();
     assert_eq!(generic_arg(&overridden, "Output_Path"), Some("/custom/"));
     assert_eq!(generic_arg(&overridden, "output_path"), None);
@@ -356,7 +362,7 @@ fn configurations_set_options_seed_and_vhdl_configuration() {
 
     let vhdl_cfg = &plan.tests[0];
     assert_eq!(vhdl_cfg.seed(), "project-seed");
-    let vhdl_cfg_command = vhdl_cfg.command(&simulator(), "s").unwrap();
+    let vhdl_cfg_command = vhdl_cfg.command(&backend(), "s").unwrap();
     assert_eq!(vhdl_cfg_command[7], "cfg1");
     assert_eq!(vhdl_cfg_command[8], "--stop-time=1ms");
     assert!(vhdl_cfg_command.contains(&"--assert-level=error".to_owned()));
@@ -364,7 +370,7 @@ fn configurations_set_options_seed_and_vhdl_configuration() {
 
     let warn = &plan.tests[1];
     assert_eq!(warn.seed(), "config-seed");
-    let warn_command = warn.command(&simulator(), "s").unwrap();
+    let warn_command = warn.command(&backend(), "s").unwrap();
     assert_eq!(warn_command[7..9], ["tb_cfg", "a"]);
     assert_eq!(generic_arg(&warn_command, "value"), Some("7"));
     assert!(warn_command.contains(&"--assert-level=warning".to_owned()));
@@ -382,8 +388,38 @@ fn unsupported_standard_fails_the_command() {
     let plan = fixture.plan(&[("*", false)]);
     let old =
         Simulator::from_identity(simulator_identity("GHDL 5.0.0 [simulation adapter]\n")).unwrap();
-    plan.tests[0].command(&old, "1").unwrap_err();
-    plan.tests[0].command(&simulator(), "1").unwrap();
+    plan.tests[0].command(&Backend::Ghdl(old), "1").unwrap_err();
+    plan.tests[0].command(&backend(), "1").unwrap();
+}
+
+#[test]
+fn gui_requests_run_without_gui_on_a_backend_without_it() {
+    let mut fixture = Fixture::new();
+    fixture.add("/ws/tb_a.vhd", &testbench("tb_a", "", &["t1", "t2"]));
+    fixture.gui_supported = false;
+    let plan = fixture.plan(&[("lib.tb_a.t1", true), ("lib.tb_a.*", true)]);
+    assert!(plan.tests.iter().all(|test| !test.gui));
+    // The warning replaces the one about a GUI pattern that matches several testcases.
+    let messages: Vec<&str> = plan
+        .diagnostics
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        ["GUI mode isn't supported by the risim backend; running without it"]
+    );
+    let risim = Backend::Risim {
+        runner: RisimRunner::from_version_output(Utf8Path::new("/bin/risim"), "risim-runner 0.1.0")
+            .unwrap(),
+        ghdl: simulator(),
+    };
+    let command = plan.tests[0].command(&risim, "1").unwrap();
+    assert_eq!(command[..2], ["/bin/risim", "run"]);
+    assert!(!command.iter().any(|arg| arg == "--wait"), "{command:?}");
+    assert_eq!(command.last().map(String::as_str), Some("tb_a(a)"));
+
+    assert_eq!(fixture.plan(&[("*", false)]).diagnostics, []);
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -398,7 +434,7 @@ async fn cancelled_simulation_starts_nothing_despite_free_permits() {
     let (events, mut receiver) = mpsc::unbounded_channel();
     let context = SimulationContext {
         workspace_root: "/ws".into(),
-        simulator: simulator(),
+        backend: backend(),
         limit: ProcessLimit::from(Arc::new(Semaphore::new(8))),
         results: Arc::new(ResultStore::load(&fixture.layout)),
         testcase_locks: Arc::default(),

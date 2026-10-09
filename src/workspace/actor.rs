@@ -13,6 +13,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::VecDeque;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -56,6 +57,7 @@ use crate::runner::SimulationRequest;
 use crate::runner::TestcaseLocks;
 use crate::runtime::ProcessLimit;
 use crate::runtime::Runtime;
+use crate::simulator::SimulatorKind;
 use crate::store::CompileState;
 use crate::store::FileKey;
 use crate::store::OutputLayout;
@@ -78,6 +80,7 @@ pub(super) enum Command {
     Simulate {
         requests: Vec<SimulationRequest>,
         tag: Option<RequestTag>,
+        simulator: SimulatorKind,
         max_parallel: Option<NonZeroUsize>,
     },
     CancelAll,
@@ -156,7 +159,8 @@ pub(super) struct Actor {
     /// Cancels the current operations; replaced by a new child of `cancel` on every cancel.
     operations_cancel: CancellationToken,
     running_compile: Option<RunningCompile>,
-    queued: Option<Operation>,
+    /// The operations waiting for the running compile, in request order.
+    queued: VecDeque<Operation>,
     simulations: FxHashMap<u64, RunningSimulation>,
     next_simulation_id: u64,
     closing: Option<Closing>,
@@ -240,7 +244,7 @@ impl Actor {
             cancel,
             operations_cancel,
             running_compile: None,
-            queued: None,
+            queued: VecDeque::new(),
             simulations: FxHashMap::default(),
             next_simulation_id: 0,
             closing: None,
@@ -313,7 +317,7 @@ impl Actor {
     }
 
     fn is_idle(&self) -> bool {
-        self.running_compile.is_none() && self.queued.is_none() && self.simulations.is_empty()
+        self.running_compile.is_none() && self.queued.is_empty() && self.simulations.is_empty()
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -328,9 +332,10 @@ impl Actor {
             Command::Simulate {
                 requests,
                 tag,
+                simulator,
                 max_parallel,
             } => {
-                self.request(Operation::simulate(requests, tag, max_parallel))
+                self.request(Operation::simulate(requests, tag, simulator, max_parallel))
                     .await;
             },
             Command::CancelAll => self.cancel_all(),
@@ -343,19 +348,25 @@ impl Actor {
         }
     }
 
-    /// Starts `operation`, or merges it into the queued one if a compile is running.
+    /// Starts `operation`, or queues it if a compile is running.
+    ///
+    /// A queued operation merges into the last queued one if [it can](Operation::can_merge), so
+    /// that the operations keep the order of their requests.
     async fn request(&mut self, operation: Operation) {
         if self.closing.is_some() {
             tracing::debug!(root = %self.root, "ignoring a request to a closing workspace");
             return;
         }
-        if self.running_compile.is_none() && self.queued.is_none() {
+        if self.running_compile.is_none() && self.queued.is_empty() {
             self.start(operation).await;
-        } else {
-            self.queued = Some(match self.queued.take() {
-                Some(queued) => queued.merge(operation),
-                None => operation,
-            });
+            return;
+        }
+        match self.queued.pop_back() {
+            Some(last) if last.can_merge(&operation) => {
+                self.queued.push_back(last.merge(operation));
+            },
+            Some(last) => self.queued.extend([last, operation]),
+            None => self.queued.push_back(operation),
         }
     }
 
@@ -373,20 +384,24 @@ impl Actor {
         tracing::debug!(root = %self.root, ?tag, "cancelling a request");
         let only_tag = |tags: &[RequestTag]| tags.len() == 1 && tags[0] == *tag;
         let mut ended = Vec::new();
-        if let Some(queued) = &mut self.queued
-            && queued.tags().contains(tag)
-        {
-            if only_tag(queued.tags()) {
-                self.drop_queued();
-            } else {
+        let mut kept = VecDeque::with_capacity(self.queued.len());
+        for mut queued in std::mem::take(&mut self.queued) {
+            if queued.tags().contains(tag) {
+                // An operation of this request alone is dropped.
+                let alone = only_tag(queued.tags());
                 queued.remove_tag(tag);
                 ended.push(WorkspaceEventKind::CompileFinished {
                     tags: vec![tag.clone()],
                     success: false,
                     simulation_patterns: queued.simulation_patterns(),
                 });
+                if alone {
+                    continue;
+                }
             }
+            kept.push_back(queued);
         }
+        self.queued = kept;
         if let Some(running) = &mut self.running_compile
             && running.operation.tags().contains(tag)
         {
@@ -432,9 +447,9 @@ impl Actor {
         }
     }
 
-    /// Drops the queued operation; its requests end without success.
+    /// Drops the queued operations; their requests end without success.
     fn drop_queued(&mut self) {
-        if let Some(queued) = self.queued.take() {
+        for queued in std::mem::take(&mut self.queued) {
             self.emit(WorkspaceEventKind::CompileFinished {
                 tags: queued.tags().to_vec(),
                 success: false,
@@ -600,10 +615,26 @@ impl Actor {
             success,
             simulation_patterns: running.operation.simulation_patterns(),
         });
-        if success && let Operation::Simulate { requests, tags, .. } = running.operation {
-            self.start_simulation(&running.model, &requests, tags, running.operation_semaphore);
+        if success
+            && let Operation::Simulate {
+                requests,
+                tags,
+                simulator,
+                ..
+            } = running.operation
+        {
+            self.start_simulation(
+                &running.model,
+                &requests,
+                tags,
+                simulator,
+                running.operation_semaphore,
+            );
         }
-        if let Some(queued) = self.queued.take() {
+        // An operation that can't compile ends right away, without starting a compile.
+        while self.running_compile.is_none()
+            && let Some(queued) = self.queued.pop_front()
+        {
             self.start(queued).await;
         }
     }
@@ -631,21 +662,47 @@ impl Actor {
     // Simulation
     // ---------------------------------------------------------------------------------------------
 
-    /// Runs the testcases of `model` that match `requests`, limited by the runtime and, if
-    /// given, by `operation_semaphore`.
+    /// Runs the testcases of `model` that match `requests` on the backend `simulator`, limited
+    /// by the runtime and, if given, by `operation_semaphore`.
+    ///
+    /// If the backend is unavailable, the simulation ends right away with a diagnostic and
+    /// without testcases.
     fn start_simulation(
         &mut self,
         model: &Model,
         requests: &[SimulationRequest],
         tags: Vec<RequestTag>,
+        simulator: SimulatorKind,
         operation_semaphore: Option<Arc<Semaphore>>,
     ) {
+        let backend = match self.runtime.backend(simulator) {
+            Ok(backend) => backend,
+            Err(reason) => {
+                self.emit(WorkspaceEventKind::SimulationStarted {
+                    tags: tags.clone(),
+                    testcases: Vec::new(),
+                });
+                self.simulation_diagnostics.insert(
+                    None,
+                    vec![Diagnostic::error(format!(
+                        "the {simulator} backend is unavailable: {reason}"
+                    ))],
+                );
+                self.dirty.insert(DiagnosticSource::Simulation);
+                self.emit(WorkspaceEventKind::SimulationFinished {
+                    tags,
+                    counts: TestCounts::default(),
+                });
+                return;
+            },
+        };
         let plan = SimulationPlan::new(
             &SimulationInput {
                 layout: &self.layout,
                 project: &model.project,
                 discovery: &model.discovery,
                 sim_options: &model.spec.sim_options,
+                gui_supported: backend.supports_gui(),
             },
             requests,
         );
@@ -671,7 +728,7 @@ impl Actor {
         });
         let context = SimulationContext {
             workspace_root: self.root.to_path_buf(),
-            simulator: self.runtime.simulator().clone(),
+            backend,
             limit: ProcessLimit::new(
                 Arc::clone(self.runtime.simulation_semaphore()),
                 operation_semaphore,

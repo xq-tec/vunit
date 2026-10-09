@@ -14,6 +14,7 @@ use camino::Utf8PathBuf;
 
 use crate::project::FileId;
 use crate::project::Project;
+use crate::simulator::Backend;
 use crate::simulator::Simulator;
 use crate::simulator::SimulatorIdentity;
 use crate::sources::ContentHash;
@@ -57,6 +58,11 @@ pub(crate) fn simulator() -> Simulator {
         "GHDL 6.4.0-risim [simulation adapter]\n",
     ))
     .unwrap()
+}
+
+/// The `ghdl` backend with [`simulator`].
+pub(crate) fn backend() -> Backend {
+    Backend::Ghdl(simulator())
 }
 
 /// Parses `code` and adds it to `library` as the file `path`; unparsable code is added

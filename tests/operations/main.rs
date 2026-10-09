@@ -4,10 +4,10 @@
 
 //! Integration tests of compile and simulation operations.
 //!
-//! The binary doubles as a fake risim-ghdl (see `fake_ghdl.rs`), so the tests run everywhere
-//! without a simulator. The trial `real_risim_ghdl_compiles_uart` uses the risim-ghdl named
-//! by `RISIM_GHDL` and is ignored without it; the end-to-end tests with risim-ghdl are in the
-//! `acceptance` target.
+//! The binary doubles as a fake risim-ghdl and risim-runner (see `fake_ghdl.rs`), so the tests
+//! run everywhere without a simulator. The trial `real_risim_ghdl_compiles_uart` uses the
+//! risim-ghdl named by `RISIM_GHDL` and is ignored without it; the end-to-end tests with
+//! risim-ghdl are in the `acceptance` target.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -48,6 +48,7 @@ use risim_vunit_frontend::runner::SimulationPlan;
 use risim_vunit_frontend::runner::SimulationReport;
 use risim_vunit_frontend::runner::SimulationRequest;
 use risim_vunit_frontend::runtime::ProcessLimit;
+use risim_vunit_frontend::simulator::Backend;
 use risim_vunit_frontend::simulator::Simulator;
 use risim_vunit_frontend::sources;
 use risim_vunit_frontend::sources::SourceCache;
@@ -365,6 +366,7 @@ impl Workspace {
                 project: &loaded.project,
                 discovery: &found,
                 sim_options: &self.spec.sim_options,
+                gui_supported: true,
             },
             &requests,
         );
@@ -386,7 +388,7 @@ impl Workspace {
         };
         let context = SimulationContext {
             workspace_root: self.root.clone(),
-            simulator: self.simulator.clone(),
+            backend: Backend::Ghdl(self.simulator.clone()),
             limit: ProcessLimit::from(Arc::clone(&self.semaphore)),
             results: Arc::clone(results),
             testcase_locks: Arc::default(),
@@ -1028,20 +1030,22 @@ async fn simulation_spawn_failure_fails_the_test() {
     let mut workspace = Workspace::new().await;
     simulation_project(&mut workspace);
     let mut identity = workspace.simulator.identity().clone();
-    identity.path = workspace.root.join("missing-risim-ghdl");
+    let missing = workspace.root.join("missing-risim-ghdl");
+    identity.path.clone_from(&missing);
     workspace.simulator = Simulator::from_identity(identity).expect("valid identity");
     let results = Arc::new(ResultStore::load(&workspace.layout));
     let run = workspace.simulate(&[("*.pass", false)], &results).await;
     assert_eq!(run.outcomes(), [("lib.tb_tests.pass", TestOutcome::Failed)]);
     assert_eq!(run.report.diagnostics.len(), 1);
     let message = &run.report.diagnostics[0].message;
+    let failed_to_run = format!("failed to run {missing}");
     assert!(
-        message.starts_with("lib.tb_tests.pass: failed to run risim-ghdl"),
+        message.starts_with(&format!("lib.tb_tests.pass: {failed_to_run}")),
         "{message}"
     );
     let paths = TestOutputPaths::new(&workspace.layout, "lib.tb_tests.pass");
     let output = fs::read_to_string(&paths.output_file).expect("output.txt");
-    assert!(output.contains("failed to run risim-ghdl"), "{output}");
+    assert!(output.contains(&failed_to_run), "{output}");
     // A simulator that didn't run doesn't measure the duration.
     assert_eq!(results.snapshot()["lib.tb_tests.pass"].duration_ms, None);
     assert!(

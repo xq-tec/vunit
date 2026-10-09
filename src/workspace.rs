@@ -14,11 +14,12 @@
 //!   files are read. The testcase list is maintained continuously; file changes never start a
 //!   compile.
 //! - **Operations:** a compile, or a simulate, which compiles first and then runs the matching
-//!   testcases. At most one compile runs per workspace. Requests arriving while a compile runs
-//!   merge into one queued operation (see `operation.rs`). After its compile, a simulate runs its
-//!   tests while the next operation may already compile.
-//! - **Cancel:** [`Workspace::cancel_all`] cancels the running compile, the queued operation, and
-//!   all running and waiting tests. [`Workspace::cancel`] cancels only what one request asked
+//!   testcases on its backend. At most one compile runs per workspace. Requests arriving while a
+//!   compile runs are queued in order; a request merges into the last queued operation unless
+//!   both are simulates of different backends (see `operation.rs`). After its compile, a
+//!   simulate runs its tests while the next operation may already compile.
+//! - **Cancel:** [`Workspace::cancel_all`] cancels the running compile, the queued operations,
+//!   and all running and waiting tests. [`Workspace::cancel`] cancels only what one request asked
 //!   for: an operation that serves other requests too keeps running for them.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
@@ -51,6 +52,7 @@ use crate::diagnostics::DiagnosticSource;
 use crate::discovery::Testcase;
 pub use crate::runner::SimulationRequest;
 use crate::runtime::Runtime;
+use crate::simulator::SimulatorKind;
 use crate::sources;
 use crate::sources::SourceCache;
 use crate::spec::ProjectSpec;
@@ -162,6 +164,9 @@ pub struct WorkspaceEvent {
 /// [`SimulationStarted`](Self::SimulationStarted) nor
 /// [`SimulationFinished`](Self::SimulationFinished). A queued operation dropped by a cancel
 /// ends with `CompileFinished` without success and without `CompileStarted`.
+///
+/// A simulate operation whose backend is unavailable sends `SimulationStarted` without
+/// testcases, a `simulation` diagnostic, and `SimulationFinished` with zero counts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceEventKind {
     /// The testcase list was loaded, or changed.
@@ -277,7 +282,7 @@ impl Workspace {
         self.send(Command::Compile { tag, max_parallel });
     }
 
-    /// Compiles, then runs the testcases matching `requests`.
+    /// Compiles, then runs the testcases matching `requests` on the backend `simulator`.
     ///
     /// `max_parallel` limits the compile and simulation processes of the request, in addition
     /// to the limits of the [`Runtime`]. Merged requests use the smallest limit.
@@ -285,16 +290,18 @@ impl Workspace {
         &self,
         requests: Vec<SimulationRequest>,
         tag: Option<RequestTag>,
+        simulator: SimulatorKind,
         max_parallel: Option<NonZeroUsize>,
     ) {
         self.send(Command::Simulate {
             requests,
             tag,
+            simulator,
             max_parallel,
         });
     }
 
-    /// Cancels the running compile, the queued operation, and all running and waiting tests.
+    /// Cancels the running compile, the queued operations, and all running and waiting tests.
     pub fn cancel_all(&self) {
         self.send(Command::CancelAll);
     }

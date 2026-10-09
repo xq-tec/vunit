@@ -17,7 +17,7 @@
 //! - test discovery with configurations and testcase patterns: [`discovery`], [`configuration`], [`pattern`]
 //! - diagnostics: [`diagnostics`]
 //! - `risim-out/` directory: [`store`]
-//! - simulator interface: [`simulator`], [`process`]
+//! - simulation backends (risim-ghdl, risim-runner): [`simulator`], [`process`]
 //! - incremental parallel compilation: [`compile`]
 //! - simulation runs with persisted results: [`runner`]
 //! - workspace management and monitoring: [`workspace`], [`watch`], [`runtime`]
@@ -58,6 +58,7 @@ pub use crate::discovery::Testcase;
 pub use crate::runtime::Runtime;
 pub use crate::runtime::RuntimeError;
 pub use crate::runtime::RuntimeOptions;
+pub use crate::simulator::SimulatorKind;
 pub use crate::store::TestCounts;
 pub use crate::store::TestOutcome;
 pub use crate::store::TestResult;
