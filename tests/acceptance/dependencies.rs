@@ -37,10 +37,9 @@ pub async fn package_body_dependencies(simulator: SimulatorKind) {
             ..target("lib.tb_pkg")
         });
         let outcome = harness::simulate_all(&runtime, &root.path, &spec, simulator).await;
-        // risim: access.
         outcome.assert_outcomes(
             &harness::outcomes(&[("lib.tb_pkg.all", TestOutcome::Passed)]),
-            RisimDeviations::AllFailing,
+            RisimDeviations::None,
         );
     }
 }

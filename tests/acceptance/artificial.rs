@@ -27,10 +27,9 @@ pub async fn artificial(simulator: SimulatorKind) {
     let mut spec = ProjectSpec::new();
     artificial_spec(&mut spec);
     let outcome = harness::simulate_all(&runtime, &root.path, &spec, simulator).await;
-    // risim: access, enclosing unit.
     outcome.assert_outcomes(
         &harness::outcomes(ARTIFICIAL_EXPECTED),
-        RisimDeviations::AllFailing,
+        RisimDeviations::None,
     );
 }
 

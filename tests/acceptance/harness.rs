@@ -128,32 +128,42 @@ pub fn tests_of<'name>(names: &'name [String], testbench: &str) -> Vec<&'name st
 
 /// Testcases whose outcome on the `risim` backend differs from the one on `ghdl`.
 ///
-/// risim-runner doesn't run VUnit's libraries yet. The trials name what it fails on:
+/// Where risim-runner differs, the trial lists the testcases and says why after `risim:`:
 ///
-/// - **access:** a shared variable whose initial value holds an access value that GHDL
-///   allocated is rejected.
-/// - **image:** `T'image` of a type other than `INTEGER` panics.
-/// - **physical:** "unsupported VHDL feature: floating physical literal".
-/// - **association:** "illegal VHDL: formal is associated more than once", for legal code.
-/// - **enclosing unit:** "instance … is not enclosed by an architecture or entity", for a
-///   report.
-/// - **driver:** a panic with "driven signal has no driver prefix in this process".
-///
-/// Every trial fails completely for now. Once risim-runner runs parts of VUnit, a variant that
-/// lists the failing testcases joins [`AllFailing`](Self::AllFailing).
+/// - **process-local call:** a declaration of a process calls a subprogram declared in that
+///   process, which elaboration does not support yet.
+/// - **analysis of the export:** risim-runner exports the analyzed libraries with
+///   `risim-ghdl ast-to-json`, which reports errors in a file that `risim-ghdl -a` accepted.
+/// - **instance name:** the testcase seeds its random generator with `'INSTANCE_NAME`, which
+///   differs from GHDL's, so it draws other values.
 #[derive(Debug, Clone, Copy)]
 pub enum RisimDeviations {
-    /// Every testcase fails on `risim`.
-    AllFailing,
+    /// Every testcase has its `ghdl` outcome.
+    None,
+    /// These testcases fail; all others have their `ghdl` outcome. An entry that ends with `.`
+    /// names all testcases of a testbench (`lib.tb.`).
+    Failing(&'static [&'static str]),
 }
 
 impl RisimDeviations {
     /// Changes the `ghdl` outcomes in `expected` into the `risim` ones.
     fn apply(self, expected: &mut BTreeMap<String, TestOutcome>) {
         match self {
-            Self::AllFailing => expected
-                .values_mut()
-                .for_each(|outcome| *outcome = TestOutcome::Failed),
+            Self::None => {},
+            Self::Failing(names) => {
+                for (name, outcome) in expected.iter_mut() {
+                    let listed = |entry: &&str| {
+                        if entry.ends_with('.') {
+                            name.starts_with(entry)
+                        } else {
+                            name == entry
+                        }
+                    };
+                    if names.iter().any(listed) {
+                        *outcome = TestOutcome::Failed;
+                    }
+                }
+            },
         }
     }
 }

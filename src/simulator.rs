@@ -6,7 +6,7 @@
 //!
 //! risim-ghdl analyses every library. It also simulates with the `ghdl` backend
 //! (`risim-ghdl --elab-run`). The `risim` backend simulates with risim-runner (`risim run`),
-//! which elaborates with the same risim-ghdl on the same libraries.
+//! which reads the same libraries through the same risim-ghdl.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -373,12 +373,12 @@ impl RisimRunner {
 pub enum Backend {
     /// risim-ghdl simulates.
     Ghdl(Simulator),
-    /// risim-runner simulates and elaborates with `ghdl`, the risim-ghdl that analysed the
-    /// libraries.
+    /// risim-runner simulates; it reads the libraries through `ghdl`, the risim-ghdl that
+    /// analysed them.
     Risim {
         /// The simulator.
         runner: RisimRunner,
-        /// The risim-ghdl that risim-runner elaborates with.
+        /// The risim-ghdl through which risim-runner reads the libraries.
         ghdl: Simulator,
     },
 }

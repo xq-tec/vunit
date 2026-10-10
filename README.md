@@ -10,13 +10,13 @@ AI NOTICE: Generated, minimally reviewed.
 
 A Rust replacement for the Python frontend of [VUnit](https://github.com/VUnit/vunit), built for the riSim simulator.
 
-This is a fork of VUnit. The VHDL libraries under `vunit/vhdl` (the testbench runner, logging, checks, data types, com, verification components and OSVVM) are unchanged upstream sources. The Python frontend is replaced by this crate, so existing VUnit testbenches run as they are and need no Python at build time or at runtime.
+This is a fork of VUnit. The VHDL libraries under `vunit/vhdl` (the testbench runner, logging, checks, data types, com, verification components and OSVVM) are unchanged upstream sources, apart from fixes to a few of their testbenches ([`UPSTREAM.md`](UPSTREAM.md)). The Python frontend is replaced by this crate, so existing VUnit testbenches run as they are and need no Python at build time or at runtime.
 
 ## Scope
 
 The scope of this crate is intentionally limited:
 
-- `risim-ghdl`, riSim's fork of GHDL, analyses all libraries. Two backends simulate: `ghdl` with `risim-ghdl --elab-run`, and `risim` with risim-runner (`risim run`), riSim's own simulator. risim-runner elaborates with the same `risim-ghdl` on the same libraries. Each simulate request selects its backend.
+- `risim-ghdl`, riSim's fork of GHDL, analyses all libraries. Two backends simulate: `ghdl` with `risim-ghdl --elab-run`, and `risim` with risim-runner (`risim run`), riSim's own simulator. risim-runner reads the same libraries through the same `risim-ghdl`. Each simulate request selects its backend.
 - VHDL only. Verilog is not supported yet.
 - There is no command-line interface. Callers open a `Runtime` and drive workspaces through the library API.
 

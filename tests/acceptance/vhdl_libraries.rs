@@ -89,14 +89,13 @@ pub async fn check_lib(simulator: SimulatorKind) {
             config_with("using check_true", &[("use_check_not_check_true", "False")]),
         ],
     ));
-    // risim: association, enclosing unit, access.
     check(
         simulator,
         &runtime,
         &root,
         &spec,
         CHECK_FAILURES,
-        RisimDeviations::AllFailing,
+        RisimDeviations::None,
     )
     .await;
 }
@@ -119,14 +118,13 @@ pub async fn com(simulator: SimulatorKind) {
         "tb_com_lib",
         test_files("com", |name| name == "tb_com_codec.vhd"),
     );
-    // risim: enclosing unit, image, physical.
     check(
         simulator,
         &runtime,
         &root,
         &spec,
         &[],
-        RisimDeviations::AllFailing,
+        RisimDeviations::None,
     )
     .await;
 }
@@ -142,36 +140,31 @@ pub async fn data_types(simulator: SimulatorKind) {
     ];
     files.extend(test_files("data_types", |_| false));
     spec.add_library("vunit_lib", files);
-    // risim: access, enclosing unit, image, physical.
     check(
         simulator,
         &runtime,
         &root,
         &spec,
         &[],
-        RisimDeviations::AllFailing,
+        RisimDeviations::None,
     )
     .await;
 }
 
 pub async fn dictionary(simulator: SimulatorKind) {
-    // risim: enclosing unit.
-    simple_library(simulator, "dictionary", "lib", RisimDeviations::AllFailing).await;
+    simple_library(simulator, "dictionary", "lib", RisimDeviations::None).await;
 }
 
 pub async fn path(simulator: SimulatorKind) {
-    // risim: enclosing unit.
-    simple_library(simulator, "path", "lib", RisimDeviations::AllFailing).await;
+    simple_library(simulator, "path", "lib", RisimDeviations::None).await;
 }
 
 pub async fn run(simulator: SimulatorKind) {
-    // risim: image.
-    simple_library(simulator, "run", "tb_run_lib", RisimDeviations::AllFailing).await;
+    simple_library(simulator, "run", "tb_run_lib", RisimDeviations::None).await;
 }
 
 pub async fn string_ops(simulator: SimulatorKind) {
-    // risim: access.
-    simple_library(simulator, "string_ops", "lib", RisimDeviations::AllFailing).await;
+    simple_library(simulator, "string_ops", "lib", RisimDeviations::None).await;
 }
 
 /// `UI.add_library(library).add_source_files(ROOT / "test" / "*.vhd")`.
@@ -194,14 +187,13 @@ pub async fn random(simulator: SimulatorKind) {
     let mut spec = ProjectSpec::new();
     spec.add_feature(Feature::Random)
         .add_library("vunit_lib", test_files("random", |_| false));
-    // risim: image.
     check(
         simulator,
         &runtime,
         &root,
         &spec,
         &[],
-        RisimDeviations::AllFailing,
+        RisimDeviations::None,
     )
     .await;
 }
@@ -245,14 +237,13 @@ pub async fn logging(simulator: SimulatorKind) {
         spec.test_configs
             .push(configs_of(&format!("{tb}.{test}"), configurations));
     }
-    // risim: image, access.
     check(
         simulator,
         &runtime,
         &root,
         &spec,
         &[],
-        RisimDeviations::AllFailing,
+        RisimDeviations::None,
     )
     .await;
 }
@@ -625,17 +616,24 @@ pub async fn verification_components(simulator: SimulatorKind) {
     );
     configs.push(no_tkeep);
 
-    // risim: enclosing unit, image, access, driver.
     check(
         simulator,
         &runtime,
         &root,
         &spec,
         &[],
-        RisimDeviations::AllFailing,
+        RisimDeviations::Failing(VERIFICATION_COMPONENTS_RISIM_FAILURES),
     )
     .await;
 }
+
+/// The testcases of `verification_components` that fail on `risim`.
+const VERIFICATION_COMPONENTS_RISIM_FAILURES: &[&str] = &[
+    // risim: process-local call (`axi_stream_master`), analysis of the export.
+    "vunit_lib.tb_axi_stream.",
+    // risim: instance name.
+    "vunit_lib.tb_axi_write_slave.Test random writes",
+];
 
 /// `gen_wb_tests` of `verification_components/run.py`.
 fn wishbone_configs(
