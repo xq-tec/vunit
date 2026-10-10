@@ -358,6 +358,7 @@ begin
       tvalid <= '0';
       tready <= '0';
 
+      wait until mock_queue_length > 0 for 0 ns;
       check_only_log(
         rule_logger,
         "Check failed for performance - tready active " & to_string(max_waits + 1) &

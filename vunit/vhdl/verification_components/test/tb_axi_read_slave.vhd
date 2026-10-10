@@ -360,6 +360,7 @@ begin
       rready <= '1';
       wait until rising_edge(clk);
       write_addr(x"0", base_address(buf), len => 2, log_size => 0, burst => axi_burst_type_incr);
+      wait until mock_queue_length > 0 for 0 ns;
       check_only_log(
         axi_slave_logger,
         "Burst not well behaved, axi size = 1 but bus data width allows " & to_string(data_size),
@@ -373,6 +374,7 @@ begin
       mock(axi_slave_logger, failure);
       wait until rising_edge(clk);
       write_addr(x"0", base_address(buf), len => 2, log_size => log_data_size, burst => axi_burst_type_incr);
+      wait until mock_queue_length > 0 for 0 ns;
       check_only_log(axi_slave_logger, "Burst not well behaved, rready was not high during active burst", failure);
       unmock(axi_slave_logger);
 

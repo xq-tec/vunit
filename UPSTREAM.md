@@ -12,10 +12,12 @@ The VHDL and Verilog trees match upstream VUnit commit `44736ccfb1a89ffdc53638a2
 
 The fork adds `2ad0add1c51798c4c7d117e585125221ea337ff7`, which rewrites the OSVVM submodule URL from the relative `../../OSVVM/OSVVM.git` to `https://github.com/OSVVM/OSVVM`. Keep that URL on later syncs.
 
+The fork also fixes seven testcases of `vunit/vhdl/verification_components/test` (`tb_axi_read_slave.vhd`, `tb_axi_write_slave.vhd`, `tb_axi_stream_protocol_checker.vhd`). Each called `check_only_log` in the same delta cycle in which a process of the verification component logs the expected item to the mocked logger, so it passed only when the simulator resumed that process first (§ 14.7.5.3 leaves the order open). They now wait one delta cycle for the item first (`wait until mock_queue_length > 0 for 0 ns;`), like their sibling testcases, and still fail when nothing is logged. Keep these fixes on later syncs until upstream has them.
+
 ## Sync procedure
 
 1. Merge upstream `master` into the fork.
-2. Keep `vunit/vhdl/**` and `vunit/verilog/**` from upstream, including their unused `run.py` and `tools/*.py` files.
+2. Keep `vunit/vhdl/**` and `vunit/verilog/**` from upstream, including their unused `run.py` and `tools/*.py` files, except for the testbench fixes above.
 3. Resolve conflicts on deleted files (the Python package outside `vunit/vhdl` and `vunit/verilog`, the Python tests, `docs/`, `examples/`, `tools/`, `setup.py`, `pyproject.toml` and the Python workflows) by keeping the deletion. Keep this fork's `README.md`, `.gitignore` and `.github/workflows/ci.yml`.
 4. Review `git diff <recorded>..<new> -- vunit/*.py vunit/**/*.py` for logic to port, using the mapping below. Review the changes to `vunit/vhdl/*/run.py` and `tests/acceptance/test_artificial.py` too, and update their translations in `tests/acceptance/`.
 5. Run the acceptance tests with `RISIM_GHDL` and `RISIM_RUNNER` set, and update the expected failures and the risim deviations.
