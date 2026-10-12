@@ -904,7 +904,13 @@ impl Actor {
         self.dirty.insert(DiagnosticSource::Config);
         self.dirty.insert(DiagnosticSource::Project);
         if let Some(watcher) = &mut self.watcher {
-            for (dir, error) in watcher.update(&loaded.watch_targets) {
+            let update = watcher.update(&loaded.watch_targets);
+            if update.added {
+                // Files created in a newly watched directory after it was scanned, but before its
+                // watch started, are reported neither by the load nor by the watcher.
+                self.debouncer.add(Change::Sources, Instant::now());
+            }
+            for (dir, error) in update.errors {
                 if matches!(error.kind, notify::ErrorKind::PathNotFound) {
                     // Deleted in the meantime; its parent reports the deletion.
                     tracing::debug!(%dir, "the directory to watch is gone");

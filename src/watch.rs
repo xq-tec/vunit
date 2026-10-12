@@ -303,8 +303,10 @@ impl DirectoryWatcher {
 
     /// Watches exactly `targets`.
     ///
-    /// Returns the directories that can't be watched.
-    pub fn update(&mut self, targets: &WatchTargets) -> Vec<(Utf8PathBuf, notify::Error)> {
+    /// The files that were created in a newly watched directory before its watch started are
+    /// never reported, so the caller has to scan the directories again if
+    /// [`WatchUpdate::added`] is set.
+    pub fn update(&mut self, targets: &WatchTargets) -> WatchUpdate {
         let removed: Vec<Utf8PathBuf> = self
             .watched
             .iter()
@@ -318,7 +320,7 @@ impl DirectoryWatcher {
                 tracing::debug!(%dir, %error, "failed to unwatch");
             }
         }
-        let mut errors = Vec::new();
+        let mut update = WatchUpdate::default();
         for (dir, &recursive) in targets {
             if self.watched.contains_key(dir) {
                 continue;
@@ -331,12 +333,23 @@ impl DirectoryWatcher {
             match self.watcher.watch(dir.as_std_path(), mode) {
                 Ok(()) => {
                     self.watched.insert(dir.clone(), recursive);
+                    update.added = true;
                 },
-                Err(error) => errors.push((dir.clone(), error)),
+                Err(error) => update.errors.push((dir.clone(), error)),
             }
         }
-        errors
+        update
     }
+}
+
+/// The outcome of [`DirectoryWatcher::update`].
+#[derive(Debug, Default)]
+pub struct WatchUpdate {
+    /// Whether a directory is newly watched, or its watch switched between recursive and
+    /// non-recursive.
+    pub added: bool,
+    /// The directories that can't be watched.
+    pub errors: Vec<(Utf8PathBuf, notify::Error)>,
 }
 
 #[cfg(test)]
@@ -550,7 +563,13 @@ mod tests {
         runtime.block_on(async {
             let (sender, mut events) = mpsc::unbounded_channel();
             let mut watcher = DirectoryWatcher::new(sender).unwrap();
-            assert!(watcher.update(&current_targets()).is_empty());
+            let initial = watcher.update(&current_targets());
+            assert!(initial.errors.is_empty() && initial.added);
+            let unchanged = watcher.update(&current_targets());
+            assert!(
+                unchanged.errors.is_empty() && !unchanged.added,
+                "nothing new to watch"
+            );
 
             let removed = |kind: &EventKind| matches!(kind, EventKind::Remove(_));
             let created = |kind: &EventKind| matches!(kind, EventKind::Create(_));
@@ -563,13 +582,17 @@ mod tests {
             // before the reload updates the watches.
             let reload_targets = current_targets();
             mkdir(&temp, "tb");
-            assert!(watcher.update(&reload_targets).is_empty());
+            assert!(watcher.update(&reload_targets).errors.is_empty());
             assert!(
                 reported(&mut watcher, &mut events, created, &tb).await,
                 "the recreation triggers the next reload"
             );
 
-            assert!(watcher.update(&current_targets()).is_empty());
+            let rewatched = watcher.update(&current_targets());
+            assert!(
+                rewatched.errors.is_empty() && rewatched.added,
+                "the recreated directory is watched again and must be scanned"
+            );
             let file = temp.write("tb/new.vhd", "");
             assert!(
                 reported(&mut watcher, &mut events, created, &file).await,
