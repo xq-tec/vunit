@@ -13,6 +13,15 @@
 //! Latin-1 characters Python matches for them. Word boundaries (`\b`) only treat ASCII
 //! characters as word characters, unlike Python.
 //!
+//! Component instantiations deviate from VUnit. The regular expression stops at the opening
+//! parenthesis of the first generic or port map instead of matching the map body, so maps
+//! with extended identifiers, string literals or operators don't hide an instantiation. The
+//! component name may have up to two prefixes (`pkg.comp`, `lib.pkg.comp`), and
+//! `lib.pkg.comp` also counts as a `use lib.pkg.comp` reference. An instantiation without
+//! maps is found only with the `component` keyword, since `label : comp;` looks like an
+//! object declaration. An incremental binding indication (`for u : comp port map (…);`)
+//! isn't taken for an instantiation.
+//!
 //! Not ported: parsing of enumeration, record and array types in packages. VUnit only uses
 //! them for com codec generation, which isn't supported.
 //!
@@ -24,6 +33,7 @@ use std::sync::LazyLock;
 use regex::bytes::Captures;
 use regex::bytes::Regex;
 use regex::bytes::RegexBuilder;
+use rustc_hash::FxHashSet;
 use serde::Deserialize;
 use serde::Serialize;
 use thiserror::Error;
@@ -49,8 +59,11 @@ pub struct VhdlDesignFile {
     pub package_bodies: Vec<VhdlPackageBody>,
     /// Context declarations.
     pub contexts: Vec<VhdlContext>,
-    /// Names of instantiated components.
-    pub component_instantiations: Vec<String>,
+    /// Component instantiations, in source order.
+    ///
+    /// Only instantiations with a generic or port map, or with the `component` keyword, are
+    /// found.
+    pub component_instantiations: Vec<VhdlComponentInstantiation>,
     /// Configuration declarations.
     pub configurations: Vec<VhdlConfiguration>,
     /// References to other design units.
@@ -108,6 +121,17 @@ pub type VhdlContext = VhdlNamedUnit;
 
 /// A configuration declaration of an entity.
 pub type VhdlConfiguration = VhdlEntityUnit;
+
+/// A component instantiation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VhdlComponentInstantiation {
+    /// The lowercase simple name of the component.
+    pub component: String,
+    /// For `lib.pkg.comp`, the lowercase library name, possibly `work`.
+    pub library: Option<String>,
+    /// For `pkg.comp` and `lib.pkg.comp`, the lowercase package name.
+    pub package: Option<String>,
+}
 
 /// A generic or port of an entity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -205,7 +229,7 @@ pub struct ParseError(String);
 ///
 /// Persistent parse caches with another version are discarded, so increment it whenever the
 /// parser's results change.
-pub const PARSER_VERSION: u32 = 1;
+pub const PARSER_VERSION: u32 = 2;
 
 impl VhdlDesignFile {
     /// Parses the raw (Latin-1) contents of a VHDL file.
@@ -285,10 +309,7 @@ impl VhdlDesignFile {
             })
             .collect();
 
-        let component_instantiations = COMPONENT_RE
-            .captures_iter(&code)
-            .map(|captures| group(&captures, "component"))
-            .collect();
+        let component_instantiations = find_component_instantiations(&code);
 
         let configurations = CONFIGURATION_RE
             .captures_iter(&code)
@@ -299,6 +320,9 @@ impl VhdlDesignFile {
             })
             .collect();
 
+        let mut references = find_references(&code);
+        references.extend(component_package_references(&component_instantiations));
+
         Ok(Self {
             entities,
             architectures,
@@ -307,7 +331,7 @@ impl VhdlDesignFile {
             contexts,
             component_instantiations,
             configurations,
-            references: find_references(&code),
+            references,
             tests,
         })
     }
@@ -422,9 +446,30 @@ fn escape_bytes(bytes: &[u8]) -> String {
 static COMMENT_RE: LazyLock<Regex> =
     LazyLock::new(|| python_regex(r#"(?:(?:"[^"]*")|(--[^\n]*))"#, MULTILINE));
 
-static COMPONENT_RE: LazyLock<Regex> = LazyLock::new(|| {
+/// The component name of an instantiation, with up to two prefixes.
+const COMPONENT_NAME_PATTERN: &str = r"(?:<ID>)(?:\.(?:<ID>)){0,2}";
+
+/// A component instantiation with a generic or port map, up to the map's opening parenthesis.
+///
+/// It also matches the `for` and instantiation list of a configuration specification or
+/// component configuration with an incremental binding indication (`for u1, u2 : comp port
+/// map (`, IEEE 1076-2008 §7.3.2.1), which [`parse_component_instantiation`] drops.
+///
+/// The expressions have no capture groups, because resolving them costs five times as much
+/// as the search in large netlists; [`parse_component_instantiation`] splits the match.
+static COMPONENT_WITH_MAP_RE: LazyLock<Regex> = LazyLock::new(|| {
     python_regex(
-        r#"(?:<ID>)\s*:\s*(?:component)?\s*(?:(?:<ID>)\.)?(?P<component><ID>)\s*(?:generic|port) map\s*\([\s\w=>,.)(+\-*/'"]*\);"#,
+        &format!(
+            r"(?:\bfor\s+(?:(?:<ID>)\s*,\s*)*)?(?:<ID>)\s*:\s*(?:component\b\s*)?{COMPONENT_NAME_PATTERN}\s*(?:generic|port)\s+map\s*\("
+        ),
+        NO_FLAGS,
+    )
+});
+
+/// A component instantiation without maps, which needs the `component` keyword.
+static COMPONENT_WITHOUT_MAP_RE: LazyLock<Regex> = LazyLock::new(|| {
+    python_regex(
+        &format!(r"(?:<ID>)\s*:\s*component\b\s*{COMPONENT_NAME_PATTERN}\s*;"),
         NO_FLAGS,
     )
 });
@@ -572,6 +617,27 @@ fn group(captures: &Captures<'_>, name: &str) -> String {
 
 fn optional_group(captures: &Captures<'_>, name: &str) -> Option<String> {
     captures.name(name).map(|found| latin1(found.as_bytes()))
+}
+
+/// Python's `\w` for Latin-1 text, like [`WORD_CLASS`].
+const fn is_python_word(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'0'..=b'9'
+            | b'A'..=b'Z'
+            | b'a'..=b'z'
+            | b'_'
+            | 0xAA
+            | 0xB2
+            | 0xB3
+            | 0xB5
+            | 0xB9
+            | 0xBA
+            | 0xBC..=0xBE
+            | 0xC0..=0xD6
+            | 0xD8..=0xF6
+            | 0xF8..=0xFF
+    )
 }
 
 /// Whitespace as Python's `str.strip()` and `str.split()` see it in Latin-1 text.
@@ -796,6 +862,138 @@ fn parse_subtype_indication(code: &[u8]) -> Option<VhdlSubtypeIndication> {
         constraint: optional_group(&captures, "constraint"),
         array_type,
     })
+}
+
+/// Finds the component instantiations, in source order.
+fn find_component_instantiations(code: &[u8]) -> Vec<VhdlComponentInstantiation> {
+    let mut found: Vec<(usize, &[u8], bool)> = COMPONENT_WITH_MAP_RE
+        .find_iter(code)
+        .map(|found| (found.start(), found.as_bytes(), false))
+        .chain(
+            COMPONENT_WITHOUT_MAP_RE
+                .find_iter(code)
+                .map(|found| (found.start(), found.as_bytes(), true)),
+        )
+        .collect();
+    found.sort_by_key(|&(start, _, _)| start);
+    found
+        .into_iter()
+        .filter_map(|(_, matched, keyword)| parse_component_instantiation(matched, keyword))
+        .collect()
+}
+
+/// Splits a match of [`COMPONENT_WITH_MAP_RE`] or [`COMPONENT_WITHOUT_MAP_RE`].
+///
+/// `keyword` says whether the match has the `component` keyword for sure. Otherwise a leading
+/// `component` is the keyword if, like in the regular expression, a name and a map follow it.
+/// A match that starts with `for`, a reserved word, belongs to a configuration specification
+/// or component configuration and gives `None`.
+fn parse_component_instantiation(
+    matched: &[u8],
+    keyword: bool,
+) -> Option<VhdlComponentInstantiation> {
+    let label_end = identifier_end(matched, 0)?;
+    if &matched[..label_end] == b"for" {
+        return None;
+    }
+    let colon = skip_python_space(matched, label_end);
+    let name_start = skip_python_space(matched, colon + 1);
+    let mut names = dotted_name(matched, name_start);
+    if let [(start, end)] = names[..]
+        && &matched[start..end] == b"component"
+    {
+        let after_keyword = dotted_name(matched, skip_python_space(matched, end));
+        let map_follows = after_keyword
+            .last()
+            .map(|&(_, name_end)| &matched[skip_python_space(matched, name_end)..])
+            .is_some_and(|rest| rest.starts_with(b"generic") || rest.starts_with(b"port"));
+        if keyword || map_follows {
+            names = after_keyword;
+        }
+    }
+    let name = |index: usize| -> Option<String> {
+        names
+            .get(index)
+            .map(|&(start, end)| latin1(&matched[start..end]))
+    };
+    let (library, package, component) = match names.len() {
+        1 => (None, None, name(0)?),
+        2 => (None, name(0), name(1)?),
+        3 => (name(0), name(1), name(2)?),
+        _ => return None,
+    };
+    Some(VhdlComponentInstantiation {
+        component,
+        library,
+        package,
+    })
+}
+
+/// Returns the spans of the identifiers of a dotted name that starts at `start`.
+fn dotted_name(code: &[u8], start: usize) -> Vec<(usize, usize)> {
+    let mut names = Vec::new();
+    let mut position = start;
+    while let Some(end) = identifier_end(code, position) {
+        names.push((position, end));
+        if code.get(end) != Some(&b'.') {
+            break;
+        }
+        position = end + 1;
+    }
+    names
+}
+
+/// Returns the end of the identifier (as in [`ID_PATTERN`]) that starts at `start`, if any.
+fn identifier_end(code: &[u8], start: usize) -> Option<usize> {
+    match *code.get(start)? {
+        b'\\' => {
+            let length = code[start + 1..]
+                .iter()
+                .position(|&byte| matches!(byte, b'\\' | b'\n' | b'\r'))?;
+            (length > 0 && code[start + 1 + length] == b'\\').then_some(start + length + 2)
+        },
+        first if first.is_ascii_alphabetic() => Some(
+            code[start..]
+                .iter()
+                .position(|&byte| !is_python_word(byte))
+                .map_or(code.len(), |length| start + length),
+        ),
+        _ => None,
+    }
+}
+
+/// Returns the offset of the first non-whitespace byte at or after `start`.
+fn skip_python_space(code: &[u8], start: usize) -> usize {
+    code[start.min(code.len())..]
+        .iter()
+        .position(|&byte| !is_python_space(byte))
+        .map_or(code.len(), |length| start + length)
+}
+
+/// Returns a package reference for each distinct `lib.pkg.comp` instantiation.
+///
+/// Analyzing the file needs `lib.pkg`, as for `use lib.pkg.comp`.
+fn component_package_references(
+    instantiations: &[VhdlComponentInstantiation],
+) -> Vec<VhdlReference> {
+    let mut seen = FxHashSet::default();
+    let mut references = Vec::new();
+    for instantiation in instantiations {
+        let (Some(library), Some(package)) = (&instantiation.library, &instantiation.package)
+        else {
+            continue;
+        };
+        let reference = VhdlReference::new(
+            ReferenceType::Package,
+            library,
+            package,
+            Some(&instantiation.component),
+        );
+        if seen.insert(reference.clone()) {
+            references.push(reference);
+        }
+    }
+    references
 }
 
 fn find_references(code: &[u8]) -> Vec<VhdlReference> {

@@ -492,10 +492,165 @@ end architecture;
 
 "#,
     );
+    assert_eq!(component_names(&design_file), ["foo", "foo2", "foo3"]);
+}
+
+fn component_names(design_file: &VhdlDesignFile) -> Vec<&str> {
+    design_file
+        .component_instantiations
+        .iter()
+        .map(|instantiation| instantiation.component.as_str())
+        .collect()
+}
+
+/// Parses `statements` as the statement part of an architecture.
+fn parse_statements(statements: &str) -> VhdlDesignFile {
+    parse(&format!(
+        "architecture arch of top is\nbegin\n{statements}\nend architecture;\n"
+    ))
+}
+
+#[test]
+fn component_instantiation_with_extended_identifiers_and_special_characters() {
+    let design_file = parse_statements(
+        r#"
+    \label 1\ : comp
+    generic map (INIT => X"0123_ABCD", NAME => "a" & "b;c")
+    port map (
+        \^x\ => \sig:1\,
+        b => ';',
+        c => d(1) & e(0),
+        f => g(1 to 2),
+        h => 16#ff#
+    );
+"#,
+    );
+    assert_eq!(component_names(&design_file), ["comp"]);
+}
+
+#[test]
+fn component_instantiation_with_library_and_package_prefix() {
+    let design_file = parse_statements(
+        "\
+    g1 : unisim.vcomponents.GND port map (G => g1_out);
+    g2 : unisim.vcomponents.gnd port map (G => g2_out);
+",
+    );
+    let expected = VhdlComponentInstantiation {
+        component: "gnd".to_owned(),
+        library: Some("unisim".to_owned()),
+        package: Some("vcomponents".to_owned()),
+    };
     assert_eq!(
         design_file.component_instantiations,
-        ["foo", "foo2", "foo3"]
+        [expected.clone(), expected]
     );
+    let component_references: Vec<&VhdlReference> = design_file
+        .references
+        .iter()
+        .filter(|reference| reference.library == "unisim")
+        .collect();
+    assert_eq!(
+        component_references,
+        [&VhdlReference::new(
+            ReferenceType::Package,
+            "unisim",
+            "vcomponents",
+            Some("gnd")
+        )]
+    );
+}
+
+#[test]
+fn component_instantiation_with_package_prefix() {
+    let design_file = parse_statements("    u : pkg.comp port map (a => b);\n");
+    assert_eq!(
+        design_file.component_instantiations,
+        [VhdlComponentInstantiation {
+            component: "comp".to_owned(),
+            library: None,
+            package: Some("pkg".to_owned()),
+        }]
+    );
+    assert!(design_file.references.is_empty());
+}
+
+#[test]
+fn component_instantiation_with_whitespace_in_map_keywords() {
+    let design_file = parse_statements(
+        "\
+    u1 : comp1 port   map (a => b);
+    u2 : comp2 generic
+    map (N => 1) port map (a => b);
+",
+    );
+    assert_eq!(component_names(&design_file), ["comp1", "comp2"]);
+}
+
+#[test]
+fn component_instantiation_without_maps_needs_component_keyword() {
+    let design_file = parse(
+        "\
+architecture arch of top is
+    signal s : comp;
+begin
+    u : component comp;
+    v : component lib.pkg.other ;
+end architecture;
+",
+    );
+    assert_eq!(component_names(&design_file), ["comp", "other"]);
+}
+
+#[test]
+fn component_keyword_before_extended_identifier() {
+    let design_file = parse_statements(r"    \u 1\ : component\my comp\ port map (a => b);");
+    assert_eq!(component_names(&design_file), [r"\my comp\"]);
+}
+
+#[test]
+fn entity_instantiation_and_configuration_specification_are_not_components() {
+    let design_file = parse(
+        "\
+architecture arch of top is
+    for all : comp use entity work.e;
+    for u2 : comp use entity work.e port map (a => b);
+    for u3 : comp generic map (N => 2);
+    for u4, \\u 5\\ : comp port map (a => c);
+begin
+    u : entity work.e port map (a => b);
+    v : entity work.e(rtl) generic map (N => 1);
+    w : configuration work.cfg port map (a => b);
+end architecture;
+
+configuration cfg of top is
+    for arch
+        for u6 : comp
+            generic map (N => 3);
+        end for;
+    end for;
+end configuration;
+",
+    );
+    assert!(design_file.component_instantiations.is_empty());
+}
+
+#[test]
+fn component_instantiations_with_and_without_maps_are_in_source_order() {
+    let design_file = parse_statements(
+        "\
+    a : component x;
+    b : y port map (q => r);
+    c : component z;
+",
+    );
+    assert_eq!(component_names(&design_file), ["x", "y", "z"]);
+}
+
+#[test]
+fn component_instantiation_with_generic_and_port_map_is_found_once() {
+    let design_file = parse_statements("    u : comp generic map (N => 1) port map (a => b);\n");
+    assert_eq!(component_names(&design_file), ["comp"]);
 }
 
 #[test]

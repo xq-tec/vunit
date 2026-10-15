@@ -781,10 +781,14 @@ end architecture;
         "comp1_arch.vhd",
         "architecture arch of foo is\nbegin\nend architecture;\n",
     );
-    assert_eq!(
-        test.project.file(top).component_instantiations(),
-        ["foo", "foo2"]
-    );
+    let components: Vec<&str> = test
+        .project
+        .file(top)
+        .component_instantiations()
+        .iter()
+        .map(|instantiation| instantiation.component.as_str())
+        .collect();
+    assert_eq!(components, ["foo", "foo2"]);
     let order = test.compile_order_of(&[top]);
     assert!(order.contains(&comp1));
     assert!(order.contains(&comp1_arch));

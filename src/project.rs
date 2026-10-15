@@ -28,6 +28,7 @@ use crate::diagnostics::Diagnostic;
 use crate::diagnostics::Range;
 use crate::sources::ContentHash;
 use crate::vhdl_parser::ReferenceType;
+use crate::vhdl_parser::VhdlComponentInstantiation;
 use crate::vhdl_parser::VhdlDesignFile;
 use crate::vhdl_parser::VhdlReference;
 use crate::vhdl_standard::VhdlStandard;
@@ -138,8 +139,8 @@ pub struct SourceFile {
 }
 
 impl SourceFile {
-    /// Names of the instantiated components.
-    pub fn component_instantiations(&self) -> &[String] {
+    /// The component instantiations, in source order.
+    pub fn component_instantiations(&self) -> &[VhdlComponentInstantiation] {
         self.design_file
             .as_ref()
             .map_or(&[], |design_file| &design_file.component_instantiations)
@@ -651,7 +652,8 @@ impl Project {
     fn component_dependencies(&self, file: &SourceFile) -> Vec<FileId> {
         let library = self.library(file.library);
         let mut result = Vec::new();
-        for component in file.component_instantiations() {
+        for instantiation in file.component_instantiations() {
+            let component = instantiation.component.as_str();
             if let Some(primary) = library.primary_unit(component) {
                 result.push(primary.file);
                 result.extend(library.architectures(component).iter().map(|&(_, id)| id));
