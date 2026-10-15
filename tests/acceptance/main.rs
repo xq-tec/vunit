@@ -3,7 +3,8 @@
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
 //! Acceptance tests: real projects compiled and simulated with risim-ghdl through the workspace
-//! API, ported from VUnit's `tests/acceptance` and the `run.py` scripts of its VHDL libraries.
+//! API, mostly ported from VUnit's `tests/acceptance` and the `run.py` scripts of its VHDL
+//! libraries.
 //!
 //! The trials use the risim-ghdl named by `RISIM_GHDL` and are ignored without it. Every trial
 //! also runs on the `risim` backend as `<name>_risim`, with the risim-runner named by
@@ -13,6 +14,7 @@
 //! AI NOTICE: Generated, minimally reviewed.
 
 mod artificial;
+mod component_binding;
 mod dependencies;
 mod harness;
 #[path = "../common/trial.rs"]
@@ -31,6 +33,7 @@ fn main() -> ExitCode {
     let args = Arguments::from_args();
     let trials = [
         trials("artificial_vhdl", artificial::artificial),
+        trials("component_binding", component_binding::component_binding),
         trials(
             "package_body_dependencies",
             dependencies::package_body_dependencies,

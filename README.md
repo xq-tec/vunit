@@ -93,7 +93,7 @@ cargo test
 ```
 
 - The unit tests and the `operations` integration tests need no simulator. The `operations` test binary doubles as a fake `risim-ghdl` and a fake risim-runner.
-- The `acceptance` tests run VUnit's acceptance projects and the test benches of the VUnit VHDL libraries with a real simulator. They are skipped unless `RISIM_GHDL` names a `risim-ghdl` executable. Every trial also runs on the `risim` backend as `<name>_risim`, which is skipped unless `RISIM_RUNNER` names a risim-runner executable too:
+- The `acceptance` tests run VUnit's acceptance projects, the test benches of the VUnit VHDL libraries and a few fixtures of riSim's own with a real simulator. They are skipped unless `RISIM_GHDL` names a `risim-ghdl` executable. Every trial also runs on the `risim` backend as `<name>_risim`, which is skipped unless `RISIM_RUNNER` names a risim-runner executable too:
 
   ```sh
   RISIM_GHDL=/path/to/risim-ghdl RISIM_RUNNER=/path/to/risim cargo test --test acceptance
