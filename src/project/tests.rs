@@ -1081,3 +1081,248 @@ fn file_standard_defaults_to_library_standard() {
         VhdlStandard::Vhdl2019
     );
 }
+
+const CELLS_PKG: &str = "\
+library ieee;
+use ieee.std_logic_1164.all;
+
+package cells_pkg is
+  component cell is
+    port (q : out std_logic);
+  end component;
+end package;
+";
+
+const CELL_ENTITY: &str = "\
+library ieee;
+use ieee.std_logic_1164.all;
+
+entity cell is
+  port (q : out std_logic);
+end entity;
+";
+
+const CELL_ARCHITECTURE: &str = "\
+architecture rtl of cell is
+begin
+  q <= '1';
+end architecture;
+";
+
+/// A project with library `cells` holding `cells_pkg`, entity `cell` and its architecture in
+/// separate files, and an empty library `top`.
+struct CellsProject {
+    test: TestProject,
+    cells_pkg: FileId,
+    cell: FileId,
+    cell_architecture: FileId,
+}
+
+impl CellsProject {
+    fn new() -> Self {
+        let mut test = TestProject::new();
+        test.add_library("cells");
+        test.add_library("top");
+        let cells_pkg = test.add("cells", "cells_pkg.vhd", CELLS_PKG);
+        let cell = test.add("cells", "cell.vhd", CELL_ENTITY);
+        let cell_architecture = test.add("cells", "cell_rtl.vhd", CELL_ARCHITECTURE);
+        Self {
+            test,
+            cells_pkg,
+            cell,
+            cell_architecture,
+        }
+    }
+
+    /// Adds `top.vhd` to library `top`, with `context` before entity `top` and an architecture
+    /// that instantiates `component`.
+    fn add_top(&mut self, context: &str, component: &str) -> FileId {
+        self.test
+            .add("top", "top.vhd", &top_code(context, component))
+    }
+
+    /// Adds another entity `cell` and its architecture to `library`, and returns their files.
+    fn add_other_cell(&mut self, library: &str) -> [FileId; 2] {
+        [
+            self.test.add(library, "other_cell.vhd", CELL_ENTITY),
+            self.test
+                .add(library, "other_cell_rtl.vhd", CELL_ARCHITECTURE),
+        ]
+    }
+
+    /// Whether the compile set of `target` contains all of `files`.
+    fn includes_all(&self, target: FileId, files: &[FileId]) -> bool {
+        let order = self.test.compile_order_of(&[target]);
+        files.iter().all(|file| order.contains(file))
+    }
+
+    /// Whether the compile set of `target` contains `cells.cell` and its architecture.
+    ///
+    /// Panics if it contains only one of them.
+    fn includes_cell(&self, target: FileId) -> bool {
+        let order = self.test.compile_order_of(&[target]);
+        let cell = order.contains(&self.cell);
+        assert_eq!(cell, order.contains(&self.cell_architecture));
+        cell
+    }
+}
+
+fn top_code(context: &str, component: &str) -> String {
+    format!(
+        "\
+library ieee;
+use ieee.std_logic_1164.all;
+{context}
+entity top is
+end entity;
+
+architecture arch of top is
+  signal q : std_logic;
+begin
+  u : {component} port map (q => q);
+end architecture;
+"
+    )
+}
+
+#[test]
+fn component_is_found_through_used_package() {
+    let mut cells = CellsProject::new();
+    let top = cells.add_top("library cells;\nuse cells.cells_pkg.all;", "cell");
+    assert!(cells.includes_cell(top));
+}
+
+#[test]
+fn component_is_found_through_used_library() {
+    let mut cells = CellsProject::new();
+    let top = cells.add_top("library cells;\nuse cells.all;", "cell");
+    assert!(cells.includes_cell(top));
+}
+
+#[test]
+fn component_is_found_through_context_reference() {
+    let mut cells = CellsProject::new();
+    cells.test.add_library("ctxs");
+    cells.test.add(
+        "ctxs",
+        "cells_ctx.vhd",
+        "context cells_ctx is\n  library cells;\n  use cells.cells_pkg.all;\nend context;\n",
+    );
+    let top = cells.add_top("library ctxs;\ncontext ctxs.cells_ctx;", "cell");
+    assert!(cells.includes_cell(top));
+}
+
+#[test]
+fn component_is_found_through_nested_context_reference() {
+    let mut cells = CellsProject::new();
+    cells.test.add_library("ctxs");
+    cells.test.add(
+        "ctxs",
+        "cells_ctx.vhd",
+        "context cells_ctx is\n  library cells;\n  use cells.cells_pkg.all;\nend context;\n",
+    );
+    cells.test.add(
+        "ctxs",
+        "outer_ctx.vhd",
+        // A context declaration can't refer to `work` (IEEE 1076-2008 §13.3).
+        "context outer_ctx is\n  library ctxs;\n  context ctxs.cells_ctx;\nend context;\n",
+    );
+    let top = cells.add_top("library ctxs;\ncontext ctxs.outer_ctx;", "cell");
+    assert!(cells.includes_cell(top));
+}
+
+#[test]
+fn component_is_found_through_context_of_primary_unit() {
+    let mut cells = CellsProject::new();
+    cells.test.add(
+        "top",
+        "top_entity.vhd",
+        "library cells;\nuse cells.cells_pkg.all;\n\nentity top is\nend entity;\n",
+    );
+    let architecture = cells.test.add(
+        "top",
+        "top_arch.vhd",
+        "\
+architecture arch of top is
+begin
+  u : cell port map (q => open);
+end architecture;
+",
+    );
+    assert!(cells.includes_cell(architecture));
+}
+
+#[test]
+fn component_with_library_and_package_prefix_is_found() {
+    let mut cells = CellsProject::new();
+    let top = cells.add_top("library cells;", "cells.cells_pkg.cell");
+    assert!(cells.includes_cell(top));
+    // The prefix is also a reference to the package.
+    cells.test.assert_compiles(cells.cells_pkg, top);
+}
+
+#[test]
+fn component_with_library_and_package_prefix_also_matches_visible_entity() {
+    let mut cells = CellsProject::new();
+    cells.test.add_library("other");
+    let other_cell = cells.add_other_cell("other");
+    let top = cells.add_top(
+        "library cells, other;\nuse other.all;",
+        "cells.cells_pkg.cell",
+    );
+    assert!(cells.includes_cell(top));
+    // `use other.all` makes `other.cell` directly visible, so default binding prefers it.
+    assert!(cells.includes_all(top, &other_cell));
+}
+
+#[test]
+fn component_with_work_prefix_is_found_in_own_library() {
+    let mut cells = CellsProject::new();
+    cells.test.add("top", "own_pkg.vhd", CELLS_PKG);
+    let own_cell = cells.add_other_cell("top");
+    let top = cells.add_top("library cells;", "work.cells_pkg.cell");
+    assert!(cells.includes_all(top, &own_cell));
+    // A library clause alone doesn't make `cells` visible.
+    assert!(!cells.includes_cell(top));
+}
+
+#[test]
+fn component_with_package_prefix_matches_entities_in_own_and_used_library() {
+    let mut cells = CellsProject::new();
+    let own_cell = cells.add_other_cell("top");
+    let top = cells.add_top("library cells;\nuse cells.cells_pkg.all;", "cells_pkg.cell");
+    assert!(cells.includes_cell(top));
+    assert!(cells.includes_all(top, &own_cell));
+}
+
+#[test]
+fn component_does_not_match_package() {
+    let mut cells = CellsProject::new();
+    cells.test.add_library("pkgs");
+    let package = cells
+        .test
+        .add("pkgs", "cell_pkg.vhd", "package cell is\nend package;\n");
+    let top = cells.add_top("library pkgs;\nuse pkgs.all;", "cell");
+    assert!(!cells.test.compile_order_of(&[top]).contains(&package));
+}
+
+#[test]
+fn component_is_not_found_through_context_of_used_package() {
+    let mut cells = CellsProject::new();
+    cells.test.add(
+        "top",
+        "p.vhd",
+        "library cells;\nuse cells.cells_pkg.all;\n\npackage p is\nend package;\n",
+    );
+    let top = cells.add_top("use work.p.all;", "cell");
+    assert!(!cells.includes_cell(top));
+}
+
+#[test]
+fn component_matches_entities_in_own_and_used_library() {
+    let mut cells = CellsProject::new();
+    let own_cell = cells.add_other_cell("top");
+    let top = cells.add_top("library cells;\nuse cells.cells_pkg.all;", "cell");
+    assert!(cells.includes_cell(top));
+    assert!(cells.includes_all(top, &own_cell));
+}

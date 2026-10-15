@@ -9,6 +9,9 @@
 //!
 //! - An ambiguous direct entity instantiation is reported as a diagnostic instead of aborting.
 //! - Missing libraries, units and architectures are only logged, as in VUnit.
+//! - A component instantiation matches entities with the component's name in all libraries
+//!   that the file's context clauses make visible, not only in the file's own library. Other
+//!   primary units with that name don't match. See `Project::component_dependencies`.
 //! - Recompilation isn't decided here (see the `compile` module).
 //!
 //! AI NOTICE: Generated, minimally reviewed.
@@ -471,8 +474,9 @@ impl Project {
     /// Builds the dependency graph between files (`Project.create_dependency_graph`).
     ///
     /// With `implementation_dependencies`, users of a package also depend on its body, users of
-    /// an entity on all its architectures, and component instantiations on the matching entity
-    /// and its architectures. This is the graph for deciding which files a testbench needs.
+    /// an entity on all its architectures, and component instantiations on matching entities in
+    /// the visible libraries and their architectures. This is the graph for deciding which files
+    /// a testbench needs.
     pub fn dependency_graph(&self, implementation_dependencies: bool) -> DependencyAnalysis {
         let mut analysis = DependencyAnalysis {
             graph: DependencyGraph::new(),
@@ -497,7 +501,7 @@ impl Project {
         }
         if implementation_dependencies {
             for (id, file) in self.files() {
-                for dependency in self.component_dependencies(file) {
+                for dependency in self.component_dependencies(id, file) {
                     self.add_dependency(&mut analysis.graph, dependency, id);
                 }
             }
@@ -648,20 +652,105 @@ impl Project {
             .collect()
     }
 
-    /// `_find_component_design_unit_dependencies`.
-    fn component_dependencies(&self, file: &SourceFile) -> Vec<FileId> {
-        let library = self.library(file.library);
+    /// `_find_component_design_unit_dependencies`, extended to the libraries of the visible
+    /// context.
+    ///
+    /// A component matches an entity with its simple name, together with all the entity's
+    /// architectures, in every library of [`Self::visible_libraries`]. This holds for `pkg.comp`
+    /// and `lib.pkg.comp` too, because default binding first looks for a visible entity with
+    /// the component's simple name (IEEE 1076-2008 §7.3.3 a, b). Their package and library are
+    /// visible anyway: `pkg` through a `use` clause, and `lib` through the package reference the
+    /// parser adds for `lib.pkg.comp`. Other primary units with the component's name don't
+    /// match.
+    fn component_dependencies(&self, file_id: FileId, file: &SourceFile) -> Vec<FileId> {
+        let instantiations = file.component_instantiations();
+        if instantiations.is_empty() {
+            return Vec::new();
+        }
+        let libraries = self.visible_libraries(file_id, file);
         let mut result = Vec::new();
-        for instantiation in file.component_instantiations() {
+        for instantiation in instantiations {
             let component = instantiation.component.as_str();
-            if let Some(primary) = library.primary_unit(component) {
-                result.push(primary.file);
-                result.extend(library.architectures(component).iter().map(|&(_, id)| id));
-            } else {
-                tracing::debug!(%component, "failed to find a matching entity for component");
+            let mut found = false;
+            for &library_id in &libraries {
+                let library = self.library(library_id);
+                if let Some(primary) = library.primary_unit(component)
+                    && primary.kind == UnitKind::Entity
+                {
+                    found = true;
+                    result.push(primary.file);
+                    result.extend(library.architectures(component).iter().map(|&(_, id)| id));
+                }
+            }
+            if !found {
+                tracing::debug!(
+                    file = %file.path,
+                    %component,
+                    "failed to find a matching entity for component"
+                );
             }
         }
         result
+    }
+
+    /// Collects the source libraries that the context clauses of `file` make visible.
+    ///
+    /// The result starts with the file's own library, followed by every other non-external
+    /// library named in a `use` clause or context reference, in first-reference order. The
+    /// context clauses are those of the file itself, of the files with the primary units of its
+    /// secondary units, and, transitively, of the files with the context declarations they
+    /// reference. `use` clauses inside used packages don't count (IEEE 1076-2008 §12.4,
+    /// NOTE 2). Like the rest of the parser, this works per file, not per design unit.
+    fn visible_libraries(&self, file_id: FileId, file: &SourceFile) -> Vec<LibraryId> {
+        let own_library = self.library(file.library);
+        let mut reference_lists: Vec<&[VhdlReference]> = vec![&file.dependencies];
+        // The primary unit of a secondary unit is often in the file itself.
+        let mut visited: FxHashSet<FileId> = FxHashSet::from_iter([file_id]);
+        for unit in file
+            .design_units
+            .iter()
+            .filter(|unit| !unit.kind.is_primary())
+        {
+            let primary_name = unit.primary_unit.as_deref().unwrap_or_default();
+            if let Some(primary) = own_library.primary_unit(primary_name)
+                && visited.insert(primary.file)
+            {
+                reference_lists.push(&self.file(primary.file).dependencies);
+            }
+        }
+
+        let mut libraries = vec![file.library];
+        let mut seen_libraries: FxHashSet<LibraryId> = FxHashSet::from_iter([file.library]);
+        let mut index = 0;
+        while let Some(&references) = reference_lists.get(index) {
+            index += 1;
+            for reference in references {
+                if !matches!(
+                    reference.reference_type,
+                    ReferenceType::Package | ReferenceType::Context
+                ) {
+                    continue;
+                }
+                let Some(library_id) = self.find_library(&reference.library) else {
+                    continue;
+                };
+                let library = self.library(library_id);
+                if library.is_external() {
+                    continue;
+                }
+                if seen_libraries.insert(library_id) {
+                    libraries.push(library_id);
+                }
+                if reference.reference_type == ReferenceType::Context
+                    && let Some(primary) = library.primary_unit(&reference.design_unit)
+                    && primary.kind == UnitKind::Context
+                    && visited.insert(primary.file)
+                {
+                    reference_lists.push(&self.file(primary.file).dependencies);
+                }
+            }
+        }
+        libraries
     }
 
     /// Returns the files to compile in compile order.
