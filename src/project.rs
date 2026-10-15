@@ -696,11 +696,15 @@ impl Project {
     /// Collects the source libraries that the context clauses of `file` make visible.
     ///
     /// The result starts with the file's own library, followed by every other non-external
-    /// library named in a `use` clause or context reference, in first-reference order. The
-    /// context clauses are those of the file itself, of the files with the primary units of its
+    /// library named in a package or context reference, in first-reference order. The context
+    /// clauses are those of the file itself, of the files with the primary units of its
     /// secondary units, and, transitively, of the files with the context declarations they
     /// reference. `use` clauses inside used packages don't count (IEEE 1076-2008 §12.4,
     /// NOTE 2). Like the rest of the parser, this works per file, not per design unit.
+    ///
+    /// Besides `use` clauses, package references come from `lib.pkg.comp` component
+    /// instantiations and from package instantiations. The latter don't make their library
+    /// visible, so they can add a library too many.
     fn visible_libraries(&self, file_id: FileId, file: &SourceFile) -> Vec<LibraryId> {
         let own_library = self.library(file.library);
         let mut reference_lists: Vec<&[VhdlReference]> = vec![&file.dependencies];

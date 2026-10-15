@@ -163,7 +163,8 @@ pub struct VhdlSubtypeIndication {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferenceType {
-    /// A `use` clause or a package instantiation.
+    /// A `use` clause, a package instantiation, or the prefix of a `lib.pkg.comp` component
+    /// instantiation.
     Package,
     /// A context reference.
     Context,
