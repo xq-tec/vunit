@@ -407,7 +407,7 @@ fn gui_requests_run_without_gui_on_a_backend_without_it() {
         .collect();
     assert_eq!(
         messages,
-        ["GUI mode isn't supported by the risim backend; running without it"]
+        ["GUI mode isn't supported by the simulation backend; running without it"]
     );
     let risim = Backend::Risim {
         runner: RisimRunner::from_version_output(Utf8Path::new("/bin/risim"), "risim-runner 0.1.0")
@@ -416,10 +416,38 @@ fn gui_requests_run_without_gui_on_a_backend_without_it() {
     };
     let command = plan.tests[0].command(&risim, "1").unwrap();
     assert_eq!(command[..2], ["/bin/risim", "run"]);
-    assert!(!command.iter().any(|arg| arg == "--wait"), "{command:?}");
+    assert!(
+        !command
+            .iter()
+            .any(|arg| arg == "--wait" || arg == "--paused"),
+        "{command:?}"
+    );
     assert_eq!(command.last().map(String::as_str), Some("tb_a(a)"));
 
     assert_eq!(fixture.plan(&[("*", false)]).diagnostics, []);
+}
+
+#[test]
+fn gui_requests_start_risim_paused() {
+    let mut fixture = Fixture::new();
+    fixture.add("/ws/tb_a.vhd", &testbench("tb_a", "", &["t1", "t2"]));
+    let plan = fixture.plan(&[("lib.tb_a.t1", true), ("lib.tb_a.t2", false)]);
+    assert_eq!(plan.diagnostics, []);
+    let risim = Backend::Risim {
+        runner: RisimRunner::from_version_output(Utf8Path::new("/bin/risim"), "risim-runner 0.1.0")
+            .unwrap(),
+        ghdl: simulator(),
+    };
+    assert!(risim.supports_gui());
+    let paused: Vec<bool> = plan
+        .tests
+        .iter()
+        .map(|test| {
+            let command = test.command(&risim, "1").unwrap();
+            command.iter().any(|arg| arg == "--paused")
+        })
+        .collect();
+    assert_eq!(paused, [true, false]);
 }
 
 // -------------------------------------------------------------------------------------------------

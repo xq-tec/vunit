@@ -383,7 +383,7 @@ impl SimulationPlan {
         let unsupported_gui = (!input.gui_supported && requests.iter().any(|request| request.gui))
             .then(|| {
                 Diagnostic::warning(
-                    "GUI mode isn't supported by the risim backend; running without it",
+                    "GUI mode isn't supported by the simulation backend; running without it",
                 )
             });
         let diagnostics = unmatched

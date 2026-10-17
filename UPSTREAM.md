@@ -66,7 +66,7 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - The compile set includes the files declaring the VHDL configurations the test runs elaborate. VUnit's `--minimal` compiles only the testbench files and their dependencies, which misses them.
 - Recompilation uses compile keys instead of timestamps. Independent libraries compile in parallel and continue after unrelated failures.
 - Duplicate tests, invalid attributes, and testbenches with no or several architectures disable only the affected testbench instead of aborting. Configuration errors (duplicate or empty names, invalid attributes) skip only that configuration.
-- A simulate request selects its backend: `ghdl` (`risim-ghdl --elab-run`) or `risim` (risim-runner). Both use the libraries analysed by risim-ghdl. The `risim` backend has no GUI mode, and its `sim_flags` are risim-runner options.
+- A simulate request selects its backend: `ghdl` (`risim-ghdl --elab-run`) or `risim` (risim-runner). Both use the libraries analysed by risim-ghdl. Both support GUI mode; the `risim` backend passes `--paused`, so its `sim_flags` must not also contain `--paused`, `--pause-after` or `--websocket=disable`. The `risim` backend's `sim_flags` are risim-runner options.
 - Testcase patterns are case-insensitive on all platforms (Python's `fnmatch` is case-insensitive only on Windows).
 - Compile and simulation processes run with the workspace root as working directory.
 - Files that are independent of each other compile in the order they were added. VUnit sorts them by path. Both orders respect the dependencies.

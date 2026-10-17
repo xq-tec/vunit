@@ -401,13 +401,15 @@ impl Backend {
     }
 
     /// Whether the backend can start a simulation paused, for a waveform viewer.
+    ///
+    /// risim-ghdl starts paused with `--wait`, risim-runner with `--paused`.
     pub const fn supports_gui(&self) -> bool {
-        matches!(self, Self::Ghdl(_))
+        match self {
+            Self::Ghdl(_) | Self::Risim { .. } => true,
+        }
     }
 
     /// The command line elaborating and running a testbench.
-    ///
-    /// The `risim` backend ignores [`SimulateArgs::wait`].
     ///
     /// # Errors
     ///
@@ -442,6 +444,9 @@ impl Backend {
                 command.push(format!("--assert-level={}", args.assert_level));
                 if args.disable_ieee_asserts {
                     command.push("--ieee-asserts=disable".to_owned());
+                }
+                if args.wait {
+                    command.push("--paused".to_owned());
                 }
                 command.push(format!("--name={}", args.name));
                 command.extend(args.sim_flags.iter().cloned());
@@ -700,7 +705,7 @@ mod tests {
         };
         assert_eq!(backend.kind(), SimulatorKind::Risim);
         assert_eq!(backend.program(), "/bin/risim");
-        assert!(!backend.supports_gui());
+        assert!(backend.supports_gui());
         let mut args = SimulateArgs {
             vhdl_standard: VhdlStandard::Vhdl2008,
             library: "lib",
@@ -711,7 +716,7 @@ mod tests {
                 entity: "tb".to_owned(),
                 architecture: "a".to_owned(),
             },
-            sim_flags: &["--stop-after=1ms".to_owned()],
+            sim_flags: &["--finish-after=1ms".to_owned()],
             generics: &generics,
             assert_level: AssertLevel::Error,
             disable_ieee_asserts: true,
@@ -735,8 +740,9 @@ mod tests {
                 "--generic=runner_cfg=x : y,z \"q\"",
                 "--assert-level=error",
                 "--ieee-asserts=disable",
+                "--paused",
                 "--name=lib.tb.test",
-                "--stop-after=1ms",
+                "--finish-after=1ms",
                 "tb(a)",
             ]
         );
@@ -747,6 +753,7 @@ mod tests {
         args.disable_ieee_asserts = false;
         args.elab_flags = &[];
         args.sim_flags = &[];
+        args.wait = false;
         let command = backend.simulate_command(&args).unwrap();
         assert_eq!(
             command[8..],
