@@ -14,10 +14,10 @@
 //!   files are read. The testcase list is maintained continuously; file changes never start a
 //!   compile.
 //! - **Operations:** a compile, or a simulate, which compiles first and then runs the matching
-//!   testcases on its backend. At most one compile runs per workspace. Requests arriving while a
-//!   compile runs are queued in order; a request merges into the last queued operation unless
-//!   both are simulates of different backends (see `operation.rs`). After its compile, a
-//!   simulate runs its tests while the next operation may already compile.
+//!   testcases. At most one compile runs per workspace. A request arriving while a compile runs
+//!   merges into the queued operation, if there is one (see `operation.rs`), so at most one
+//!   operation waits. After its compile, a simulate runs its tests while the next operation may
+//!   already compile.
 //! - **Cancel:** [`Workspace::cancel_all`] cancels the running compile, the queued operations,
 //!   and all running and waiting tests. [`Workspace::cancel`] cancels only what one request asked
 //!   for: an operation that serves other requests too keeps running for them.

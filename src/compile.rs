@@ -27,8 +27,9 @@
 //!   loads and saves the archives of the libraries; the reports are mapped back to the files by
 //!   their locations.
 //! - **Failures:** the transitive dependents of a failed file are skipped, also those in the
-//!   batch of the failed file, whose reports are dropped; all other files are still compiled. The stored keys of failed and cancelled files and of all their dependents
-//!   are removed, because the analysis may have made their units obsolete.
+//!   batch of the failed file, whose reports are dropped; all other files are still compiled.
+//!   The stored keys of failed and cancelled files and of all their dependents are removed,
+//!   because the analysis may have made their units obsolete.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 

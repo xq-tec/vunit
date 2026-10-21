@@ -140,7 +140,7 @@ pub enum LibrarySpec {
         /// The standard of the library's files, if it differs from the project's.
         vhdl_standard: Option<VhdlStandard>,
     },
-    /// A precompiled library. It is never compiled, only passed to the simulator with `-P`.
+    /// A precompiled library. It is never compiled, only passed to the simulator with `-L`.
     External {
         /// The library name.
         name: String,
