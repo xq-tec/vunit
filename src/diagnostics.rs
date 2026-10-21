@@ -263,6 +263,9 @@ impl ReportLine {
 pub struct AnalysisReport {
     /// The severity.
     pub severity: Severity,
+    /// The code, such as `type-mismatch`.
+    #[serde(default)]
+    pub code: Option<String>,
     /// The message.
     pub message: String,
     /// Where the problem is; absent for problems of a library or an archive.
@@ -454,6 +457,7 @@ mod tests {
             ),
             ReportLine::Diagnostic(AnalysisReport {
                 severity: Severity::Warning,
+                code: Some("x".to_owned()),
                 message: "m".to_owned(),
                 location: None,
                 notes: Vec::new(),

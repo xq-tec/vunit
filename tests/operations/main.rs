@@ -54,6 +54,7 @@ use risim_vunit_frontend::sources::SourceCache;
 use risim_vunit_frontend::spec::Feature;
 use risim_vunit_frontend::spec::ProjectSpec;
 use risim_vunit_frontend::store::CompileState;
+use risim_vunit_frontend::store::FileKey;
 use risim_vunit_frontend::store::OutputLayout;
 use risim_vunit_frontend::store::ResultStore;
 use risim_vunit_frontend::store::TestCounts;
@@ -86,6 +87,14 @@ fn main() -> ExitCode {
         trial(
             "files_of_a_library_compile_in_one_batch",
             files_of_a_library_compile_in_one_batch,
+        ),
+        trial(
+            "obsolete_reports_recompile_their_files",
+            obsolete_reports_recompile_their_files,
+        ),
+        trial(
+            "crash_fails_the_files_without_errors",
+            crash_fails_the_files_without_errors,
         ),
         trial("independent_libraries_compile_in_parallel", || {
             parallelism(4, true)
@@ -633,6 +642,91 @@ async fn files_of_a_library_compile_in_one_batch() {
     );
     workspace.compile(&mut state).await;
     assert_eq!(workspace.take_calls(), ["lib tb_top.vhd"]);
+}
+
+/// A report that a batch made a design unit of a file outside the batch obsolete is dropped,
+/// and that file loses its stored key, so that it is compiled again.
+async fn obsolete_reports_recompile_their_files() {
+    let mut workspace = Workspace::new().await;
+    workspace.standard_project();
+    let mut state = CompileState::default();
+    workspace.compile(&mut state).await;
+    // `unused.vhd` is outside the compile set; it was compiled by an earlier compile set.
+    let unused = FileKey::new("lib", &workspace.root.join("src/unused.vhd"));
+    let stored = state.files.values().next().expect("a stored file").clone();
+    state.files.insert(unused.clone(), stored);
+
+    workspace.write(
+        "src/pkg.vhd",
+        "-- fake: obsolete src/unused.vhd
+package pkg is end package;
+",
+    );
+    let compiled = workspace.compile(&mut state).await;
+    assert_eq!(compiled.report.status, CompileStatus::Succeeded);
+    assert!(
+        compiled.report.diagnostics.values().all(Vec::is_empty),
+        "{:?}",
+        compiled.report.diagnostics
+    );
+    assert!(!state.files.contains_key(&unused));
+    assert_eq!(state.files.len(), 3);
+}
+
+/// A batch whose process ends with another status than that of reported errors, such as a crash,
+/// fails its files without errors too.
+async fn crash_fails_the_files_without_errors() {
+    let mut workspace = Workspace::new().await;
+    workspace.write(
+        "src/a.vhd",
+        "-- fake: error broken
+package a is end package;
+",
+    );
+    workspace.write(
+        "src/b.vhd",
+        "-- fake: exit 101
+package b is end package;
+",
+    );
+    workspace.write(
+        "src/tb_ab.vhd",
+        &format!(
+            "use work.a.all;
+use work.b.all;
+{}",
+            testbench("tb_ab", "")
+        ),
+    );
+    workspace.spec.add_library("lib", ["src/*.vhd"]);
+    let mut state = CompileState::default();
+    let failed = workspace.compile(&mut state).await;
+    assert_eq!(workspace.take_calls(), ["lib a.vhd b.vhd tb_ab.vhd"]);
+    assert_eq!(
+        failed.statuses(),
+        [
+            ("a.vhd", FileStatus::Failed),
+            ("b.vhd", FileStatus::Failed),
+            ("tb_ab.vhd", FileStatus::Skipped),
+        ]
+    );
+    let b_messages: Vec<&str> = failed
+        .report
+        .diagnostics
+        .iter()
+        .filter(|(key, _)| key.as_str().ends_with("b.vhd"))
+        .flat_map(|(_, diagnostics)| {
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+        })
+        .collect();
+    assert_eq!(b_messages.len(), 1, "{b_messages:?}");
+    assert!(
+        b_messages[0].contains("risim analyze failed"),
+        "{b_messages:?}"
+    );
+    assert!(state.files.is_empty());
 }
 
 async fn parallelism(permits: usize, expect_overlap: bool) {

@@ -12,12 +12,14 @@
 //!   Files no testbench uses aren't compiled.
 //! - **Recompile decision:** every file gets a compile key, a Merkle-style hash over its
 //!   contents, standard, options, the simulator identity and the keys of its direct
-//!   dependencies. A file is compiled if its stored key differs, its library directory is
+//!   dependencies. A file is compiled if its stored key differs, its library archive is
 //!   missing, or one of its dependencies is compiled. A change anywhere upstream changes the keys
 //!   of all dependents. Compiling a file removes the stored keys of dependents outside the
 //!   compile set: risim analyses a dependent in another file again when it loads the archive,
 //!   and drops it if that fails (it is obsolete, LRM 13.5), or at the next load of its library if
-//!   it is in another one.
+//!   it is in another one. A file whose design unit `risim analyze` reports as obsolete loses its
+//!   stored key too, unless a later batch compiles it, also when the dependency graph doesn't
+//!   know the dependency; the report itself is dropped, because it is about another file.
 //! - **Scheduling:** libraries that depend on each other are merged into scheduling units. A
 //!   unit starts once the units it depends on have finished, and units run in parallel. Within
 //!   a unit, files compile in compile order. The consecutive files of one library that need
@@ -35,6 +37,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
@@ -131,7 +134,7 @@ pub struct PlannedFile {
     pub path: Utf8PathBuf,
     /// The compile key the file has now.
     pub compile_key: CompileKey,
-    /// Whether the file must be compiled: its stored compile key differs, its library directory
+    /// Whether the file must be compiled: its stored compile key differs, its library archive
     /// is missing, or a dependency must be compiled.
     pub needs_compile: bool,
     /// The standard of the file.
@@ -306,12 +309,12 @@ impl CompilePlan {
             let key = self.all_keys[&id].clone();
             let library_dir = input.layout.library_dir(library);
             // Recompiling a file may make its dependents obsolete, even if its compile key is
-            // unchanged, for example because its library directory was deleted.
+            // unchanged, for example because its library archive was deleted.
             let needs_compile = state
                 .files
                 .get(&key)
                 .is_none_or(|stored| stored.compile_key != compile_key)
-                || !library_dir.is_dir()
+                || !input.layout.library_archive(library).is_file()
                 || dependencies
                     .iter()
                     .any(|&dependency| self.files[dependency].needs_compile);
@@ -647,6 +650,12 @@ struct Shared {
     context: CompileContext,
     started: AtomicUsize,
     total: usize,
+    /// The number of batches started so far, which orders the batches of one library.
+    batches: AtomicUsize,
+    /// The files whose design units a batch reported as obsolete, with the number of the batch.
+    obsolete: Mutex<Vec<(FileKey, usize)>>,
+    /// The files that a batch compiled, with the number of the last such batch.
+    compiled_in: Mutex<FxHashMap<FileKey, usize>>,
 }
 
 struct FileResult {
@@ -687,6 +696,9 @@ pub async fn execute(
         context: context.clone(),
         started: AtomicUsize::new(0),
         total,
+        batches: AtomicUsize::new(0),
+        obsolete: Mutex::new(Vec::new()),
+        compiled_in: Mutex::new(FxHashMap::default()),
     });
     let plan = &shared.plan;
     let mut results: Vec<Option<FileResult>> = (0..plan.files.len()).map(|_| None).collect();
@@ -728,7 +740,27 @@ pub async fn execute(
         }
     }
 
-    finish(plan, results, state, project_diagnostics)
+    let report = finish(plan, results, state, project_diagnostics);
+    forget_obsolete(&shared, state);
+    report
+}
+
+/// Removes the stored keys of the files whose design units a batch reported as obsolete, unless
+/// a later batch compiled them, so that they are compiled again.
+fn forget_obsolete(shared: &Shared, state: &mut CompileState) {
+    let compiled_in = shared
+        .compiled_in
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let obsolete = shared
+        .obsolete
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (key, batch) in obsolete.iter() {
+        if compiled_in.get(key).is_none_or(|compiled| compiled < batch) {
+            state.files.remove(key);
+        }
+    }
 }
 
 type UnitResults = (usize, Vec<(usize, FileResult)>);
@@ -883,6 +915,10 @@ async fn run_unit(shared: &Shared, unit: usize, mut bad: FxHashSet<usize>) -> Un
     (unit, results)
 }
 
+/// The code of the warning of `risim analyze` about a design unit of another file that the
+/// call made obsolete.
+const OBSOLETE_DESIGN_UNIT: &str = "obsolete-design-unit";
+
 /// Whether `file` depends directly on one of the files `files`.
 fn depends_on(file: &PlannedFile, files: &FxHashSet<usize>) -> bool {
     file.dependencies
@@ -918,7 +954,8 @@ async fn compile_batch(shared: &Shared, batch: &[usize]) -> Vec<FileResult> {
         () = context.cancel.cancelled() => return not_started(),
     };
 
-    let mut output = BatchOutput::new(shared, batch);
+    let number = shared.batches.fetch_add(1, Ordering::Relaxed);
+    let mut output = BatchOutput::new(shared, batch, number);
     let first = output.files[0];
     output.start(0);
     let result = async {
@@ -945,6 +982,8 @@ async fn compile_batch(shared: &Shared, batch: &[usize]) -> Vec<FileResult> {
 /// The progress and the reports of a batch.
 struct BatchOutput<'a> {
     shared: &'a Shared,
+    /// The number of the batch ([`Shared::batches`]).
+    number: usize,
     /// The indices of the files into [`CompilePlan::files`].
     batch: &'a [usize],
     files: Vec<&'a PlannedFile>,
@@ -962,9 +1001,10 @@ struct BatchOutput<'a> {
 }
 
 impl<'a> BatchOutput<'a> {
-    fn new(shared: &'a Shared, batch: &'a [usize]) -> Self {
+    fn new(shared: &'a Shared, batch: &'a [usize], number: usize) -> Self {
         Self {
             shared,
+            number,
             batch,
             files: batch
                 .iter()
@@ -1011,6 +1051,20 @@ impl<'a> BatchOutput<'a> {
             .location
             .as_ref()
             .and_then(|location| location.path(root));
+        // A design unit of a file outside the batch that the batch made obsolete; that file is
+        // compiled again ([`forget_obsolete`]).
+        if report.code.as_deref() == Some(OBSOLETE_DESIGN_UNIT)
+            && let Some(path) = &report_path
+            && !self.files.iter().any(|file| file.path == *path)
+        {
+            let key = FileKey::new(&self.files[0].library, path);
+            self.shared
+                .obsolete
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((key, self.number));
+            return;
+        }
         // VUnit's and OSVVM's sources trigger warnings that users can't do anything about.
         if report.severity != Severity::Error
             && report_path
@@ -1058,12 +1112,15 @@ impl<'a> BatchOutput<'a> {
     /// Returns the results of the files after the process ended with `result`.
     ///
     /// A file that depends on a failed or skipped one of the batch is skipped, and its reports
-    /// are dropped. A failure of the process that no report explains fails every other file.
+    /// are dropped. A failure of the process that no report explains, or an exit status other
+    /// than 1, the status of reported errors, such as a crash, fails every file without errors.
     fn finish(mut self, result: &io::Result<process::Outcome>) -> Vec<FileResult> {
         let first = self.files[0];
         let failure = match result {
             Ok(process::Outcome::Exited(status))
-                if !status.success() && !self.diagnostics.iter().any(|file| has_errors(file)) =>
+                if !status.success()
+                    && (status.code() != Some(1)
+                        || !self.diagnostics.iter().any(|file| has_errors(file))) =>
             {
                 Some(
                     self.text
@@ -1100,6 +1157,13 @@ impl<'a> BatchOutput<'a> {
             };
             if matches!(status, FileStatus::Skipped | FileStatus::Failed) {
                 failed.insert(self.batch[member]);
+            }
+            if status == FileStatus::Compiled {
+                self.shared
+                    .compiled_in
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(file.key.clone(), self.number);
             }
             emit(
                 &self.shared.context.events,

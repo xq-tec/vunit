@@ -74,7 +74,7 @@ while let Some(event) = receiver.recv().await {
 
 Everything a workspace generates goes to `<root>/risim-out/`: the extracted VUnit and OSVVM sources, compiled libraries, compile and test output, and the JSON state files. A lock file keeps other processes from using the same directory at the same time.
 
-The consecutive files of one library that need compiling are analysed by one `risim analyze`, which prints its reports as JSON lines (`--message-format=json`); each report goes to the file of its location. The compiled libraries are kept as long as the path and the `--version` output of `risim` are the same, which names the archive format.
+The consecutive files of one library that need compiling are analysed by one `risim analyze`, which prints its reports as JSON lines (`--message-format=json`); each report goes to the file of its location, and a file whose design units the call made obsolete is compiled again. The compiled libraries are kept as long as the path and the `--version` output of `risim` are the same, which names the archive format.
 
 ## Building
 

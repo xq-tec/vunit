@@ -73,6 +73,12 @@ fn compiled_state(plan: &CompilePlan) -> CompileState {
     let mut state = CompileState::default();
     for file in plan.files() {
         fs::create_dir_all(&file.library_dir).unwrap();
+        fs::write(
+            file.library_dir
+                .join(format!("{}.hlib", file.library.to_ascii_lowercase())),
+            "",
+        )
+        .unwrap();
         state.files.insert(
             file.key.clone(),
             FileState {
@@ -197,7 +203,7 @@ fn compile_keys_depend_on_options_and_simulator() {
 }
 
 #[test]
-fn deleted_library_directory_forces_compile_of_dependents() {
+fn deleted_library_archive_forces_compile_of_dependents() {
     let mut fixture = Fixture::new();
     fixture.library("lib").library("user_lib");
     fixture.add("lib", "pkg.vhd", PKG);
@@ -213,6 +219,12 @@ fn deleted_library_directory_forces_compile_of_dependents() {
     // The keys are unchanged, but recompiling the package makes its user obsolete.
     fs::remove_dir_all(fixture.layout.library_dir("lib")).unwrap();
     assert_eq!(fixture.plan(&[user], &state).compile_count(), 2);
+
+    // So does a missing archive in an existing directory, as a cancelled first compile leaves it.
+    fs::create_dir_all(fixture.layout.library_dir("lib")).unwrap();
+    assert_eq!(fixture.plan(&[user], &state).compile_count(), 2);
+    fs::write(fixture.layout.library_archive("lib"), "").unwrap();
+    assert_eq!(fixture.plan(&[user], &state).compile_count(), 0);
 }
 
 #[test]

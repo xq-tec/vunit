@@ -124,14 +124,8 @@ pub fn tests_of<'name>(names: &'name [String], testbench: &str) -> Vec<&'name st
 ///
 /// Where risim differs, the trial lists the testcases and says why after `risim:`:
 ///
-/// - **process-local call:** a declaration of a process calls a subprogram declared in that
-///   process, which elaboration does not support yet.
 /// - **instance name:** the testcase seeds its random generator with `'INSTANCE_NAME`, which
 ///   differs from GHDL's, so it draws other values.
-/// - **IEEE `to_sulv`:** the VHDL-2008 bodies of `FIXED_GENERIC_PKG` and `FLOAT_GENERIC_PKG`
-///   convert a vector with negative indices to `STD_ULOGIC_VECTOR`, whose index subtype is
-///   `NATURAL`, so the conversion fails its index check (LRM 9.3.6). The IEEE 1076-2019 sources
-///   convert a copy with indices from 0 instead.
 #[derive(Debug, Clone, Copy)]
 pub enum RisimDeviations {
     /// Every testcase has its upstream outcome.

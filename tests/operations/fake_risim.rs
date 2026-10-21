@@ -11,13 +11,16 @@
 //!   directory, and follows the directives in the file's comments, in order:
 //!   - `-- fake: error <message>`, `warning`, `note`: print a JSON report for that line (as
 //!     `--message-format=json` does); an error makes the exit code 1;
+//!   - `-- fake: obsolete <file>`: print the warning `obsolete-design-unit` at the start of
+//!     `file`;
 //!   - `-- fake: output <text>`: print `text` to stderr;
 //!   - `-- fake: exit <code>`: set the exit code;
 //!   - `-- fake: sleep <ms>`: sleep;
 //!   - `-- fake: hang`: append `hang` to the log, then sleep for an hour;
 //!   - `-- fake: spawn-sleeper <file>`: start a sleeping grandchild and write its PID to `file`.
 //!
-//!   Each call also appends `<work> <file name>…` to `fake-calls.log`.
+//!   Each call also appends `<work> <file name>…` to `fake-calls.log`, and at its end writes the
+//!   archive `<workdir>/<work>.hlib`.
 //! - `run … --name=<testcase>` "simulates" the testcase: it appends `simstart <testcase>` and
 //!   `simend <testcase>` to the log, writes its arguments, including `run`, to `args.txt` in the
 //!   output path from `runner_cfg` (`--generic=runner_cfg=`), and follows the directives for the
@@ -118,6 +121,11 @@ fn analyse(args: &[String]) -> ExitCode {
     for file in files {
         analyse_file(work, file, &mut code);
     }
+    // Analysis always saves the work library.
+    if let Some(workdir) = args.iter().find_map(|arg| arg.strip_prefix("--workdir=")) {
+        let archive = format!("{workdir}/{}.hlib", work.to_ascii_lowercase());
+        fs::write(&archive, "").expect("write the archive");
+    }
     ExitCode::from(code)
 }
 
@@ -162,6 +170,18 @@ fn analyse_file(work: &str, file: &str, code: &mut u8) {
                 if command == "error" {
                     *code = 1;
                 }
+            },
+            "obsolete" => {
+                let start = serde_json::json!({"line": 1, "column": 1, "offset": 0});
+                let report = serde_json::json!({
+                    "type": "diagnostic",
+                    "severity": "warning",
+                    "code": "obsolete-design-unit",
+                    "message": format!("design unit {work}.x of {argument} is obsolete"),
+                    "relaxable": false,
+                    "location": {"file": argument, "start": start, "end": start},
+                });
+                println!("{report}");
             },
             "output" => eprintln!("{argument}"),
             "spawn-sleeper" => {

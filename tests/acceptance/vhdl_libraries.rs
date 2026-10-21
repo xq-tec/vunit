@@ -32,7 +32,7 @@ use crate::harness::generics;
 use crate::harness::target;
 
 /// Runs all testcases of `spec`; the testcases in `failing` must fail and all others pass,
-/// changed by `risim` on the `risim` backend.
+/// changed by `risim`.
 async fn check(
     runtime: &Runtime,
     root: &Root,
@@ -92,7 +92,7 @@ pub async fn check_lib() {
         &root,
         &spec,
         CHECK_FAILURES,
-        RisimDeviations::Failing(CHECK_RISIM_FAILURES),
+        RisimDeviations::None,
     )
     .await;
 }
@@ -107,12 +107,6 @@ const CHECK_FAILURES: &[&str] = &[
      allowed",
 ];
 
-/// The testcases of `check_lib` that fail on risim.
-const CHECK_RISIM_FAILURES: &[&str] = &[
-    // risim: IEEE `to_sulv`.
-    "lib.tb_check_equal_2008p.",
-];
-
 pub async fn com() {
     let runtime = harness::runtime().await;
     let root = Root::new();
@@ -121,19 +115,7 @@ pub async fn com() {
         "tb_com_lib",
         test_files("com", |name| name == "tb_com_codec.vhd"),
     );
-    check(
-        &runtime,
-        &root,
-        &spec,
-        &[],
-        RisimDeviations::Failing(&[
-            // risim: IEEE `to_sulv`.
-            "tb_com_lib.tb_com_msg_building.Test push and pop float",
-            "tb_com_lib.tb_com_msg_building.Test push and pop sfixed",
-            "tb_com_lib.tb_com_msg_building.Test push and pop ufixed",
-        ]),
-    )
-    .await;
+    check(&runtime, &root, &spec, &[], RisimDeviations::None).await;
 }
 
 pub async fn data_types() {
@@ -147,25 +129,7 @@ pub async fn data_types() {
     ];
     files.extend(test_files("data_types", |_| false));
     spec.add_library("vunit_lib", files);
-    check(
-        &runtime,
-        &root,
-        &spec,
-        &[],
-        RisimDeviations::Failing(&[
-            // risim: IEEE `to_sulv`.
-            "vunit_lib.tb_codec_2008p.Test that float can be encoded and decoded",
-            "vunit_lib.tb_codec_2008p.Test that sfixed can be encoded and decoded",
-            "vunit_lib.tb_codec_2008p.Test that ufixed can be encoded and decoded",
-            "vunit_lib.tb_dict_2008p.test set and get float",
-            "vunit_lib.tb_dict_2008p.test set and get sfixed",
-            "vunit_lib.tb_dict_2008p.test set and get ufixed",
-            "vunit_lib.tb_queue_2008p.Test push and pop float",
-            "vunit_lib.tb_queue_2008p.Test push and pop sfixed",
-            "vunit_lib.tb_queue_2008p.Test push and pop ufixed",
-        ]),
-    )
-    .await;
+    check(&runtime, &root, &spec, &[], RisimDeviations::None).await;
 }
 
 pub async fn dictionary() {
@@ -624,8 +588,6 @@ pub async fn verification_components() {
 
 /// The testcases of `verification_components` that fail on `risim`.
 const VERIFICATION_COMPONENTS_RISIM_FAILURES: &[&str] = &[
-    // risim: process-local call (`axi_stream_master`).
-    "vunit_lib.tb_axi_stream.",
     // risim: instance name.
     "vunit_lib.tb_axi_write_slave.Test random writes",
 ];

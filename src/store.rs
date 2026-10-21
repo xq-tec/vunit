@@ -102,6 +102,13 @@ impl OutputLayout {
         self.libraries_dir().join(library.to_ascii_lowercase())
     }
 
+    /// The archive of `library` in its [directory](Self::library_dir), which `risim analyze`
+    /// writes: `<library>.hlib`, in lowercase.
+    pub fn library_archive(&self, library: &str) -> Utf8PathBuf {
+        let name = library.to_ascii_lowercase();
+        self.library_dir(&name).join(format!("{name}.hlib"))
+    }
+
     /// The file receiving the output of compiling `source` into `library`.
     pub fn compile_output_file(&self, library: &str, source: &Utf8Path) -> Utf8PathBuf {
         let stem = source.file_stem().unwrap_or("file");
