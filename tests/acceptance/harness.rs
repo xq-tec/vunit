@@ -125,7 +125,8 @@ pub fn tests_of<'name>(names: &'name [String], testbench: &str) -> Vec<&'name st
 /// Where risim differs, the trial lists the testcases and says why after `risim:`:
 ///
 /// - **instance name:** the testcase seeds its random generator with `'INSTANCE_NAME`, which
-///   differs from GHDL's, so it draws other values.
+///   differs from the one that upstream VUnit's expected outcome assumes, so it draws other
+///   values.
 #[derive(Debug, Clone, Copy)]
 pub enum RisimDeviations {
     /// Every testcase has its upstream outcome.

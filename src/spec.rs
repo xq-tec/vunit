@@ -192,7 +192,7 @@ pub struct PatternLocation {
 /// Options for analysis (`risim analyze`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CompileOptions {
-    /// Extra analysis options (VUnit's `ghdl.a_flags`).
+    /// Extra options of `risim analyze`.
     pub a_flags: Vec<String>,
 }
 
@@ -203,9 +203,9 @@ pub struct CompileOptions {
 /// enabled, and a new seed per run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SimOptions {
-    /// Extra elaboration options (VUnit's `ghdl.elab_flags`).
+    /// Extra elaboration options of `risim run`.
     pub elab_flags: Option<Vec<String>>,
-    /// Extra risim-runner options (VUnit's `ghdl.sim_flags`).
+    /// Extra simulation options of `risim run`.
     pub sim_flags: Option<Vec<String>>,
     /// The lowest assertion severity that stops the simulation; default `error`.
     pub vhdl_assert_stop_level: Option<AssertLevel>,

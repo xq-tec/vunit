@@ -93,7 +93,8 @@ fn artificial_spec(spec: &mut ProjectSpec) {
         }],
         ..target("lib.tb_same_sim_from_python_all_pass")
     });
-    // configure_tb_set_generic; `is_ghdl` skips the real and time generics, as for GHDL.
+    // configure_tb_set_generic; the fixture's `is_ghdl` skips the real and time generics, which
+    // the port does not set.
     let long_value = "0123456789abcdef".repeat(512);
     configs.push(TestConfigSpec {
         generics: generics(&[
