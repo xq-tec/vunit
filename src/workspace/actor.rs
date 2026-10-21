@@ -57,7 +57,6 @@ use crate::runner::SimulationRequest;
 use crate::runner::TestcaseLocks;
 use crate::runtime::ProcessLimit;
 use crate::runtime::Runtime;
-use crate::simulator::SimulatorKind;
 use crate::store::CompileState;
 use crate::store::FileKey;
 use crate::store::OutputLayout;
@@ -80,7 +79,6 @@ pub(super) enum Command {
     Simulate {
         requests: Vec<SimulationRequest>,
         tag: Option<RequestTag>,
-        simulator: SimulatorKind,
         max_parallel: Option<NonZeroUsize>,
     },
     CancelAll,
@@ -332,10 +330,9 @@ impl Actor {
             Command::Simulate {
                 requests,
                 tag,
-                simulator,
                 max_parallel,
             } => {
-                self.request(Operation::simulate(requests, tag, simulator, max_parallel))
+                self.request(Operation::simulate(requests, tag, max_parallel))
                     .await;
             },
             Command::CancelAll => self.cancel_all(),
@@ -350,8 +347,7 @@ impl Actor {
 
     /// Starts `operation`, or queues it if a compile is running.
     ///
-    /// A queued operation merges into the last queued one if [it can](Operation::can_merge), so
-    /// that the operations keep the order of their requests.
+    /// A queued operation merges into the last queued one.
     async fn request(&mut self, operation: Operation) {
         if self.closing.is_some() {
             tracing::debug!(root = %self.root, "ignoring a request to a closing workspace");
@@ -361,13 +357,11 @@ impl Actor {
             self.start(operation).await;
             return;
         }
-        match self.queued.pop_back() {
-            Some(last) if last.can_merge(&operation) => {
-                self.queued.push_back(last.merge(operation));
-            },
-            Some(last) => self.queued.extend([last, operation]),
-            None => self.queued.push_back(operation),
-        }
+        let operation = match self.queued.pop_back() {
+            Some(last) => last.merge(operation),
+            None => operation,
+        };
+        self.queued.push_back(operation);
     }
 
     fn cancel_all(&mut self) {
@@ -615,21 +609,8 @@ impl Actor {
             success,
             simulation_patterns: running.operation.simulation_patterns(),
         });
-        if success
-            && let Operation::Simulate {
-                requests,
-                tags,
-                simulator,
-                ..
-            } = running.operation
-        {
-            self.start_simulation(
-                &running.model,
-                &requests,
-                tags,
-                simulator,
-                running.operation_semaphore,
-            );
+        if success && let Operation::Simulate { requests, tags, .. } = running.operation {
+            self.start_simulation(&running.model, &requests, tags, running.operation_semaphore);
         }
         // An operation that can't compile ends right away, without starting a compile.
         while self.running_compile.is_none()
@@ -662,47 +643,21 @@ impl Actor {
     // Simulation
     // ---------------------------------------------------------------------------------------------
 
-    /// Runs the testcases of `model` that match `requests` on the backend `simulator`, limited
-    /// by the runtime and, if given, by `operation_semaphore`.
-    ///
-    /// If the backend is unavailable, the simulation ends right away with a diagnostic and
-    /// without testcases.
+    /// Runs the testcases of `model` that match `requests`, limited by the runtime and, if
+    /// given, by `operation_semaphore`.
     fn start_simulation(
         &mut self,
         model: &Model,
         requests: &[SimulationRequest],
         tags: Vec<RequestTag>,
-        simulator: SimulatorKind,
         operation_semaphore: Option<Arc<Semaphore>>,
     ) {
-        let backend = match self.runtime.backend(simulator) {
-            Ok(backend) => backend,
-            Err(reason) => {
-                self.emit(WorkspaceEventKind::SimulationStarted {
-                    tags: tags.clone(),
-                    testcases: Vec::new(),
-                });
-                self.simulation_diagnostics.insert(
-                    None,
-                    vec![Diagnostic::error(format!(
-                        "the {simulator} backend is unavailable: {reason}"
-                    ))],
-                );
-                self.dirty.insert(DiagnosticSource::Simulation);
-                self.emit(WorkspaceEventKind::SimulationFinished {
-                    tags,
-                    counts: TestCounts::default(),
-                });
-                return;
-            },
-        };
         let plan = SimulationPlan::new(
             &SimulationInput {
                 layout: &self.layout,
                 project: &model.project,
                 discovery: &model.discovery,
                 sim_options: &model.spec.sim_options,
-                gui_supported: backend.supports_gui(),
             },
             requests,
         );
@@ -728,7 +683,7 @@ impl Actor {
         });
         let context = SimulationContext {
             workspace_root: self.root.to_path_buf(),
-            backend,
+            simulator: self.runtime.simulator().clone(),
             limit: ProcessLimit::new(
                 Arc::clone(self.runtime.simulation_semaphore()),
                 operation_semaphore,

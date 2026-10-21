@@ -2,41 +2,35 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! A fake risim-ghdl and risim-runner. The test binary runs this instead of the tests when
-//! `RISIM_FAKE_GHDL` is set. It acts as risim-runner when it is started as `risim` (see
-//! [`risim_runner`]), and as risim-ghdl otherwise.
+//! A fake risim-runner. The test binary runs this instead of the tests when `RISIM_FAKE` is set.
 //!
-//! - `--version` prints a risim-ghdl version line.
+//! - `--version` prints a risim-runner version line and the archive format.
 //! - `--sleep <ms>` sleeps.
-//! - `-a … <file>` "analyses" the file: it appends `start <work> <file name>` and
-//!   `end <work> <file name>` to `fake-ghdl.log` in the working directory, and follows the
-//!   directives in the file's comments, in order:
-//!   - `-- fake: error <message>`, `warning`, `note`: print a GHDL message for that line; an
-//!     error makes the exit code 1;
+//! - `analyze … <file>…` "analyses" the files one after the other: it appends
+//!   `start <work> <file name>` and `end <work> <file name>` to `fake-risim.log` in the working
+//!   directory, and follows the directives in the file's comments, in order:
+//!   - `-- fake: error <message>`, `warning`, `note`: print a JSON report for that line (as
+//!     `--message-format=json` does); an error makes the exit code 1;
 //!   - `-- fake: output <text>`: print `text` to stderr;
 //!   - `-- fake: exit <code>`: set the exit code;
 //!   - `-- fake: sleep <ms>`: sleep;
 //!   - `-- fake: hang`: append `hang` to the log, then sleep for an hour;
 //!   - `-- fake: spawn-sleeper <file>`: start a sleeping grandchild and write its PID to `file`.
-//! - `--elab-run … --name=<testcase>` "simulates" the testcase: it appends `simstart <testcase>`
-//!   and `simend <testcase>` to the log, writes its arguments, including `--elab-run`, to
-//!   `args.txt` in the output path from `runner_cfg` (`-grunner_cfg=`), and follows the
-//!   directives for the testcase in `fake-sim.txt` in the working directory (lines
-//!   `<testcase>\t<directive>`), in order:
+//!
+//!   Each call also appends `<work> <file name>…` to `fake-calls.log`.
+//! - `run … --name=<testcase>` "simulates" the testcase: it appends `simstart <testcase>` and
+//!   `simend <testcase>` to the log, writes its arguments, including `run`, to `args.txt` in the
+//!   output path from `runner_cfg` (`--generic=runner_cfg=`), and follows the directives for the
+//!   testcase in `fake-sim.txt` in the working directory (lines `<testcase>\t<directive>`), in
+//!   order:
 //!   - `fail`: the test starts but the suite doesn't complete, exit code 1;
 //!   - `no-results`: don't write `vunit_results`;
 //!   - `exit <code>`: set the exit code;
 //!   - `print <text>`: print `text` to stdout;
-//!   - `sleep <ms>`, `hang`: as for `-a`.
+//!   - `sleep <ms>`, `hang`: as for `analyze`.
 //!
 //!   Without `fail` or `no-results`, the enabled test passes: `vunit_results` records its start
 //!   and the end of the suite.
-//!
-//! As risim-runner:
-//!
-//! - `--version` prints a risim-runner version line.
-//! - `run … --name=<testcase>` simulates like `--elab-run`, with `runner_cfg` from
-//!   `--generic=runner_cfg=`.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -47,101 +41,30 @@
 )]
 
 use std::env;
-use std::ffi::OsStr;
 use std::fs;
-use std::io;
 use std::io::Write as _;
-use std::path::Path;
 use std::process::Command;
 use std::process::ExitCode;
-use std::sync::LazyLock;
 use std::thread;
 use std::time::Duration;
 
-use camino::Utf8PathBuf;
-
 /// The environment variable that turns the test binary into the fake simulator.
-pub const ENV: &str = "RISIM_FAKE_GHDL";
+pub const ENV: &str = "RISIM_FAKE";
 
 /// The log file in the working directory.
-pub const LOG: &str = "fake-ghdl.log";
+pub const LOG: &str = "fake-risim.log";
+
+/// The log of the `analyze` calls in the working directory.
+pub const CALLS: &str = "fake-calls.log";
 
 /// The simulation directives in the working directory.
 pub const SIM_DIRECTIVES: &str = "fake-sim.txt";
 
-/// The file stem that makes the fake act as risim-runner.
-const RISIM_RUNNER_STEM: &str = "risim";
-
-/// A link to the test binary named `risim[.exe]`, which acts as risim-runner.
-///
-/// On Unix, the link is a symbolic link, so that it costs no space and never keeps an old test
-/// binary alive. Elsewhere it is a hard link, or a copy if that fails. Every build of the test
-/// binary has one link, which concurrent test processes replace atomically.
-pub fn risim_runner() -> Utf8PathBuf {
-    static PATH: LazyLock<Utf8PathBuf> = LazyLock::new(|| {
-        let exe = env::current_exe().expect("current exe");
-        let build = exe
-            .file_stem()
-            .and_then(OsStr::to_str)
-            .expect("UTF-8 test binary name");
-        let dir = Utf8PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
-            .join("fake-risim")
-            .join(build);
-        fs::create_dir_all(&dir).expect("create the fake risim directory");
-        let path = dir.join(format!("{RISIM_RUNNER_STEM}{}", env::consts::EXE_SUFFIX));
-        let temp = dir.join(format!("{}.tmp", std::process::id()));
-        // A file left by an earlier process with the same ID.
-        let _ignored = fs::remove_file(&temp);
-        link(&exe, temp.as_std_path()).expect("link the test binary");
-        if let Err(error) = fs::rename(&temp, &path) {
-            // Windows can't replace a running fake; it is a link to the same build.
-            let _unused = fs::remove_file(&temp);
-            assert!(path.exists(), "can't create {path}: {error}");
-        }
-        path
-    });
-    PATH.clone()
-}
-
-/// Creates `link` as a link to `exe`.
-#[cfg(unix)]
-fn link(exe: &Path, link: &Path) -> io::Result<()> {
-    use std::os::unix::fs::symlink;
-
-    symlink(exe, link)
-}
-
-/// Creates `link` as a hard link to `exe`, or as a copy of it.
-#[cfg(not(unix))]
-fn link(exe: &Path, link: &Path) -> io::Result<()> {
-    fs::hard_link(exe, link).or_else(|_| fs::copy(exe, link).map(drop))
-}
-
 pub fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    // The name it was started with, since the executable of a symbolic link is the test binary.
-    let is_runner = env::args_os()
-        .next()
-        .as_deref()
-        .map(Path::new)
-        .and_then(Path::file_stem)
-        .is_some_and(|stem| stem == RISIM_RUNNER_STEM);
-    if is_runner {
-        return match args.first().map(String::as_str) {
-            Some("--version") => {
-                println!("risim-runner 0.1.0");
-                ExitCode::SUCCESS
-            },
-            Some("run") => simulate(&args),
-            _ => {
-                eprintln!("fake risim-runner: unsupported arguments {args:?}");
-                ExitCode::from(2)
-            },
-        };
-    }
     match args.first().map(String::as_str) {
         Some("--version") => {
-            println!("GHDL 6.4.0-fake (tests) [simulation adapter]");
+            println!("risim-runner 0.1.0-fake\nhydrolyze archive format 1");
             ExitCode::SUCCESS
         },
         Some("--sleep") => {
@@ -149,20 +72,25 @@ pub fn main() -> ExitCode {
             thread::sleep(Duration::from_millis(millis));
             ExitCode::SUCCESS
         },
-        Some("-a") => analyse(&args[1..]),
-        Some("--elab-run") => simulate(&args),
+        Some("analyze") => analyse(&args[1..]),
+        Some("run") => simulate(&args),
         _ => {
-            eprintln!("fake risim-ghdl: unsupported arguments {args:?}");
+            eprintln!("fake risim-runner: unsupported arguments {args:?}");
             ExitCode::from(2)
         },
     }
 }
 
 fn log(line: &str) {
+    append(LOG, line);
+}
+
+/// Appends `line` to the file `path`.
+fn append(path: &str, line: &str) {
     let mut file = fs::File::options()
         .create(true)
         .append(true)
-        .open(LOG)
+        .open(path)
         .expect("open the log");
     // One write per line, so lines of concurrent processes don't interleave.
     file.write_all(format!("{line}\n").as_bytes())
@@ -174,13 +102,41 @@ fn analyse(args: &[String]) -> ExitCode {
         .iter()
         .find_map(|arg| arg.strip_prefix("--work="))
         .unwrap_or("?");
-    let file = args.last().map_or("", String::as_str);
-    let name = file.rsplit(['/', '\\']).next().unwrap_or(file);
+    // The files are the arguments that aren't options or the directories of `-L`.
+    let mut files = Vec::new();
+    let mut arguments = args.iter();
+    while let Some(arg) = arguments.next() {
+        if arg == "-L" {
+            arguments.next();
+        } else if !arg.starts_with('-') {
+            files.push(arg.as_str());
+        }
+    }
+    let names: Vec<&str> = files.iter().map(|file| file_name(file)).collect();
+    append(CALLS, &format!("{work} {}", names.join(" ")));
+    let mut code = 0;
+    for file in files {
+        analyse_file(work, file, &mut code);
+    }
+    ExitCode::from(code)
+}
+
+/// The file name of the path `file`.
+fn file_name(file: &str) -> &str {
+    file.rsplit(['/', '\\']).next().unwrap_or(file)
+}
+
+/// "Analyses" `file` into `work`, and sets `code` to the exit code it asks for.
+fn analyse_file(work: &str, file: &str, code: &mut u8) {
+    let name = file_name(file);
     log(&format!("start {work} {name}"));
 
     let contents = String::from_utf8_lossy(&fs::read(file).unwrap_or_default()).into_owned();
-    let mut code = 0;
-    for (number, line) in contents.lines().enumerate() {
+    let mut offset = 0;
+    for (number, line) in contents.split_inclusive('\n').enumerate() {
+        let line_offset = offset;
+        offset += line.len();
+        let line = line.trim_end_matches(['\n', '\r']);
         let Some((_, directive)) = line.split_once("-- fake:") else {
             continue;
         };
@@ -189,9 +145,22 @@ fn analyse(args: &[String]) -> ExitCode {
         let line_number = number + 1;
         match command {
             "error" | "warning" | "note" => {
-                println!("{file}:{line_number}:1:{command}: {argument}");
+                let position = |column: usize, at: usize| serde_json::json!({"line": line_number, "column": column, "offset": at});
+                let report = serde_json::json!({
+                    "type": "diagnostic",
+                    "severity": command,
+                    "code": "fake",
+                    "message": argument,
+                    "relaxable": false,
+                    "location": {
+                        "file": file,
+                        "start": position(1, line_offset),
+                        "end": position(line.chars().count() + 1, line_offset + line.len()),
+                    },
+                });
+                println!("{report}");
                 if command == "error" {
-                    code = 1;
+                    *code = 1;
                 }
             },
             "output" => eprintln!("{argument}"),
@@ -206,12 +175,11 @@ fn analyse(args: &[String]) -> ExitCode {
                     .expect("spawn the sleeper");
                 fs::write(argument, child.id().to_string()).expect("write the PID");
             },
-            _ if shared_directive(command, argument, &mut code) => {},
-            _ => eprintln!("fake risim-ghdl: unknown directive {directive}"),
+            _ if shared_directive(command, argument, code) => {},
+            _ => eprintln!("fake risim-runner: unknown directive {directive}"),
         }
     }
     log(&format!("end {work} {name}"));
-    ExitCode::from(code)
 }
 
 /// Runs a directive that `analyse` and `simulate` handle alike: `exit`, `sleep` or `hang`.
@@ -259,7 +227,7 @@ fn decode_dict(encoded: &str) -> Vec<(String, String)> {
     entries
 }
 
-/// Simulates the testcase of `args`, which start with the mode: `--elab-run` or `run`.
+/// Simulates the testcase of `args`, which start with `run`.
 fn simulate(args: &[String]) -> ExitCode {
     let name = args
         .iter()
@@ -269,10 +237,7 @@ fn simulate(args: &[String]) -> ExitCode {
     log(&format!("simstart {name}"));
     let runner_cfg = args
         .iter()
-        .find_map(|arg| {
-            arg.strip_prefix("-grunner_cfg=")
-                .or_else(|| arg.strip_prefix("--generic=runner_cfg="))
-        })
+        .find_map(|arg| arg.strip_prefix("--generic=runner_cfg="))
         .map(decode_dict)
         .unwrap_or_default();
     let value = |key: &str| {
@@ -302,7 +267,7 @@ fn simulate(args: &[String]) -> ExitCode {
             "no-results" => results = false,
             "print" => println!("{argument}"),
             _ if shared_directive(command, argument, &mut code) => {},
-            _ => eprintln!("fake risim-ghdl: unknown directive {directive}"),
+            _ => eprintln!("fake risim-runner: unknown directive {directive}"),
         }
     }
     if results {

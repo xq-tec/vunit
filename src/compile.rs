@@ -15,19 +15,25 @@
 //!   dependencies. A file is compiled if its stored key differs, its library directory is
 //!   missing, or one of its dependencies is compiled. A change anywhere upstream changes the keys
 //!   of all dependents. Compiling a file removes the stored keys of dependents outside the
-//!   compile set, because risim-ghdl considers them obsolete.
+//!   compile set: risim analyses a dependent in another file again when it loads the archive,
+//!   and drops it if that fails (it is obsolete, LRM 13.5), or at the next load of its library if
+//!   it is in another one.
 //! - **Scheduling:** libraries that depend on each other are merged into scheduling units. A
 //!   unit starts once the units it depends on have finished, and units run in parallel. Within
-//!   a unit, files compile one after the other in compile order.
-//! - **Failures:** the transitive dependents of a failed file are skipped; all other files are
-//!   still compiled. The stored keys of failed and cancelled files and of all their dependents
-//!   are removed, because the simulator may have made their units obsolete.
+//!   a unit, files compile in compile order. The consecutive files of one library that need
+//!   compiling compile in one batch, one `risim analyze` with all of them, because every call
+//!   loads and saves the archives of the libraries; the reports are mapped back to the files by
+//!   their locations.
+//! - **Failures:** the transitive dependents of a failed file are skipped, also those in the
+//!   batch of the failed file, whose reports are dropped; all other files are still compiled. The stored keys of failed and cancelled files and of all their dependents
+//!   are removed, because the analysis may have made their units obsolete.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
+use std::io;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -43,7 +49,7 @@ use tokio_util::sync::CancellationToken;
 use crate::dependency_graph::CircularDependency;
 use crate::dependency_graph::DependencyGraph;
 use crate::diagnostics::Diagnostic;
-use crate::diagnostics::GhdlMessage;
+use crate::diagnostics::ReportLine;
 use crate::diagnostics::Severity;
 use crate::discovery::Discovery;
 use crate::process;
@@ -52,6 +58,7 @@ use crate::project::LibraryId;
 use crate::project::Project;
 use crate::project::UnitKind;
 use crate::runtime::ProcessLimit;
+use crate::simulator;
 use crate::simulator::CompileArgs;
 use crate::simulator::Simulator;
 use crate::simulator::SimulatorIdentity;
@@ -127,8 +134,8 @@ pub struct PlannedFile {
     /// Whether the file must be compiled: its stored compile key differs, its library directory
     /// is missing, or a dependency must be compiled.
     pub needs_compile: bool,
-    /// The compile command line.
-    pub command: Vec<String>,
+    /// The standard of the file.
+    pub vhdl_standard: VhdlStandard,
     /// The file receiving the compiler output.
     pub output_file: Utf8PathBuf,
     library_dir: Utf8PathBuf,
@@ -150,7 +157,13 @@ pub struct CompilePlan {
     all_keys: FxHashMap<FileId, FileKey>,
     /// The directory with the extracted builtins; their warnings and notes are dropped.
     builtins_root: Utf8PathBuf,
-    /// Errors that prevent compiling: dependency cycles, mixed or unsupported standards.
+    /// The simulator that compiles, once the files are added.
+    simulator: Option<Simulator>,
+    /// The directories of all libraries.
+    library_dirs: Vec<Utf8PathBuf>,
+    /// The analysis options.
+    flags: Vec<String>,
+    /// Errors that prevent compiling: dependency cycles, unsupported standards.
     pub errors: Vec<Diagnostic>,
     /// Problems with the dependencies that don't prevent compiling.
     pub warnings: Vec<Diagnostic>,
@@ -170,6 +183,32 @@ impl CompilePlan {
     /// The number of files to compile.
     pub fn compile_count(&self) -> usize {
         self.files.iter().filter(|file| file.needs_compile).count()
+    }
+
+    /// The command line compiling the files `batch`, indices into [`files`](Self::files) of one
+    /// library.
+    ///
+    /// Empty for a plan with errors or an empty batch.
+    pub fn compile_command(&self, batch: &[usize]) -> Vec<String> {
+        let (Some(simulator), Some(&first)) = (&self.simulator, batch.first()) else {
+            return Vec::new();
+        };
+        let file = &self.files[first];
+        let paths: Vec<&Utf8Path> = batch
+            .iter()
+            .map(|&index| self.files[index].path.as_path())
+            .collect();
+        // The standards were checked when the files were added.
+        simulator
+            .compile_command(&CompileArgs {
+                library: &file.library,
+                library_dir: &file.library_dir,
+                vhdl_standard: file.vhdl_standard,
+                library_dirs: &self.library_dirs,
+                flags: &self.flags,
+                files: &paths,
+            })
+            .unwrap_or_default()
     }
 
     /// Plans compiling `input.targets` given the compile `state`.
@@ -217,21 +256,13 @@ impl CompilePlan {
             .iter()
             .map(|&id| project.file(id).vhdl_standard)
             .collect();
-        if standards.len() > 1 {
-            let names: Vec<String> = standards
-                .iter()
-                .map(|standard| format!("VHDL-{standard}"))
-                .collect();
-            plan.errors.push(Diagnostic::error(format!(
-                "risim-ghdl can't handle mixed VHDL standards, found {}",
-                names.join(", ")
-            )));
-            return plan;
-        }
-        if let Some(&standard) = standards.first()
-            && let Err(error) = input.simulator.std_flag(standard)
-        {
-            plan.errors.push(Diagnostic::error(error.to_string()));
+        plan.errors.extend(
+            standards
+                .into_iter()
+                .filter_map(|standard| simulator::check_standard(standard).err())
+                .map(|error| Diagnostic::error(error.to_string())),
+        );
+        if !plan.errors.is_empty() {
             return plan;
         }
 
@@ -240,10 +271,12 @@ impl CompilePlan {
         plan
     }
 
-    /// Adds the files of `order` with their compile keys and commands.
+    /// Adds the files of `order` with their compile keys.
     fn add_files(&mut self, input: &PlanInput<'_>, state: &CompileState, order: &[FileId]) {
         let project = input.project;
-        let library_dirs = library_dirs(project, input.layout);
+        self.simulator = Some(input.simulator.clone());
+        self.library_dirs = library_dirs(project, input.layout);
+        self.flags.clone_from(&input.compile_options.a_flags);
         let simulator_hash = identity_hash(input.simulator.identity());
         let positions: FxHashMap<FileId, usize> = order
             .iter()
@@ -272,8 +305,8 @@ impl CompilePlan {
             });
             let key = self.all_keys[&id].clone();
             let library_dir = input.layout.library_dir(library);
-            // Recompiling a file makes its dependents obsolete in risim-ghdl, even if its
-            // compile key is unchanged, for example because its library directory was deleted.
+            // Recompiling a file may make its dependents obsolete, even if its compile key is
+            // unchanged, for example because its library directory was deleted.
             let needs_compile = state
                 .files
                 .get(&key)
@@ -282,18 +315,6 @@ impl CompilePlan {
                 || dependencies
                     .iter()
                     .any(|&dependency| self.files[dependency].needs_compile);
-            // The standard was checked above, so building the command can't fail.
-            let command = input
-                .simulator
-                .compile_command(&CompileArgs {
-                    library,
-                    library_dir: &library_dir,
-                    vhdl_standard: file.vhdl_standard,
-                    library_dirs: &library_dirs,
-                    flags: &input.compile_options.a_flags,
-                    file: &file.path,
-                })
-                .unwrap_or_default();
             self.files.push(PlannedFile {
                 id,
                 key,
@@ -301,7 +322,7 @@ impl CompilePlan {
                 path: file.path.clone(),
                 compile_key,
                 needs_compile,
-                command,
+                vhdl_standard: file.vhdl_standard,
                 output_file: input.layout.compile_output_file(library, &file.path),
                 library_dir,
                 dependencies,
@@ -382,7 +403,7 @@ impl CompilePlan {
     }
 }
 
-/// The directories of all libraries, passed to the simulator with `-P`.
+/// The directories of all libraries, passed to the simulator with `-L`.
 pub(crate) fn library_dirs(project: &Project, layout: &OutputLayout) -> Vec<Utf8PathBuf> {
     project
         .libraries()
@@ -424,7 +445,7 @@ fn compile_order(
 
 /// What a compile key is computed from.
 ///
-/// The `-P` paths of external libraries aren't part of it. Their libraries can't be configured
+/// The `-L` paths of external libraries aren't part of it. Their libraries can't be configured
 /// yet; once they can, a changed path or a recompiled external library must change the key.
 struct CompileKeyInput<'a> {
     content_hash: ContentHash,
@@ -787,7 +808,7 @@ fn finish(
         };
         report.files.push((file.key.clone(), result.status));
     }
-    // Compiled files make their dependents obsolete, so those must be compiled again unless
+    // Compiled files may make their dependents obsolete, so those must be compiled again unless
     // they were compiled after them.
     let obsolete = plan
         .graph
@@ -804,45 +825,88 @@ fn finish(
 
 async fn run_unit(shared: &Shared, unit: usize, mut bad: FxHashSet<usize>) -> UnitResults {
     let plan = &shared.plan;
-    let mut results = Vec::with_capacity(plan.units[unit].len());
-    for &index in &plan.units[unit] {
-        let file = &plan.files[index];
-        let result = if file
-            .dependencies
-            .iter()
-            .any(|dependency| bad.contains(dependency))
-        {
-            FileResult::without_diagnostics(if shared.context.cancel.is_cancelled() {
+    let files = &plan.units[unit];
+    let mut results = Vec::with_capacity(files.len());
+    let mut position = 0;
+    while position < files.len() {
+        let first = files[position];
+        let file = &plan.files[first];
+        if !file.needs_compile {
+            results.push((first, FileResult::without_diagnostics(FileStatus::UpToDate)));
+            position += 1;
+            continue;
+        }
+        if depends_on(file, &bad) {
+            bad.insert(first);
+            let status = if shared.context.cancel.is_cancelled() {
                 FileStatus::NotStarted
             } else {
+                emit(
+                    &shared.context.events,
+                    CompileEvent::FileFinished {
+                        key: file.key.clone(),
+                        status: FileStatus::Skipped,
+                        diagnostics: Vec::new(),
+                    },
+                );
                 FileStatus::Skipped
-            })
-        } else if !file.needs_compile {
-            FileResult::without_diagnostics(FileStatus::UpToDate)
-        } else {
-            compile_file(shared, file).await
-        };
-        if !matches!(result.status, FileStatus::UpToDate | FileStatus::Compiled) {
-            bad.insert(index);
+            };
+            results.push((first, FileResult::without_diagnostics(status)));
+            position += 1;
+            continue;
         }
-        if matches!(result.status, FileStatus::Skipped) {
-            emit(
-                &shared.context.events,
-                CompileEvent::FileFinished {
-                    key: file.key.clone(),
-                    status: result.status,
-                    diagnostics: Vec::new(),
-                },
-            );
+        // The batch: this file and the following ones of its library that need compiling.
+        let mut batch = vec![first];
+        position += 1;
+        while let Some(&next) = files.get(position) {
+            let candidate = &plan.files[next];
+            if candidate.library != file.library
+                || !candidate.needs_compile
+                || depends_on(candidate, &bad)
+            {
+                break;
+            }
+            batch.push(next);
+            position += 1;
         }
-        results.push((index, result));
+        for (member, result) in batch
+            .iter()
+            .copied()
+            .zip(compile_batch(shared, &batch).await)
+        {
+            if !matches!(result.status, FileStatus::UpToDate | FileStatus::Compiled) {
+                bad.insert(member);
+            }
+            results.push((member, result));
+        }
     }
     (unit, results)
 }
 
-async fn compile_file(shared: &Shared, file: &PlannedFile) -> FileResult {
+/// Whether `file` depends directly on one of the files `files`.
+fn depends_on(file: &PlannedFile, files: &FxHashSet<usize>) -> bool {
+    file.dependencies
+        .iter()
+        .any(|dependency| files.contains(dependency))
+}
+
+/// Whether `diagnostics` has an error.
+fn has_errors(diagnostics: &[Diagnostic]) -> bool {
+    diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.severity == Severity::Error)
+}
+
+/// Compiles the files `batch` of one library in one process, and returns their results in the
+/// same order.
+async fn compile_batch(shared: &Shared, batch: &[usize]) -> Vec<FileResult> {
     let context = &shared.context;
-    let not_started = || FileResult::without_diagnostics(FileStatus::NotStarted);
+    let not_started = || {
+        batch
+            .iter()
+            .map(|_| FileResult::without_diagnostics(FileStatus::NotStarted))
+            .collect()
+    };
     if context.cancel.is_cancelled() {
         return not_started();
     }
@@ -854,93 +918,203 @@ async fn compile_file(shared: &Shared, file: &PlannedFile) -> FileResult {
         () = context.cancel.cancelled() => return not_started(),
     };
 
-    let index = shared.started.fetch_add(1, Ordering::Relaxed) + 1;
-    emit(
-        &context.events,
-        CompileEvent::FileStarted {
-            key: file.key.clone(),
-            library: file.library.clone(),
-            file: file.path.clone(),
-            index,
-            total: shared.total,
-        },
-    );
-
-    let mut diagnostics = Vec::new();
-    let mut output = FailureOutput::default();
-    // The sources the messages refer to, for converting their columns.
-    let mut sources: FxHashMap<Utf8PathBuf, Option<Vec<u8>>> = FxHashMap::default();
+    let mut output = BatchOutput::new(shared, batch);
+    let first = output.files[0];
+    output.start(0);
     let result = async {
-        fs::create_dir_all(&file.library_dir)?;
+        fs::create_dir_all(&first.library_dir)?;
         process::run_piped(
-            &file.command,
+            &shared.plan.compile_command(batch),
             &context.workspace_root,
-            &file.output_file,
+            &first.output_file,
             &context.cancel,
-            |line| {
-                output.push(line);
-                let Some(message) = GhdlMessage::parse(line) else {
-                    return;
-                };
-                let path = context.workspace_root.join(message.file);
-                // VUnit's and OSVVM's sources trigger hundreds of warnings (mostly `-Whide`)
-                // that users can't do anything about.
-                if message.severity != Severity::Error
-                    && path.starts_with(&shared.plan.builtins_root)
-                {
-                    return;
-                }
-                let source = sources
-                    .entry(path)
-                    .or_insert_with_key(|path| fs::read(path).ok());
-                let diagnostic = message.to_diagnostic(&context.workspace_root, source.as_deref());
-                emit(
-                    &context.events,
-                    CompileEvent::Diagnostic {
-                        key: file.key.clone(),
-                        diagnostic: diagnostic.clone(),
-                    },
-                );
-                diagnostics.push(diagnostic);
-            },
+            |line| output.push_line(line),
         )
         .await
     }
     .await;
+    // Every file of the batch gets the whole output.
+    for file in &output.files[1..] {
+        if let Err(error) = fs::copy(&first.output_file, &file.output_file) {
+            tracing::debug!(%error, file = %file.output_file, "failed to copy the compile output");
+        }
+    }
+    output.finish(&result)
+}
 
-    let status = match result {
-        Ok(process::Outcome::Exited(status)) if status.success() => FileStatus::Compiled,
-        Ok(process::Outcome::Exited(status)) => {
-            if !diagnostics
+/// The progress and the reports of a batch.
+struct BatchOutput<'a> {
+    shared: &'a Shared,
+    /// The indices of the files into [`CompilePlan::files`].
+    batch: &'a [usize],
+    files: Vec<&'a PlannedFile>,
+    /// Whether a file has been reported as started.
+    ///
+    /// The first file starts with the batch, the others at their first report or at the end of
+    /// the batch, so that a cancel keeps the others from starting.
+    started: Vec<bool>,
+    /// The diagnostics of each file.
+    diagnostics: Vec<Vec<Diagnostic>>,
+    /// The output that isn't a JSON report, such as a crash message.
+    text: FailureOutput,
+    /// The sources the reports refer to, for converting their byte offsets.
+    sources: FxHashMap<Utf8PathBuf, Option<Vec<u8>>>,
+}
+
+impl<'a> BatchOutput<'a> {
+    fn new(shared: &'a Shared, batch: &'a [usize]) -> Self {
+        Self {
+            shared,
+            batch,
+            files: batch
                 .iter()
-                .any(|diagnostic| diagnostic.severity == Severity::Error)
-            {
-                let message = output
-                    .message(&file.output_file)
-                    .unwrap_or_else(|| format!("risim-ghdl failed ({status})"));
-                diagnostics.push(Diagnostic::error(message).in_file(&file.path));
-            }
-            FileStatus::Failed
-        },
-        Ok(process::Outcome::Cancelled) => FileStatus::Cancelled,
-        Err(error) => {
-            diagnostics.push(
-                Diagnostic::error(format!("failed to run risim-ghdl: {error}")).in_file(&file.path),
+                .map(|&index| &shared.plan.files[index])
+                .collect(),
+            started: vec![false; batch.len()],
+            diagnostics: vec![Vec::new(); batch.len()],
+            text: FailureOutput::default(),
+            sources: FxHashMap::default(),
+        }
+    }
+
+    /// Reports that the file `member` of the batch starts compiling, unless it did already.
+    fn start(&mut self, member: usize) {
+        if std::mem::replace(&mut self.started[member], true) {
+            return;
+        }
+        let file = self.files[member];
+        emit(
+            &self.shared.context.events,
+            CompileEvent::FileStarted {
+                key: file.key.clone(),
+                library: file.library.clone(),
+                file: file.path.clone(),
+                index: self.shared.started.fetch_add(1, Ordering::Relaxed) + 1,
+                total: self.shared.total,
+            },
+        );
+    }
+
+    /// Takes a line of the output: a report goes to the file of its location, otherwise to the
+    /// first one.
+    fn push_line(&mut self, line: &str) {
+        let report = match ReportLine::parse(line) {
+            ReportLine::Diagnostic(report) => report,
+            ReportLine::Other => return,
+            ReportLine::Text => {
+                self.text.push(line);
+                return;
+            },
+        };
+        let root = &self.shared.context.workspace_root;
+        let report_path = report
+            .location
+            .as_ref()
+            .and_then(|location| location.path(root));
+        // VUnit's and OSVVM's sources trigger warnings that users can't do anything about.
+        if report.severity != Severity::Error
+            && report_path
+                .as_ref()
+                .is_some_and(|path| path.starts_with(&self.shared.plan.builtins_root))
+        {
+            return;
+        }
+        let member = report_path
+            .as_ref()
+            .and_then(|path| self.files.iter().position(|file| file.path == *path))
+            .unwrap_or(0);
+        for location_path in report
+            .location
+            .iter()
+            .chain(
+                report
+                    .notes
+                    .iter()
+                    .filter_map(|note| note.location.as_ref()),
+            )
+            .filter_map(|location| location.path(root))
+        {
+            self.sources
+                .entry(location_path)
+                .or_insert_with_key(|key| fs::read(key).ok());
+        }
+        let sources = &self.sources;
+        let converted = report.to_diagnostics(root, &self.files[member].path, |source| {
+            sources.get(source).and_then(Option::as_deref)
+        });
+        self.start(member);
+        for diagnostic in converted {
+            emit(
+                &self.shared.context.events,
+                CompileEvent::Diagnostic {
+                    key: self.files[member].key.clone(),
+                    diagnostic: diagnostic.clone(),
+                },
             );
-            FileStatus::Failed
-        },
-    };
-    emit(
-        &context.events,
-        CompileEvent::FileFinished {
-            key: file.key.clone(),
-            status,
-            diagnostics: diagnostics.clone(),
-        },
-    );
-    FileResult {
-        status,
-        diagnostics,
+            self.diagnostics[member].push(diagnostic);
+        }
+    }
+
+    /// Returns the results of the files after the process ended with `result`.
+    ///
+    /// A file that depends on a failed or skipped one of the batch is skipped, and its reports
+    /// are dropped. A failure of the process that no report explains fails every other file.
+    fn finish(mut self, result: &io::Result<process::Outcome>) -> Vec<FileResult> {
+        let first = self.files[0];
+        let failure = match result {
+            Ok(process::Outcome::Exited(status))
+                if !status.success() && !self.diagnostics.iter().any(|file| has_errors(file)) =>
+            {
+                Some(
+                    self.text
+                        .message(&first.output_file)
+                        .unwrap_or_else(|| format!("risim analyze failed ({status})")),
+                )
+            },
+            Ok(_) => None,
+            Err(error) => Some(format!("failed to run risim analyze: {error}")),
+        };
+        let cancelled = matches!(result, Ok(process::Outcome::Cancelled));
+        let mut failed = FxHashSet::default();
+        let mut results = Vec::with_capacity(self.files.len());
+        for member in 0..self.files.len() {
+            if cancelled && !self.started[member] {
+                results.push(FileResult::without_diagnostics(FileStatus::NotStarted));
+                continue;
+            }
+            self.start(member);
+            let file = self.files[member];
+            let mut file_diagnostics = std::mem::take(&mut self.diagnostics[member]);
+            let status = if depends_on(file, &failed) {
+                file_diagnostics.clear();
+                FileStatus::Skipped
+            } else if cancelled {
+                FileStatus::Cancelled
+            } else if has_errors(&file_diagnostics) {
+                FileStatus::Failed
+            } else if let Some(message) = &failure {
+                file_diagnostics.push(Diagnostic::error(message.clone()).in_file(&file.path));
+                FileStatus::Failed
+            } else {
+                FileStatus::Compiled
+            };
+            if matches!(status, FileStatus::Skipped | FileStatus::Failed) {
+                failed.insert(self.batch[member]);
+            }
+            emit(
+                &self.shared.context.events,
+                CompileEvent::FileFinished {
+                    key: file.key.clone(),
+                    status,
+                    diagnostics: file_diagnostics.clone(),
+                },
+            );
+            results.push(FileResult {
+                status,
+                diagnostics: file_diagnostics,
+            });
+        }
+        results
     }
 }
 

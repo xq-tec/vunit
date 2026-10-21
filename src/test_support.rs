@@ -14,7 +14,6 @@ use camino::Utf8PathBuf;
 
 use crate::project::FileId;
 use crate::project::Project;
-use crate::simulator::Backend;
 use crate::simulator::Simulator;
 use crate::simulator::SimulatorIdentity;
 use crate::sources::ContentHash;
@@ -42,27 +41,21 @@ impl TempRoot {
     }
 }
 
-/// The identity of a fake risim-ghdl that prints `version_output` for `--version`.
+/// The identity of a fake risim-runner at `/bin/risim` that prints `version_output` for
+/// `--version`.
 pub(crate) fn simulator_identity(version_output: &str) -> SimulatorIdentity {
     SimulatorIdentity {
-        path: "/bin/risim-ghdl".into(),
-        size: 1,
-        modified: None,
+        path: "/bin/risim".into(),
         version_output: version_output.to_owned(),
     }
 }
 
-/// A fake risim-ghdl 6.4.
+/// A fake risim-runner 0.1.
 pub(crate) fn simulator() -> Simulator {
     Simulator::from_identity(simulator_identity(
-        "GHDL 6.4.0-risim [simulation adapter]\n",
+        "risim-runner 0.1.0\nhydrolyze archive format 1\n",
     ))
     .unwrap()
-}
-
-/// The `ghdl` backend with [`simulator`].
-pub(crate) fn backend() -> Backend {
-    Backend::Ghdl(simulator())
 }
 
 /// Parses `code` and adds it to `library` as the file `path`; unparsable code is added

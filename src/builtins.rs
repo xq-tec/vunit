@@ -5,7 +5,7 @@
 //! The VUnit and OSVVM VHDL libraries that every project gets.
 //!
 //! The files are embedded at build time (see `build.rs`). [`select`] ports the selection
-//! logic of `builtins.py` for risim-ghdl, which supports context declarations and package
+//! logic of `builtins.py` for risim, which supports context declarations and package
 //! generics, but not VHDL-2019 call paths or a vendor coverage API. [`extract`] writes the
 //! files to disk so they can be compiled.
 //!
@@ -87,7 +87,7 @@ pub struct Selection {
 /// coverage API.
 const OSVVM_EXCLUDED: [&str; 2] = ["AlertLogPkg_body_BVUL.vhd", "VendorCovApiPkg_Aldec.vhd"];
 
-/// OSVVM variants for simulators without package generics, which risim-ghdl has.
+/// OSVVM variants for simulators without package generics, which risim has.
 const OSVVM_WITHOUT_PACKAGE_GENERICS: [&str; 4] = [
     "ScoreboardPkg_int_c.vhd",
     "ScoreboardPkg_slv_c.vhd",
@@ -113,7 +113,7 @@ pub fn select(
         let path = format!("vhdl/data_types/src/api/external_{key}_pkg.vhd");
         add_files(&mut vunit_lib, standard, file(&path).into_iter());
     }
-    // risim-ghdl has no call paths, so the VHDL-2008 location body is used for all standards.
+    // risim has no call paths, so the VHDL-2008 location body is used for all standards.
     vunit_lib.extend(file("vhdl/logging/src/location_pkg-body-2008m.vhd"));
     vunit_lib.extend(
         files_in("vhdl/logging/src")

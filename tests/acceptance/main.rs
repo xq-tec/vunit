@@ -2,14 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! Acceptance tests: real projects compiled and simulated with risim-ghdl through the workspace
-//! API, mostly ported from VUnit's `tests/acceptance` and the `run.py` scripts of its VHDL
-//! libraries.
+//! Acceptance tests: real projects compiled and simulated with risim-runner through the
+//! workspace API, mostly ported from VUnit's `tests/acceptance` and the `run.py` scripts of its
+//! VHDL libraries.
 //!
-//! The trials use the risim-ghdl named by `RISIM_GHDL` and are ignored without it. Every trial
-//! also runs on the `risim` backend as `<name>_risim`, with the risim-runner named by
-//! `RISIM_RUNNER`; it is ignored unless both variables are set. With `ACCEPTANCE_KEEP` set, the
-//! temporary workspaces aren't deleted, for debugging.
+//! The trials use the risim-runner named by `RISIM_RUNNER` and are ignored without it. With
+//! `ACCEPTANCE_KEEP` set, the temporary workspaces aren't deleted, for debugging.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -27,7 +25,6 @@ use std::process::ExitCode;
 
 use libtest_mimic::Arguments;
 use libtest_mimic::Trial;
-use risim_vunit_frontend::SimulatorKind;
 
 fn main() -> ExitCode {
     let args = Arguments::from_args();
@@ -52,22 +49,10 @@ fn main() -> ExitCode {
             vhdl_libraries::verification_components,
         ),
     ];
-    libtest_mimic::run(&args, trials.into_iter().flatten().collect()).exit_code()
+    libtest_mimic::run(&args, trials.into_iter().collect()).exit_code()
 }
 
-/// The trial `name` on the `ghdl` backend and the trial `<name>_risim` on the `risim` backend.
-///
-/// The first is ignored unless risim-ghdl is available, the second unless risim-runner is
-/// available too.
-fn trials<F: Future<Output = ()> + 'static>(
-    name: &str,
-    test: fn(SimulatorKind) -> F,
-) -> [Trial; 2] {
-    let ghdl_missing = env::var_os(harness::RISIM_GHDL).is_none();
-    let runner_missing = env::var_os(harness::RISIM_RUNNER).is_none();
-    [
-        trial::trial(name, move || test(SimulatorKind::Ghdl)).with_ignored_flag(ghdl_missing),
-        trial::trial(&format!("{name}_risim"), move || test(SimulatorKind::Risim))
-            .with_ignored_flag(ghdl_missing || runner_missing),
-    ]
+/// The trial `name`, ignored unless risim-runner is available.
+fn trials<F: Future<Output = ()> + 'static>(name: &str, test: fn() -> F) -> Trial {
+    trial::trial(name, test).with_ignored_flag(env::var_os(harness::RISIM_RUNNER).is_none())
 }

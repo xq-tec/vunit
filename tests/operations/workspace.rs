@@ -21,7 +21,6 @@ use risim_vunit_frontend::RequestTag;
 use risim_vunit_frontend::Runtime;
 use risim_vunit_frontend::RuntimeOptions;
 use risim_vunit_frontend::SimulationRequest;
-use risim_vunit_frontend::SimulatorKind;
 use risim_vunit_frontend::TestCounts;
 use risim_vunit_frontend::TestOutcome;
 use risim_vunit_frontend::Workspace as Handle;
@@ -98,16 +97,8 @@ pub fn trials() -> Vec<Trial> {
             workspace_without_handles_finishes_and_closes,
         ),
         trial(
-            "workspace_simulates_with_both_backends",
-            workspace_simulates_with_both_backends,
-        ),
-        trial(
-            "workspace_reports_an_unavailable_backend",
-            workspace_reports_an_unavailable_backend,
-        ),
-        trial(
-            "workspace_queues_simulates_of_different_backends",
-            workspace_queues_simulates_of_different_backends,
+            "workspace_simulates_with_the_compiled_libraries",
+            workspace_simulates_with_the_compiled_libraries,
         ),
     ]
 }
@@ -121,19 +112,13 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 
 const CONFIG: &str = "risim-config.toml";
 
-/// A runtime with the fake risim-ghdl and the fake risim-runner.
+/// A runtime with the fake risim-runner.
 async fn runtime() -> Runtime {
-    runtime_with(Some(crate::fake_ghdl::risim_runner())).await
-}
-
-/// A runtime with the fake risim-ghdl and the risim-runner `risim_runner`.
-async fn runtime_with(risim_runner: Option<Utf8PathBuf>) -> Runtime {
     let exe = Utf8PathBuf::from_path_buf(std::env::current_exe().expect("current exe"))
         .expect("UTF-8 path");
     let four = NonZeroUsize::new(4).expect("non-zero");
     Runtime::new(RuntimeOptions {
-        risim_ghdl: exe,
-        risim_runner,
+        risim: exe,
         max_parallel_simulations: four,
         max_parallel_compiles: four,
     })
@@ -327,7 +312,7 @@ fn lock_contents(fixture: &Workspace) -> String {
 
 /// Waits until `line` appears in the fake simulator log.
 async fn wait_for_log_line(fixture: &Workspace, line: &str) {
-    let path = fixture.root.join(crate::fake_ghdl::LOG);
+    let path = fixture.root.join(crate::fake_risim::LOG);
     let deadline = Instant::now() + TIMEOUT;
     loop {
         let log = fs::read_to_string(&path).unwrap_or_default();
@@ -366,12 +351,9 @@ async fn workspace_compiles_and_simulates_with_events() {
     );
     assert_eq!(session.handle.snapshot().testcases.len(), 4);
 
-    session.handle.simulate(
-        requests(&["lib.tb_tests.*", "nothing*"]),
-        tag("s"),
-        SimulatorKind::Ghdl,
-        None,
-    );
+    session
+        .handle
+        .simulate(requests(&["lib.tb_tests.*", "nothing*"]), tag("s"), None);
     let events = summary(&session.operation("s").await);
     assert_eq!(
         events[..5],
@@ -459,18 +441,14 @@ async fn workspace_merges_requests_while_compiling() {
     let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
 
     session.handle.compile(tag("a"), None);
-    session.handle.simulate(
-        requests(&["lib.tb_tests.pass"]),
-        tag("b"),
-        SimulatorKind::Ghdl,
-        None,
-    );
+    session
+        .handle
+        .simulate(requests(&["lib.tb_tests.pass"]), tag("b"), None);
     session.handle.compile(tag("c"), None);
     session.handle.compile(None, None);
     session.handle.simulate(
         requests(&["lib.tb_implicit.all", "lib.tb_tests.pass"]),
         tag("d"),
-        SimulatorKind::Ghdl,
         None,
     );
     let events = summary(&session.operation("d").await);
@@ -532,12 +510,9 @@ async fn limited_run(max_parallel: Option<NonZeroUsize>) -> Vec<String> {
     }
     let runtime = runtime().await;
     let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
-    session.handle.simulate(
-        requests(&["lib.tb_tests.*"]),
-        tag("a"),
-        SimulatorKind::Ghdl,
-        max_parallel,
-    );
+    session
+        .handle
+        .simulate(requests(&["lib.tb_tests.*"]), tag("a"), max_parallel);
     let events = summary(&session.operation("a").await);
     assert_eq!(
         events.last().map(String::as_str),
@@ -561,9 +536,7 @@ async fn workspace_cancel_all() {
     // A hanging compile with a queued simulation.
     let started = Instant::now();
     session.handle.compile(tag("a"), None);
-    session
-        .handle
-        .simulate(requests(&["*"]), tag("b"), SimulatorKind::Ghdl, None);
+    session.handle.simulate(requests(&["*"]), tag("b"), None);
     session
         .until(|event| matches!(event, WorkspaceEventKind::FileCompiling { .. }))
         .await;
@@ -581,12 +554,9 @@ async fn workspace_cancel_all() {
     // Hanging simulations; the other tests may finish before the cancel.
     fixture.write("tb/tb_implicit.vhd", &testbench("tb_implicit", ""));
     fixture.sim_directive("lib.tb_tests.slow", "hang");
-    session.handle.simulate(
-        requests(&["lib.tb_tests.*"]),
-        tag("c"),
-        SimulatorKind::Ghdl,
-        None,
-    );
+    session
+        .handle
+        .simulate(requests(&["lib.tb_tests.*"]), tag("c"), None);
     session
         .until(|event| {
             matches!(event, WorkspaceEventKind::TestStarted { name, .. } if name == "lib.tb_tests.slow")
@@ -605,13 +575,10 @@ async fn workspace_cancel_all() {
     );
 
     // The workspace works after a cancel.
-    fixture.write(crate::fake_ghdl::SIM_DIRECTIVES, "");
-    session.handle.simulate(
-        requests(&["lib.tb_tests.slow"]),
-        tag("d"),
-        SimulatorKind::Ghdl,
-        None,
-    );
+    fixture.write(crate::fake_risim::SIM_DIRECTIVES, "");
+    session
+        .handle
+        .simulate(requests(&["lib.tb_tests.slow"]), tag("d"), None);
     let rerun_events = summary(&session.operation("d").await);
     assert_eq!(
         rerun_events.last().map(String::as_str),
@@ -632,15 +599,10 @@ async fn workspace_cancels_one_request() {
 
     // A hanging compile, and three requests merged into the queued operation.
     session.handle.compile(tag("a"), None);
+    session.handle.simulate(requests(&["*"]), tag("b"), None);
     session
         .handle
-        .simulate(requests(&["*"]), tag("b"), SimulatorKind::Ghdl, None);
-    session.handle.simulate(
-        requests(&["lib.tb_tests.slow"]),
-        tag("e"),
-        SimulatorKind::Ghdl,
-        None,
-    );
+        .simulate(requests(&["lib.tb_tests.slow"]), tag("e"), None);
     session.handle.compile(tag("c"), None);
     session
         .until(|event| matches!(event, WorkspaceEventKind::FileCompiling { .. }))
@@ -715,14 +677,11 @@ async fn workspace_cancels_one_request() {
     );
 
     // A request of another client isn't affected.
-    fixture.write(crate::fake_ghdl::SIM_DIRECTIVES, "");
+    fixture.write(crate::fake_risim::SIM_DIRECTIVES, "");
     fixture.sim_directive("lib.tb_tests.slow", "sleep 300");
-    session.handle.simulate(
-        requests(&["lib.tb_tests.slow"]),
-        tag("f"),
-        SimulatorKind::Ghdl,
-        None,
-    );
+    session
+        .handle
+        .simulate(requests(&["lib.tb_tests.slow"]), tag("f"), None);
     session.handle.cancel(RequestTag("other".to_owned()));
     assert_eq!(
         summary(&session.operation("f").await)
@@ -743,9 +702,7 @@ async fn workspace_simulates_the_compiled_project() {
     let runtime = runtime().await;
     let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
 
-    session
-        .handle
-        .simulate(requests(&["*"]), tag("a"), SimulatorKind::Ghdl, None);
+    session.handle.simulate(requests(&["*"]), tag("a"), None);
     session
         .until(|event| matches!(event, WorkspaceEventKind::FileCompiling { .. }))
         .await;
@@ -774,12 +731,9 @@ async fn workspace_simulates_the_compiled_project() {
     );
 
     // The next request compiles and runs it.
-    session.handle.simulate(
-        requests(&["lib.tb_new.*"]),
-        tag("b"),
-        SimulatorKind::Ghdl,
-        None,
-    );
+    session
+        .handle
+        .simulate(requests(&["lib.tb_new.*"]), tag("b"), None);
     assert_eq!(
         summary(&session.operation("b").await)
             .last()
@@ -869,21 +823,15 @@ async fn workspace_runs_a_testcase_once_at_a_time() {
     let runtime = runtime().await;
     let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
 
-    session.handle.simulate(
-        requests(&["lib.tb_tests.slow"]),
-        tag("first"),
-        SimulatorKind::Ghdl,
-        None,
-    );
+    session
+        .handle
+        .simulate(requests(&["lib.tb_tests.slow"]), tag("first"), None);
     session
         .until(|event| matches!(event, WorkspaceEventKind::TestStarted { .. }))
         .await;
-    session.handle.simulate(
-        requests(&["lib.tb_tests.slow"]),
-        tag("second"),
-        SimulatorKind::Ghdl,
-        None,
-    );
+    session
+        .handle
+        .simulate(requests(&["lib.tb_tests.slow"]), tag("second"), None);
     let events = summary(&session.operation("second").await);
     // The lock is released when the test finishes, before its simulation reports the end.
     let first_finished = events
@@ -1051,12 +999,9 @@ async fn workspace_close_cancels_simulations() {
     fixture.sim_directive("lib.tb_tests.slow", "hang");
     let runtime = runtime().await;
     let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
-    session.handle.simulate(
-        requests(&["lib.tb_tests.slow"]),
-        tag("a"),
-        SimulatorKind::Ghdl,
-        None,
-    );
+    session
+        .handle
+        .simulate(requests(&["lib.tb_tests.slow"]), tag("a"), None);
     session
         .until(|event| matches!(event, WorkspaceEventKind::TestStarted { .. }))
         .await;
@@ -1117,12 +1062,7 @@ async fn workspace_without_handles_finishes_and_closes() {
     fixture.sim_directive("lib.tb_tests.slow", "sleep 300");
     let runtime = runtime().await;
     let Session { handle, mut events } = open(&runtime, &fixture, spec_source(&fixture)).await;
-    handle.simulate(
-        requests(&["lib.tb_tests.slow"]),
-        tag("a"),
-        SimulatorKind::Ghdl,
-        None,
-    );
+    handle.simulate(requests(&["lib.tb_tests.slow"]), tag("a"), None);
     drop(handle);
 
     // The simulation isn't cancelled; the workspace closes once it is done.
@@ -1170,25 +1110,20 @@ fn simulation_args(fixture: &Workspace, testcase: &str) -> Vec<String> {
         .collect()
 }
 
-async fn workspace_simulates_with_both_backends() {
+async fn workspace_simulates_with_the_compiled_libraries() {
     let mut fixture = Workspace::new().await;
     simulation_project(&mut fixture);
     let runtime = runtime().await;
     let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
 
-    session.handle.simulate(
-        requests(&["lib.tb_tests.pass"]),
-        tag("ghdl"),
-        SimulatorKind::Ghdl,
-        None,
-    );
-    let ghdl_events = summary(&session.operation("ghdl").await);
+    session
+        .handle
+        .simulate(requests(&["lib.tb_tests.pass"]), tag("a"), None);
+    let first = summary(&session.operation("a").await);
     assert_eq!(
-        ghdl_events.last().map(String::as_str),
-        Some("simulation_finished ghdl 1/0/0")
+        first.last().map(String::as_str),
+        Some("simulation_finished a 1/0/0")
     );
-    let ghdl_args = simulation_args(&fixture, "lib.tb_tests.pass");
-    assert_eq!(ghdl_args[0], "--elab-run");
     let compiled = fixture.take_log();
     assert_eq!(
         compiled
@@ -1199,22 +1134,19 @@ async fn workspace_simulates_with_both_backends() {
         "{compiled:?}"
     );
 
-    session.handle.simulate(
-        requests(&["lib.tb_tests.pass"]),
-        tag("risim"),
-        SimulatorKind::Risim,
-        None,
-    );
-    let events = summary(&session.operation("risim").await);
+    session
+        .handle
+        .simulate(requests(&["lib.tb_tests.pass"]), tag("b"), None);
+    let events = summary(&session.operation("b").await);
     assert_eq!(
         events,
         [
-            "compile_started risim 0",
-            "compile_finished risim true Some([\"lib.tb_tests.pass\"])",
-            "simulation_started risim [lib.tb_tests.pass]",
+            "compile_started b 0",
+            "compile_finished b true Some([\"lib.tb_tests.pass\"])",
+            "simulation_started b [lib.tb_tests.pass]",
             "test_started lib.tb_tests.pass",
             "test_finished lib.tb_tests.pass Passed",
-            "simulation_finished risim 1/0/0",
+            "simulation_finished b 1/0/0",
         ]
     );
     // The libraries of the first simulation are up to date.
@@ -1223,143 +1155,15 @@ async fn workspace_simulates_with_both_backends() {
         !log.iter().any(|line| line.starts_with("start ")),
         "{log:?}"
     );
-    let risim_args = simulation_args(&fixture, "lib.tb_tests.pass");
-    assert_eq!(risim_args[0], "run");
-    let ghdl = format!("--risim-ghdl={}", runtime.simulator().path());
-    assert!(risim_args.contains(&ghdl), "{risim_args:?}");
+    let args = simulation_args(&fixture, "lib.tb_tests.pass");
+    assert_eq!(args[0], "run");
+    let workdir = format!("--workdir={}", fixture.layout.library_dir("lib"));
+    assert!(args.contains(&workdir), "{args:?}");
     assert!(
-        risim_args
-            .iter()
+        args.iter()
             .any(|arg| arg.starts_with("--generic=runner_cfg=")),
-        "{risim_args:?}"
+        "{args:?}"
     );
-    assert_eq!(risim_args.last().map(String::as_str), Some("tb_tests(tb)"));
-    session.handle.close().await;
-}
-
-async fn workspace_reports_an_unavailable_backend() {
-    let mut fixture = Workspace::new().await;
-    simulation_project(&mut fixture);
-    let runtime = runtime_with(None).await;
-    let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
-
-    session
-        .handle
-        .simulate(requests(&["*"]), tag("s"), SimulatorKind::Risim, None);
-    let events = summary(&session.operation("s").await);
-    assert_eq!(
-        events[events.len() - 3..],
-        [
-            "compile_finished s true Some([\"*\"])",
-            "simulation_started s []",
-            "simulation_finished s 0/0/0",
-        ]
-    );
-    let snapshot = session.handle.snapshot();
-    let simulation = snapshot.diagnostics.get(DiagnosticSource::Simulation);
-    assert_eq!(simulation.len(), 1, "{simulation:?}");
-    assert_eq!(simulation[0].severity, Severity::Error);
-    assert_eq!(
-        simulation[0].message,
-        "the risim backend is unavailable: risim-runner is not configured"
-    );
-    assert!(snapshot.results.is_empty());
-    assert_eq!(simulation_log(&fixture), Vec::<String>::new());
-
-    // The ghdl backend still works, and its simulation replaces the diagnostic.
-    session
-        .handle
-        .simulate(requests(&["*.pass"]), tag("g"), SimulatorKind::Ghdl, None);
-    let ghdl_events = summary(&session.operation("g").await);
-    assert_eq!(
-        ghdl_events.last().map(String::as_str),
-        Some("simulation_finished g 1/0/0")
-    );
-    assert_eq!(
-        session
-            .handle
-            .snapshot()
-            .diagnostics
-            .get(DiagnosticSource::Simulation),
-        []
-    );
-    session.handle.close().await;
-}
-
-async fn workspace_queues_simulates_of_different_backends() {
-    let mut fixture = Workspace::new().await;
-    simulation_project(&mut fixture);
-    fixture.write(
-        "tb/tb_implicit.vhd",
-        &format!("-- fake: sleep 600\n{}", testbench("tb_implicit", "")),
-    );
-    let runtime = runtime().await;
-    let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
-
-    session.handle.compile(tag("a"), None);
-    session.handle.simulate(
-        requests(&["lib.tb_tests.pass"]),
-        tag("b"),
-        SimulatorKind::Ghdl,
-        None,
-    );
-    session.handle.simulate(
-        requests(&["lib.tb_implicit.all"]),
-        tag("c"),
-        SimulatorKind::Risim,
-        None,
-    );
-    // Merges into the last queued operation, of the same backend.
-    session.handle.simulate(
-        requests(&["lib.tb_tests.slow"]),
-        tag("d"),
-        SimulatorKind::Risim,
-        None,
-    );
-    let mut events = Vec::new();
-    let mut finished = Vec::new();
-    while finished.len() < 2 {
-        let event = session.next().await;
-        if let WorkspaceEventKind::SimulationFinished { tags, .. } = &event {
-            finished.push(tags_text(tags));
-        }
-        events.push(event);
-    }
-    let events = summary(&events);
-    let compiles: Vec<&str> = events
-        .iter()
-        .map(String::as_str)
-        .filter(|event| event.starts_with("compile_"))
-        .collect();
-    assert_eq!(
-        compiles,
-        [
-            "compile_started a 2",
-            "compile_finished a true None",
-            "compile_started b 0",
-            "compile_finished b true Some([\"lib.tb_tests.pass\"])",
-            "compile_started c,d 0",
-            "compile_finished c,d true Some([\"lib.tb_implicit.all\", \"lib.tb_tests.slow\"])",
-        ]
-    );
-    let simulations: Vec<&str> = events
-        .iter()
-        .map(String::as_str)
-        .filter(|event| event.starts_with("simulation_started"))
-        .collect();
-    assert_eq!(
-        simulations,
-        [
-            "simulation_started b [lib.tb_tests.pass]",
-            "simulation_started c,d [lib.tb_implicit.all; lib.tb_tests.slow]",
-        ]
-    );
-    for (testcase, mode) in [
-        ("lib.tb_tests.pass", "--elab-run"),
-        ("lib.tb_implicit.all", "run"),
-        ("lib.tb_tests.slow", "run"),
-    ] {
-        assert_eq!(simulation_args(&fixture, testcase)[0], mode, "{testcase}");
-    }
+    assert_eq!(args.last().map(String::as_str), Some("tb_tests(tb)"));
     session.handle.close().await;
 }

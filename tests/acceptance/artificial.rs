@@ -6,7 +6,6 @@
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
-use risim_vunit_frontend::SimulatorKind;
 use risim_vunit_frontend::TestOutcome;
 use risim_vunit_frontend::spec::AssertLevel;
 use risim_vunit_frontend::spec::ConfigurationSpec;
@@ -21,12 +20,12 @@ use crate::harness::generics;
 use crate::harness::target;
 
 /// Compiles and runs all testcases and compares the outcomes with `test_artificial.py`.
-pub async fn artificial(simulator: SimulatorKind) {
+pub async fn artificial() {
     let runtime = harness::runtime().await;
     let root = harness::Root::new();
     let mut spec = ProjectSpec::new();
     artificial_spec(&mut spec);
-    let outcome = harness::simulate_all(&runtime, &root.path, &spec, simulator).await;
+    let outcome = harness::simulate_all(&runtime, &root.path, &spec).await;
     outcome.assert_outcomes(
         &harness::outcomes(ARTIFICIAL_EXPECTED),
         RisimDeviations::None,
@@ -94,7 +93,7 @@ fn artificial_spec(spec: &mut ProjectSpec) {
         }],
         ..target("lib.tb_same_sim_from_python_all_pass")
     });
-    // configure_tb_set_generic; risim-ghdl is GHDL, which can't override real and time generics.
+    // configure_tb_set_generic; `is_ghdl` skips the real and time generics, as for GHDL.
     let long_value = "0123456789abcdef".repeat(512);
     configs.push(TestConfigSpec {
         generics: generics(&[

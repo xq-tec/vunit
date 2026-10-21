@@ -7,7 +7,6 @@
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
-use risim_vunit_frontend::SimulatorKind;
 use risim_vunit_frontend::TestOutcome;
 use risim_vunit_frontend::spec::ProjectSpec;
 
@@ -20,7 +19,7 @@ use crate::harness::RisimDeviations;
 /// The entity `cells.cell` is reached only through the default binding of these instances, so it
 /// is compiled only if component resolution looks beyond the testbench's own library. An unbound
 /// instance leaves its output at `'U'`, which fails the testbench.
-pub async fn component_binding(simulator: SimulatorKind) {
+pub async fn component_binding() {
     let runtime = harness::runtime().await;
     let root = harness::Root::new();
     let dir = harness::fixtures_dir().join("component_binding");
@@ -33,7 +32,7 @@ pub async fn component_binding(simulator: SimulatorKind) {
         ],
     );
     spec.add_library("top", [dir.join("tb_component_binding.vhd").to_string()]);
-    let outcome = harness::simulate_all(&runtime, &root.path, &spec, simulator).await;
+    let outcome = harness::simulate_all(&runtime, &root.path, &spec).await;
     outcome.assert_outcomes(
         &harness::outcomes(&[("top.tb_component_binding.all", TestOutcome::Passed)]),
         RisimDeviations::None,

@@ -4,14 +4,14 @@
 
 //! Integration tests of compile and simulation operations.
 //!
-//! The binary doubles as a fake risim-ghdl and risim-runner (see `fake_ghdl.rs`), so the tests
-//! run everywhere without a simulator. The trial `real_risim_ghdl_compiles_uart` uses the
-//! risim-ghdl named by `RISIM_GHDL` and is ignored without it; the end-to-end tests with
-//! risim-ghdl are in the `acceptance` target.
+//! The binary doubles as a fake risim-runner (see `fake_risim.rs`), so the tests run everywhere
+//! without a simulator. The trial `real_risim_compiles_uart` uses the risim-runner named by
+//! `RISIM_RUNNER` and is ignored without it; the end-to-end tests with risim-runner are in the
+//! `acceptance` target.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
-mod fake_ghdl;
+mod fake_risim;
 #[path = "../common/trial.rs"]
 mod trial;
 mod workspace;
@@ -48,7 +48,6 @@ use risim_vunit_frontend::runner::SimulationPlan;
 use risim_vunit_frontend::runner::SimulationReport;
 use risim_vunit_frontend::runner::SimulationRequest;
 use risim_vunit_frontend::runtime::ProcessLimit;
-use risim_vunit_frontend::simulator::Backend;
 use risim_vunit_frontend::simulator::Simulator;
 use risim_vunit_frontend::sources;
 use risim_vunit_frontend::sources::SourceCache;
@@ -68,13 +67,13 @@ use tokio_util::sync::CancellationToken;
 use self::trial::trial;
 
 fn main() -> ExitCode {
-    if env::var_os(fake_ghdl::ENV).is_some() {
-        return fake_ghdl::main();
+    if env::var_os(fake_risim::ENV).is_some() {
+        return fake_risim::main();
     }
     // SAFETY: No other threads exist yet. Child processes inherit the variable and act as the
     // fake simulator.
     unsafe {
-        env::set_var(fake_ghdl::ENV, "1");
+        env::set_var(fake_risim::ENV, "1");
     }
 
     let args = Arguments::from_args();
@@ -84,6 +83,10 @@ fn main() -> ExitCode {
             compiles_in_order_and_incrementally,
         ),
         trial("failure_skips_dependents", failure_skips_dependents),
+        trial(
+            "files_of_a_library_compile_in_one_batch",
+            files_of_a_library_compile_in_one_batch,
+        ),
         trial("independent_libraries_compile_in_parallel", || {
             parallelism(4, true)
         }),
@@ -130,11 +133,8 @@ fn main() -> ExitCode {
             "simulation_spawn_failure_fails_the_test",
             simulation_spawn_failure_fails_the_test,
         ),
-        trial(
-            "real_risim_ghdl_compiles_uart",
-            real_risim_ghdl_compiles_uart,
-        )
-        .with_ignored_flag(env::var_os("RISIM_GHDL").is_none()),
+        trial("real_risim_compiles_uart", real_risim_compiles_uart)
+            .with_ignored_flag(env::var_os("RISIM_RUNNER").is_none()),
     ];
     let trials = trials.into_iter().chain(workspace::trials()).collect();
     libtest_mimic::run(&args, trials).exit_code()
@@ -366,7 +366,6 @@ impl Workspace {
                 project: &loaded.project,
                 discovery: &found,
                 sim_options: &self.spec.sim_options,
-                gui_supported: true,
             },
             &requests,
         );
@@ -388,7 +387,7 @@ impl Workspace {
         };
         let context = SimulationContext {
             workspace_root: self.root.clone(),
-            backend: Backend::Ghdl(self.simulator.clone()),
+            simulator: self.simulator.clone(),
             limit: ProcessLimit::from(Arc::clone(&self.semaphore)),
             results: Arc::clone(results),
             testcase_locks: Arc::default(),
@@ -409,7 +408,7 @@ impl Workspace {
 
     /// Adds a directive for `testcase` to the fake simulator.
     fn sim_directive(&self, testcase: &str, directive: &str) {
-        let path = self.root.join(fake_ghdl::SIM_DIRECTIVES);
+        let path = self.root.join(fake_risim::SIM_DIRECTIVES);
         let mut directives = fs::read_to_string(&path).unwrap_or_default();
         for part in [testcase, "\t", directive, "\n"] {
             directives.push_str(part);
@@ -417,9 +416,17 @@ impl Workspace {
         fs::write(&path, directives).expect("write the directives");
     }
 
+    /// Returns and clears the log of the `analyze` calls of the fake simulator.
+    fn take_calls(&self) -> Vec<String> {
+        let path = self.root.join(fake_risim::CALLS);
+        let log = fs::read_to_string(&path).unwrap_or_default();
+        let _ignored = fs::remove_file(&path);
+        log.lines().map(str::to_owned).collect()
+    }
+
     /// Returns and clears the log of the fake simulator.
     fn take_log(&self) -> Vec<String> {
-        let path = self.root.join(fake_ghdl::LOG);
+        let path = self.root.join(fake_risim::LOG);
         let log = fs::read_to_string(&path).unwrap_or_default();
         let _ignored = fs::remove_file(&path);
         log.lines().map(str::to_owned).collect()
@@ -555,6 +562,77 @@ async fn failure_skips_dependents() {
     );
     assert_eq!(fixed.with_status(FileStatus::UpToDate), ["b_pkg.vhd"]);
     assert!(fixed.report.diagnostics.values().all(Vec::is_empty));
+}
+
+async fn files_of_a_library_compile_in_one_batch() {
+    let mut workspace = Workspace::new().await;
+    workspace.standard_project();
+    workspace.write(
+        "src/pkg.vhd",
+        "-- fake: warning first\n-- fake: error broken\npackage pkg is end package;\n",
+    );
+    workspace.write(
+        "src/ent.vhd",
+        "use work.pkg.all;\n-- fake: error depends on the broken one\nentity ent is end entity;\n\
+         architecture rtl of ent is begin end architecture;\n",
+    );
+    let mut state = CompileState::default();
+    let failed = workspace.compile(&mut state).await;
+    assert_eq!(
+        failed.statuses(),
+        [
+            ("pkg.vhd", FileStatus::Failed),
+            ("ent.vhd", FileStatus::Skipped),
+            ("tb_top.vhd", FileStatus::Skipped),
+        ]
+    );
+    assert_eq!(workspace.take_calls(), ["lib pkg.vhd ent.vhd tb_top.vhd"]);
+    // The reports go to their files; those of skipped files are dropped.
+    let messages: Vec<(&str, &str)> = failed
+        .report
+        .diagnostics
+        .iter()
+        .flat_map(|(key, diagnostics)| {
+            diagnostics
+                .iter()
+                .map(move |diagnostic| (file_name(key.as_str()), diagnostic.message.as_str()))
+        })
+        .collect();
+    assert_eq!(messages, [("pkg.vhd", "first"), ("pkg.vhd", "broken")]);
+    let started: Vec<(&str, usize)> = failed
+        .events
+        .iter()
+        .filter_map(|(_, event)| match event {
+            CompileEvent::FileStarted { file, index, .. } => {
+                Some((file_name(file.as_str()), *index))
+            },
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started, [("pkg.vhd", 1), ("ent.vhd", 2), ("tb_top.vhd", 3)]);
+
+    // Incremental compiles batch only the files that need compiling.
+    workspace.write("src/pkg.vhd", "package pkg is end package;\n");
+    workspace.write(
+        "src/ent.vhd",
+        "use work.pkg.all;\nentity ent is end entity;\n\
+         architecture rtl of ent is begin end architecture;\n",
+    );
+    let fixed = workspace.compile(&mut state).await;
+    assert_eq!(fixed.report.status, CompileStatus::Succeeded);
+    assert_eq!(workspace.take_calls(), ["lib pkg.vhd ent.vhd tb_top.vhd"]);
+    workspace.write("src/pkg.vhd", "package pkg is end package;\n-- changed\n");
+    workspace.compile(&mut state).await;
+    assert_eq!(workspace.take_calls(), ["lib pkg.vhd ent.vhd tb_top.vhd"]);
+    workspace.write(
+        "src/tb_top.vhd",
+        &format!(
+            "-- changed\n{}",
+            testbench("tb_top", "dut: entity work.ent;")
+        ),
+    );
+    workspace.compile(&mut state).await;
+    assert_eq!(workspace.take_calls(), ["lib tb_top.vhd"]);
 }
 
 async fn parallelism(permits: usize, expect_overlap: bool) {
@@ -724,7 +802,7 @@ async fn spawn_failure_fails_the_file() {
     let mut workspace = Workspace::new().await;
     workspace.standard_project();
     let mut identity = workspace.simulator.identity().clone();
-    identity.path = workspace.root.join("missing-risim-ghdl");
+    identity.path = workspace.root.join("missing-risim");
     workspace.simulator = Simulator::from_identity(identity).expect("valid identity");
     let run = workspace.compile(&mut CompileState::default()).await;
     assert_eq!(run.report.status, CompileStatus::Failed);
@@ -737,7 +815,10 @@ async fn spawn_failure_fails_the_file() {
         ]
     );
     let message = &run.report.diagnostics.values().next().expect("diagnostics")[0].message;
-    assert!(message.starts_with("failed to run risim-ghdl"), "{message}");
+    assert!(
+        message.starts_with("failed to run risim analyze"),
+        "{message}"
+    );
 }
 
 async fn dependency_cycle_fails_the_compile() {
@@ -762,14 +843,17 @@ async fn dependency_cycle_fails_the_compile() {
 }
 
 async fn detect_rejects_other_programs() {
-    let missing = Simulator::detect(Utf8Path::new("/nonexistent/risim-ghdl")).await;
+    let missing = Simulator::detect(Utf8Path::new("/nonexistent/risim")).await;
     missing.expect_err("the executable doesn't exist");
     #[cfg(unix)]
     {
         let error = Simulator::detect(Utf8Path::new("/bin/sh"))
             .await
-            .expect_err("sh isn't risim-ghdl");
-        assert!(error.to_string().contains("risim-ghdl version"), "{error}");
+            .expect_err("sh isn't risim-runner");
+        assert!(
+            error.to_string().contains("risim-runner version"),
+            "{error}"
+        );
     }
 }
 
@@ -873,7 +957,7 @@ async fn simulates_and_records_results() {
     let pass_args = args("lib.tb_tests.pass");
     let pass_dir = TestOutputPaths::new(&workspace.layout, "lib.tb_tests.pass").dir;
     assert!(
-        pass_args.contains(&format!("-goutput_path={pass_dir}/")),
+        pass_args.contains(&format!("--generic=output_path={pass_dir}/")),
         "{pass_args}"
     );
     assert!(
@@ -885,10 +969,10 @@ async fn simulates_and_records_results() {
         pass_args.contains("--name=lib.tb_tests.pass"),
         "{pass_args}"
     );
-    assert!(!pass_args.contains("--wait"), "{pass_args}");
+    assert!(!pass_args.contains("--paused"), "{pass_args}");
     assert!(args("lib.tb_tests.fail, really").contains("enabled_test_cases : fail,,,, really,"));
     let implicit_args = args("lib.tb_implicit.all");
-    assert!(implicit_args.contains("--wait"), "{implicit_args}");
+    assert!(implicit_args.contains("--paused"), "{implicit_args}");
     assert!(
         implicit_args.contains("enabled_test_cases : ,"),
         "{implicit_args}"
@@ -1030,7 +1114,7 @@ async fn simulation_spawn_failure_fails_the_test() {
     let mut workspace = Workspace::new().await;
     simulation_project(&mut workspace);
     let mut identity = workspace.simulator.identity().clone();
-    let missing = workspace.root.join("missing-risim-ghdl");
+    let missing = workspace.root.join("missing-risim");
     identity.path.clone_from(&missing);
     workspace.simulator = Simulator::from_identity(identity).expect("valid identity");
     let results = Arc::new(ResultStore::load(&workspace.layout));
@@ -1055,14 +1139,16 @@ async fn simulation_spawn_failure_fails_the_test() {
     );
 }
 
-/// Compiles the UART example of VUnit (`tests/operations/uart`) with the real risim-ghdl, then
+/// Compiles the UART example of VUnit (`tests/operations/uart`) with the real risim-runner, then
 /// recompiles after edits.
 #[expect(clippy::print_stderr, reason = "reports timings")]
-async fn real_risim_ghdl_compiles_uart() {
+async fn real_risim_compiles_uart() {
     let fixtures = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/operations");
     let mut workspace = Workspace::new().await;
-    let ghdl = Utf8PathBuf::from(env::var("RISIM_GHDL").expect("RISIM_GHDL"));
-    workspace.simulator = Simulator::detect(&ghdl).await.expect("detect risim-ghdl");
+    let risim = Utf8PathBuf::from(env::var("RISIM_RUNNER").expect("RISIM_RUNNER"));
+    workspace.simulator = Simulator::detect(&risim)
+        .await
+        .expect("detect risim-runner");
     let parallelism = thread::available_parallelism().map_or(4, NonZeroUsize::get);
     workspace.semaphore = Arc::new(Semaphore::new(parallelism));
 

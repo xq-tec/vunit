@@ -3,7 +3,7 @@
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
 //! Diagnostics reported to the client, conversion of byte offsets to positions, and parsing of
-//! GHDL messages.
+//! the JSON report lines of `risim analyze --message-format=json`.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -188,45 +188,19 @@ impl<'text> LineIndex<'text> {
             .unwrap_or(self.text.len());
         let line = self.text.get(line_start..line_end).unwrap_or_default();
         let prefix_len = offset - line_start;
+        // An offset inside a character is the position of that character.
         let column = match std::str::from_utf8(line) {
             Ok(line) => line
-                .get(..prefix_len)
-                .map_or(prefix_len, |prefix| prefix.encode_utf16().count()),
+                .char_indices()
+                .take_while(|&(start, ch)| start + ch.len_utf8() <= prefix_len)
+                .map(|(_, ch)| ch.len_utf16())
+                .sum(),
             Err(_) => prefix_len,
         };
         Position {
             line: saturating_u32(line_index + 1),
             column: saturating_u32(column + 1),
         }
-    }
-
-    /// Converts a GHDL position to a [`Position`] of this text.
-    ///
-    /// GHDL counts columns in bytes and expands tabs to multiples of [`GHDL_TAB_STOP`]
-    /// (`Files_Map.Coord_To_Col`). A column past the end of the line is clamped to the end; a
-    /// line past the end of the text is returned unchanged.
-    pub fn ghdl_position(&self, position: Position) -> Position {
-        let Some(&line_start) = self
-            .line_starts
-            .get((position.line as usize).saturating_sub(1))
-        else {
-            return position;
-        };
-        let line_end = self.text[line_start..]
-            .iter()
-            .position(|&byte| byte == b'\n' || byte == b'\r')
-            .map_or(self.text.len(), |length| line_start + length);
-        let target = position.column as usize;
-        let mut column = 1;
-        let mut offset = line_start;
-        while offset < line_end && column < target {
-            if self.text[offset] == b'\t' {
-                column += GHDL_TAB_STOP - column % GHDL_TAB_STOP;
-            }
-            column += 1;
-            offset += 1;
-        }
-        self.position(offset)
     }
 
     /// Returns the range covering the bytes in `span`; an empty span covers one character.
@@ -257,68 +231,156 @@ pub fn error_chain(error: &dyn Error) -> String {
     message
 }
 
-/// The tab width GHDL assumes when it computes columns (`-ftabstop`, default 8).
-pub const GHDL_TAB_STOP: usize = 8;
-
-/// A diagnostic line of GHDL output: `<file>:<line>:<column>:<severity>:<message>`.
+/// A line of the output of `risim analyze --message-format=json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GhdlMessage<'line> {
-    /// The file as GHDL printed it; relative paths are relative to GHDL's working directory.
-    pub file: &'line str,
-    /// The 1-based position.
-    pub position: Position,
-    /// The severity.
-    pub severity: Severity,
-    /// The trimmed message.
-    pub message: &'line str,
+pub enum ReportLine {
+    /// A diagnostic record.
+    Diagnostic(AnalysisReport),
+    /// A JSON record of another type, which a later risim-runner may print.
+    Other,
+    /// Not a JSON record, such as a crash message.
+    Text,
 }
 
-impl GhdlMessage<'_> {
-    /// Parses a GHDL diagnostic line; returns `None` for any other line.
-    ///
-    /// Example: `C:\proj\tb.vhd:7:32:warning: example warning`.
-    pub fn parse(line: &str) -> Option<GhdlMessage<'_>> {
-        [
-            (":error:", Severity::Error),
-            (":warning:", Severity::Warning),
-            (":note:", Severity::Note),
-        ]
-        .into_iter()
-        .find_map(|(marker, severity)| {
-            let (location, message) = line.split_once(marker)?;
-            let message = message.trim();
-            let (location, column) = location.rsplit_once(':')?;
-            let (file, line_number) = location.rsplit_once(':')?;
-            let column: u32 = column.parse().ok()?;
-            let line_number: u32 = line_number.parse().ok()?;
-            (!message.is_empty() && !file.is_empty() && line_number > 0 && column > 0).then_some(
-                GhdlMessage {
-                    file,
-                    position: Position {
-                        line: line_number,
-                        column,
-                    },
-                    severity,
-                    message,
-                },
-            )
-        })
+impl ReportLine {
+    /// Parses a line of output.
+    pub fn parse(line: &str) -> Self {
+        let Ok(record) = serde_json::from_str::<serde_json::Value>(line) else {
+            return Self::Text;
+        };
+        if !record.is_object() {
+            return Self::Text;
+        }
+        if record.get("type").and_then(serde_json::Value::as_str) != Some("diagnostic") {
+            return Self::Other;
+        }
+        serde_json::from_value(record).map_or(Self::Other, Self::Diagnostic)
+    }
+}
+
+/// A diagnostic record of hydrolyze's JSON report format (see `hydrolyze/doc/diagnostics.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AnalysisReport {
+    /// The severity.
+    pub severity: Severity,
+    /// The message.
+    pub message: String,
+    /// Where the problem is; absent for problems of a library or an archive.
+    #[serde(default)]
+    pub location: Option<ReportLocation>,
+    /// Further information, each with an optional location.
+    #[serde(default)]
+    pub notes: Vec<ReportNote>,
+}
+
+/// A location of a JSON report.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ReportLocation {
+    /// The file as given to `risim analyze`, or `<builtin:name>` or `<memory:name>` for a file
+    /// that isn't on disk.
+    pub file: String,
+    /// The first character.
+    #[serde(default)]
+    pub start: Option<ReportPosition>,
+    /// The position after the last character.
+    #[serde(default)]
+    pub end: Option<ReportPosition>,
+}
+
+/// A position of a JSON report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct ReportPosition {
+    /// The 1-based line.
+    pub line: u32,
+    /// The 1-based column, in characters.
+    pub column: u32,
+    /// The byte offset in the file.
+    pub offset: usize,
+}
+
+/// A note of a JSON report.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct ReportNote {
+    /// The message.
+    pub message: String,
+    /// Where the note points to.
+    #[serde(default)]
+    pub location: Option<ReportLocation>,
+}
+
+impl ReportLocation {
+    /// The file on disk, resolved against `cwd`; `None` for a file that isn't on disk.
+    pub fn path(&self, cwd: &Utf8Path) -> Option<Utf8PathBuf> {
+        let is_virtual = self.file.starts_with('<') && self.file.ends_with('>');
+        (!is_virtual && !self.file.is_empty()).then(|| cwd.join(&self.file))
     }
 
-    /// Converts the message into a [`Diagnostic`], resolving a relative file against `cwd`.
+    /// The range in the file with the contents `source`, from the byte offsets; without the
+    /// contents, from the lines and columns. `None` if the location has no positions.
+    pub fn range(&self, source: Option<&[u8]>) -> Option<Range> {
+        let (start, end) = (self.start?, self.end?);
+        if let Some(source) = source {
+            return Some(LineIndex::new(source).range(start.offset..end.offset));
+        }
+        let start_position = Position::new(start.line, start.column);
+        // `end` is exclusive.
+        let end_position = if (end.line, end.column) > (start.line, start.column + 1) {
+            Position::new(end.line, end.column.saturating_sub(1).max(1))
+        } else {
+            start_position
+        };
+        Some(Range {
+            start: start_position,
+            end: end_position,
+        })
+    }
+}
+
+impl AnalysisReport {
+    /// Converts the report into diagnostics: the report itself, then one note per note with a
+    /// location on disk. Notes without such a location are appended to the message.
     ///
-    /// `source` is the contents of the file, if it could be read; it is needed to convert GHDL's
-    /// column (see [`LineIndex::ghdl_position`]). Without it, the column is kept.
-    pub fn to_diagnostic(&self, cwd: &Utf8Path, source: Option<&[u8]>) -> Diagnostic {
-        let position = source.map_or(self.position, |source| {
-            LineIndex::new(source).ghdl_position(self.position)
-        });
-        Diagnostic::new(self.severity, self.message)
-            .in_file(cwd.join(self.file))
-            .at(Some(Range {
-                start: position,
-                end: position,
-            }))
+    /// Relative paths are resolved against `cwd`; `source` returns the contents of a file, for
+    /// converting byte offsets. A report without a location on disk is attached to `file`, the
+    /// file that was analysed, without a range.
+    pub fn to_diagnostics<'source>(
+        &self,
+        cwd: &Utf8Path,
+        file: &Utf8Path,
+        mut source: impl FnMut(&Utf8Path) -> Option<&'source [u8]>,
+    ) -> Vec<Diagnostic> {
+        let mut message = self.message.clone();
+        let mut notes = Vec::new();
+        for note in &self.notes {
+            let located = note.location.as_ref().and_then(|location| {
+                let path = location.path(cwd)?;
+                let range = location.range(source(&path));
+                Some((path, range))
+            });
+            if let Some((path, range)) = located {
+                notes.push(
+                    Diagnostic::new(Severity::Note, note.message.clone())
+                        .in_file(path)
+                        .at(range),
+                );
+            } else {
+                message.push('\n');
+                message.push_str(&note.message);
+            }
+        }
+        let diagnostic = Diagnostic::new(self.severity, message);
+        let diagnostic = match self
+            .location
+            .as_ref()
+            .and_then(|location| Some((location, location.path(cwd)?)))
+        {
+            Some((location, path)) => {
+                let range = location.range(source(&path));
+                diagnostic.in_file(path).at(range)
+            },
+            None => diagnostic.in_file(file),
+        };
+        std::iter::once(diagnostic).chain(notes).collect()
     }
 }
 
@@ -364,34 +426,6 @@ mod tests {
     }
 
     #[test]
-    fn ghdl_positions_expand_tabs_and_count_bytes() {
-        // risim-ghdl reports `x` at 6:17 and `y` at 10:21 for these lines.
-        let text = "line 1\n\t\tx <= 1;\n    report \"äää\" & y;\r\nlast".as_bytes();
-        let index = LineIndex::new(text);
-        assert_eq!(
-            index.ghdl_position(Position::new(2, 17)),
-            Position::new(2, 3)
-        );
-        assert_eq!(
-            index.ghdl_position(Position::new(3, 23)),
-            Position::new(3, 20)
-        );
-        // Past the end of the line, or of the text.
-        assert_eq!(
-            index.ghdl_position(Position::new(1, 99)),
-            Position::new(1, 7)
-        );
-        assert_eq!(
-            index.ghdl_position(Position::new(4, 99)),
-            Position::new(4, 5)
-        );
-        assert_eq!(
-            index.ghdl_position(Position::new(9, 3)),
-            Position::new(9, 3)
-        );
-    }
-
-    #[test]
     fn range_end_is_last_character() {
         let index = LineIndex::new(b"entity foo is");
         let range = index.range(7..10);
@@ -400,58 +434,121 @@ mod tests {
     }
 
     #[test]
-    fn ghdl_message_with_location() {
-        let line = "/proj/tb_bad_syntax.vhd:4:28:error: missing \";\" at end of use clause";
+    fn report_lines() {
         assert_eq!(
-            GhdlMessage::parse(line),
-            Some(GhdlMessage {
-                file: "/proj/tb_bad_syntax.vhd",
-                position: Position::new(4, 28),
-                severity: Severity::Error,
-                message: "missing \";\" at end of use clause",
+            ReportLine::parse("thread 'main' panicked"),
+            ReportLine::Text
+        );
+        assert_eq!(ReportLine::parse("42"), ReportLine::Text);
+        assert_eq!(
+            ReportLine::parse(r#"{"type":"summary"}"#),
+            ReportLine::Other
+        );
+        assert_eq!(
+            ReportLine::parse(r#"{"type":"diagnostic","message":"no severity"}"#),
+            ReportLine::Other
+        );
+        assert_eq!(
+            ReportLine::parse(
+                r#"{"type":"diagnostic","severity":"warning","code":"x","message":"m","relaxable":false}"#
+            ),
+            ReportLine::Diagnostic(AnalysisReport {
+                severity: Severity::Warning,
+                message: "m".to_owned(),
+                location: None,
+                notes: Vec::new(),
             })
         );
     }
 
-    #[test]
-    fn ghdl_message_with_windows_path() {
-        let line = r"C:\proj\tb.vhd:7:32:warning: example warning";
-        let message = GhdlMessage::parse(line).unwrap();
-        assert_eq!(message.file, r"C:\proj\tb.vhd");
-        assert_eq!(message.severity, Severity::Warning);
-        assert_eq!(message.message, "example warning");
-    }
-
-    #[test]
-    fn ghdl_message_rejects_other_lines() {
-        for line in [
-            "use ieee.std_logic_1164.all",
-            "                           ^",
-            "risim-ghdl:error: compilation error",
-            "/a.vhd:0:3:error: zero line",
-            "/a.vhd:x:3:error: no line",
-            "/a.vhd:3:4:error:   ",
-            ":3:4:note: no file",
-        ] {
-            assert_eq!(GhdlMessage::parse(line), None, "{line}");
+    fn parse_report(line: &str) -> AnalysisReport {
+        match ReportLine::parse(line) {
+            ReportLine::Diagnostic(report) => report,
+            other => panic!("not a diagnostic: {other:?}"),
         }
     }
 
     #[test]
-    fn ghdl_message_resolves_relative_paths() {
-        let root = Utf8Path::new("/root");
-        let in_tab = GhdlMessage::parse("src/a.vhd:1:2:note: hello").unwrap();
-        let after_tab = GhdlMessage::parse("src/a.vhd:1:9:note: hello").unwrap();
-        let expected = "/root/src/a.vhd:1:2: note: hello";
-        assert_eq!(in_tab.to_diagnostic(root, None).to_string(), expected);
-        assert_eq!(
-            in_tab.to_diagnostic(root, Some(b"\tx")).to_string(),
-            expected
+    fn report_ranges_come_from_offsets() {
+        // The tab and the "ä" make the columns of the report differ from those of the client.
+        let source = "entity e is\n\tconstant \u{e4}: x;\nend;\n";
+        let report = parse_report(
+            r#"{"type":"diagnostic","severity":"error","code":"c","message":"bad","relaxable":false,"unit":"work.e","location":{"file":"src/e.vhd","start":{"line":2,"column":11,"offset":22},"end":{"line":2,"column":12,"offset":24}},"notes":[{"message":"declared here","location":{"file":"/abs/p.vhd","start":{"line":1,"column":1,"offset":0},"end":{"line":1,"column":3,"offset":2}}},{"message":"in the standard","location":{"file":"<builtin:standard>","start":{"line":1,"column":1,"offset":0},"end":{"line":1,"column":2,"offset":1}}},{"message":"no location"}]}"#,
+        );
+        let mut read = Vec::new();
+        let diagnostics = report.to_diagnostics(
+            Utf8Path::new("/root"),
+            Utf8Path::new("/root/src/e.vhd"),
+            |path| {
+                read.push(path.to_owned());
+                (path == "/root/src/e.vhd").then_some(source.as_bytes())
+            },
         );
         assert_eq!(
-            after_tab.to_diagnostic(root, Some(b"\tx")).to_string(),
-            expected
+            diagnostics,
+            [
+                Diagnostic::error("bad\nin the standard\nno location")
+                    .in_file("/root/src/e.vhd")
+                    .at(Some(Range {
+                        start: Position::new(2, 11),
+                        end: Position::new(2, 11),
+                    })),
+                Diagnostic::new(Severity::Note, "declared here")
+                    .in_file("/abs/p.vhd")
+                    .at(Some(Range {
+                        start: Position::new(1, 1),
+                        end: Position::new(1, 2),
+                    })),
+            ]
         );
+        assert_eq!(read, ["/abs/p.vhd", "/root/src/e.vhd"]);
+    }
+
+    #[test]
+    fn reports_without_location_belong_to_the_analysed_file() {
+        let report = parse_report(
+            r#"{"type":"diagnostic","severity":"error","code":"io","message":"cannot read","relaxable":false}"#,
+        );
+        let diagnostics =
+            report.to_diagnostics(Utf8Path::new("/root"), Utf8Path::new("/root/a.vhd"), |_| {
+                None
+            });
+        assert_eq!(
+            diagnostics,
+            [Diagnostic::error("cannot read").in_file("/root/a.vhd")]
+        );
+    }
+
+    #[test]
+    fn report_ranges_without_source_use_lines_and_columns() {
+        let location = |start: (u32, u32), end: (u32, u32)| ReportLocation {
+            file: "a.vhd".to_owned(),
+            start: Some(ReportPosition {
+                line: start.0,
+                column: start.1,
+                offset: 0,
+            }),
+            end: Some(ReportPosition {
+                line: end.0,
+                column: end.1,
+                offset: 0,
+            }),
+        };
+        let range = |start: (u32, u32), end: (u32, u32)| {
+            Some(Range {
+                start: Position::new(start.0, start.1),
+                end: Position::new(end.0, end.1),
+            })
+        };
+        assert_eq!(location((2, 3), (2, 7)).range(None), range((2, 3), (2, 6)));
+        assert_eq!(location((2, 3), (2, 4)).range(None), range((2, 3), (2, 3)));
+        assert_eq!(location((2, 3), (3, 1)).range(None), range((2, 3), (3, 1)));
+        let no_positions = ReportLocation {
+            file: "a.vhd".to_owned(),
+            start: None,
+            end: None,
+        };
+        assert_eq!(no_positions.range(None), None);
     }
 
     #[test]

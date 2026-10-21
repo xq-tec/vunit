@@ -9,10 +9,10 @@
 //! - On Unix, the process gets its own process group. Cancelling sends `SIGTERM` to the group,
 //!   and `SIGKILL` after [`KILL_GRACE_PERIOD`]. On Linux, the process also gets `SIGKILL` when
 //!   the thread that spawned it ends, so that it doesn't outlive a crashed or killed parent.
-//!   Only the spawned process gets it, not its children; risim-ghdl doesn't spawn any.
+//!   Only the spawned process gets it, not its children; risim-runner doesn't spawn any.
 //! - On Windows, the process is assigned to a job object that kills its processes when it is
 //!   closed. Cancelling terminates the job. A grandchild spawned before the assignment escapes,
-//!   which is acceptable because risim-ghdl doesn't spawn children for `-a` or `--elab-run`.
+//!   which is acceptable because risim-runner doesn't spawn children.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 

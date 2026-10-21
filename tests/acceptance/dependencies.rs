@@ -6,7 +6,6 @@
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
-use risim_vunit_frontend::SimulatorKind;
 use risim_vunit_frontend::TestOutcome;
 use risim_vunit_frontend::spec::ProjectSpec;
 use risim_vunit_frontend::spec::TestConfigSpec;
@@ -18,7 +17,7 @@ use crate::harness::target;
 
 /// Some simulators require package users to be recompiled when only the package body changed.
 /// The second run swaps the package body in the same workspace and must see the new body.
-pub async fn package_body_dependencies(simulator: SimulatorKind) {
+pub async fn package_body_dependencies() {
     let runtime = harness::runtime().await;
     let root = harness::Root::new();
     let dir = harness::fixtures_dir().join("dependencies");
@@ -36,7 +35,7 @@ pub async fn package_body_dependencies(simulator: SimulatorKind) {
             generics: generics(&[("value", &value.to_string())]),
             ..target("lib.tb_pkg")
         });
-        let outcome = harness::simulate_all(&runtime, &root.path, &spec, simulator).await;
+        let outcome = harness::simulate_all(&runtime, &root.path, &spec).await;
         outcome.assert_outcomes(
             &harness::outcomes(&[("lib.tb_pkg.all", TestOutcome::Passed)]),
             RisimDeviations::None,

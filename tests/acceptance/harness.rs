@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! Running a project with the real risim-ghdl through the public workspace API.
+//! Running a project with the real risim-runner through the public workspace API.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -21,7 +21,6 @@ use risim_vunit_frontend::RequestTag;
 use risim_vunit_frontend::Runtime;
 use risim_vunit_frontend::RuntimeOptions;
 use risim_vunit_frontend::SimulationRequest;
-use risim_vunit_frontend::SimulatorKind;
 use risim_vunit_frontend::TestOutcome;
 use risim_vunit_frontend::Workspace;
 use risim_vunit_frontend::WorkspaceEvent;
@@ -32,10 +31,7 @@ use risim_vunit_frontend::spec::ProjectSpec;
 use risim_vunit_frontend::spec::TestConfigSpec;
 use tokio::sync::mpsc;
 
-/// The environment variable naming the risim-ghdl executable.
-pub const RISIM_GHDL: &str = "RISIM_GHDL";
-
-/// The environment variable naming the risim-runner executable, for the `risim` backend.
+/// The environment variable naming the risim-runner executable.
 pub const RISIM_RUNNER: &str = "RISIM_RUNNER";
 
 /// How long a whole simulate operation may take.
@@ -74,15 +70,13 @@ impl Root {
     }
 }
 
-/// A runtime with the risim-ghdl named by [`RISIM_GHDL`] and the risim-runner named by
-/// [`RISIM_RUNNER`], if set.
+/// A runtime with the risim-runner named by [`RISIM_RUNNER`].
 pub async fn runtime() -> Runtime {
-    let ghdl = Utf8PathBuf::from(env::var(RISIM_GHDL).expect("RISIM_GHDL"));
+    let risim = Utf8PathBuf::from(env::var(RISIM_RUNNER).expect("RISIM_RUNNER"));
     let parallelism =
         std::thread::available_parallelism().unwrap_or(NonZeroUsize::new(4).expect("non-zero"));
     Runtime::new(RuntimeOptions {
-        risim_ghdl: ghdl,
-        risim_runner: env::var(RISIM_RUNNER).ok().map(Utf8PathBuf::from),
+        risim,
         max_parallel_simulations: parallelism,
         max_parallel_compiles: parallelism,
     })
@@ -126,27 +120,29 @@ pub fn tests_of<'name>(names: &'name [String], testbench: &str) -> Vec<&'name st
         .collect()
 }
 
-/// Testcases whose outcome on the `risim` backend differs from the one on `ghdl`.
+/// Testcases whose outcome on risim differs from the one upstream VUnit expects.
 ///
-/// Where risim-runner differs, the trial lists the testcases and says why after `risim:`:
+/// Where risim differs, the trial lists the testcases and says why after `risim:`:
 ///
 /// - **process-local call:** a declaration of a process calls a subprogram declared in that
 ///   process, which elaboration does not support yet.
-/// - **analysis of the export:** risim-runner exports the analyzed libraries with
-///   `risim-ghdl ast-to-json`, which reports errors in a file that `risim-ghdl -a` accepted.
 /// - **instance name:** the testcase seeds its random generator with `'INSTANCE_NAME`, which
 ///   differs from GHDL's, so it draws other values.
+/// - **IEEE `to_sulv`:** the VHDL-2008 bodies of `FIXED_GENERIC_PKG` and `FLOAT_GENERIC_PKG`
+///   convert a vector with negative indices to `STD_ULOGIC_VECTOR`, whose index subtype is
+///   `NATURAL`, so the conversion fails its index check (LRM 9.3.6). The IEEE 1076-2019 sources
+///   convert a copy with indices from 0 instead.
 #[derive(Debug, Clone, Copy)]
 pub enum RisimDeviations {
-    /// Every testcase has its `ghdl` outcome.
+    /// Every testcase has its upstream outcome.
     None,
-    /// These testcases fail; all others have their `ghdl` outcome. An entry that ends with `.`
+    /// These testcases fail; all others have their upstream outcome. An entry that ends with `.`
     /// names all testcases of a testbench (`lib.tb.`).
     Failing(&'static [&'static str]),
 }
 
 impl RisimDeviations {
-    /// Changes the `ghdl` outcomes in `expected` into the `risim` ones.
+    /// Changes the upstream outcomes in `expected` into the risim ones.
     fn apply(self, expected: &mut BTreeMap<String, TestOutcome>) {
         match self {
             Self::None => {},
@@ -170,8 +166,6 @@ impl RisimDeviations {
 
 /// What a simulate operation of all testcases produced.
 pub struct Outcome {
-    /// The backend that ran the testcases.
-    pub simulator: SimulatorKind,
     /// The outcome of every testcase that ran.
     pub outcomes: BTreeMap<String, TestOutcome>,
     /// The simulator output file of every testcase that ran.
@@ -180,14 +174,8 @@ pub struct Outcome {
     pub problems: Vec<String>,
 }
 
-/// Opens a workspace at `root` with `spec`, compiles and simulates all testcases on the backend
-/// `simulator`, and closes it.
-pub async fn simulate_all(
-    runtime: &Runtime,
-    root: &Utf8Path,
-    spec: &ProjectSpec,
-    simulator: SimulatorKind,
-) -> Outcome {
+/// Opens a workspace at `root` with `spec`, compiles and simulates all testcases, and closes it.
+pub async fn simulate_all(runtime: &Runtime, root: &Utf8Path, spec: &ProjectSpec) -> Outcome {
     let (workspace, mut events) = open(runtime, root, spec).await;
     workspace.simulate(
         vec![SimulationRequest {
@@ -195,12 +183,10 @@ pub async fn simulate_all(
             gui: false,
         }],
         Some(RequestTag(TAG.to_owned())),
-        simulator,
         None,
     );
 
     let mut outcome = Outcome {
-        simulator,
         outcomes: BTreeMap::new(),
         output_paths: BTreeMap::new(),
         problems: Vec::new(),
@@ -270,7 +256,7 @@ fn has_tag(tags: &[RequestTag]) -> bool {
 
 impl Outcome {
     /// Checks that there are no problems, that the testcases in `failing` failed, and that all
-    /// others passed, changed by `risim` on the `risim` backend. Prints the end of the output of
+    /// others passed, changed by `risim`. Prints the end of the output of
     /// every unexpected outcome.
     pub fn assert_all_pass_except(&self, failing: &[&str], risim: RisimDeviations) {
         let expected: BTreeMap<String, TestOutcome> = self
@@ -294,13 +280,15 @@ impl Outcome {
         self.assert_outcomes(&expected, risim);
     }
 
-    /// Checks that there are no problems and that exactly the testcases of `ghdl` ran with
-    /// these outcomes, changed by `risim` on the `risim` backend.
-    pub fn assert_outcomes(&self, ghdl: &BTreeMap<String, TestOutcome>, risim: RisimDeviations) {
-        let mut expected = ghdl.clone();
-        if self.simulator == SimulatorKind::Risim {
-            risim.apply(&mut expected);
-        }
+    /// Checks that there are no problems and that exactly the testcases of `upstream` ran with
+    /// these outcomes, changed by `risim`.
+    pub fn assert_outcomes(
+        &self,
+        upstream: &BTreeMap<String, TestOutcome>,
+        risim: RisimDeviations,
+    ) {
+        let mut expected = upstream.clone();
+        risim.apply(&mut expected);
         assert_eq!(self.problems, Vec::<String>::new(), "diagnostics");
         assert!(!self.outcomes.is_empty(), "no testcase ran");
         let mut report = String::new();

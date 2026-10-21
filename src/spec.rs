@@ -189,24 +189,23 @@ pub struct PatternLocation {
     pub range: Range,
 }
 
-/// Options for analysis (`risim-ghdl -a`).
+/// Options for analysis (`risim analyze`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CompileOptions {
-    /// Extra analysis flags (`risim-ghdl.a_flags`).
+    /// Extra analysis options (VUnit's `ghdl.a_flags`).
     pub a_flags: Vec<String>,
 }
 
-/// Options for elaboration and simulation (`risim-ghdl --elab-run`).
+/// Options for elaboration and simulation (`risim run`).
 ///
 /// A test configuration overrides the project, and still-unset fields take their defaults when
 /// the command line is built: empty flag lists, assert stop level `error`, IEEE assertions left
 /// enabled, and a new seed per run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SimOptions {
-    /// Extra elaboration flags (`risim-ghdl.elab_flags`), passed to risim-ghdl by both backends.
+    /// Extra elaboration options (VUnit's `ghdl.elab_flags`).
     pub elab_flags: Option<Vec<String>>,
-    /// Extra simulation flags (`risim-ghdl.sim_flags`), passed to the simulator of the backend:
-    /// GHDL runtime options for `ghdl`, risim-runner options for `risim`.
+    /// Extra risim-runner options (VUnit's `ghdl.sim_flags`).
     pub sim_flags: Option<Vec<String>>,
     /// The lowest assertion severity that stops the simulation; default `error`.
     pub vhdl_assert_stop_level: Option<AssertLevel>,
@@ -253,7 +252,7 @@ pub enum AssertLevel {
 }
 
 impl AssertLevel {
-    /// The name used in configuration files and by GHDL's `--assert-level`.
+    /// The name used in configuration files and by `risim run --assert-level`.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Warning => "warning",

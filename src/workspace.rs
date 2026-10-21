@@ -52,7 +52,6 @@ use crate::diagnostics::DiagnosticSource;
 use crate::discovery::Testcase;
 pub use crate::runner::SimulationRequest;
 use crate::runtime::Runtime;
-use crate::simulator::SimulatorKind;
 use crate::sources;
 use crate::sources::SourceCache;
 use crate::spec::ProjectSpec;
@@ -164,9 +163,6 @@ pub struct WorkspaceEvent {
 /// [`SimulationStarted`](Self::SimulationStarted) nor
 /// [`SimulationFinished`](Self::SimulationFinished). A queued operation dropped by a cancel
 /// ends with `CompileFinished` without success and without `CompileStarted`.
-///
-/// A simulate operation whose backend is unavailable sends `SimulationStarted` without
-/// testcases, a `simulation` diagnostic, and `SimulationFinished` with zero counts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceEventKind {
     /// The testcase list was loaded, or changed.
@@ -282,7 +278,7 @@ impl Workspace {
         self.send(Command::Compile { tag, max_parallel });
     }
 
-    /// Compiles, then runs the testcases matching `requests` on the backend `simulator`.
+    /// Compiles, then runs the testcases matching `requests`.
     ///
     /// `max_parallel` limits the compile and simulation processes of the request, in addition
     /// to the limits of the [`Runtime`]. Merged requests use the smallest limit.
@@ -290,13 +286,11 @@ impl Workspace {
         &self,
         requests: Vec<SimulationRequest>,
         tag: Option<RequestTag>,
-        simulator: SimulatorKind,
         max_parallel: Option<NonZeroUsize>,
     ) {
         self.send(Command::Simulate {
             requests,
             tag,
-            simulator,
             max_parallel,
         });
     }

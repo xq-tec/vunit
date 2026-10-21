@@ -13,7 +13,7 @@
 //! ├── state.json                compile state and simulator identity
 //! ├── parse_cache.json          per-file parse results
 //! ├── builtins/<hash>/…         extracted VUnit/OSVVM sources
-//! ├── libraries/<lib>/          risim-ghdl work directories
+//! ├── libraries/<lib>/          library archives (`<lib>.hlib`)
 //! ├── compile_output/<lib>/<file-stem>_<hash>.txt
 //! ├── test_output/<safe-name>_<hash>/{output.txt, vunit_results}
 //! └── results.json              last result per testcase

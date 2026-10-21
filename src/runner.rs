@@ -13,8 +13,8 @@
 //!   once, and then a permit of the simulation limit. Tests whose lock is free get permits
 //!   in name order; a test whose lock is held by another simulation waits for it without
 //!   holding up the others. Each test with a permit recreates its output directory, gets a seed
-//!   and its `runner_cfg` generic, and runs the simulator of the backend (`risim-ghdl
-//!   --elab-run` or `risim run`) with stdout and stderr redirected to `output.txt`.
+//!   and its `runner_cfg` generic, and runs the simulator (`risim run`) with stdout and stderr
+//!   redirected to `output.txt`.
 //! - **Outcome:** an explicit test passed if `vunit_results` records its start and the end of
 //!   the test suite; a testbench without explicit tests passed if the test suite ended. A
 //!   non-zero exit code fails a passed test from VHDL-2008 on (`has_valid_exit_code`).
@@ -59,9 +59,9 @@ use crate::process;
 use crate::project::Project;
 use crate::runtime::ProcessLimit;
 use crate::runtime::ProcessPermit;
-use crate::simulator::Backend;
 use crate::simulator::CommandError;
 use crate::simulator::SimulateArgs;
+use crate::simulator::Simulator;
 use crate::simulator::Top;
 use crate::spec::AssertLevel;
 use crate::spec::SimOptions;
@@ -197,8 +197,6 @@ pub struct SimulationInput<'a> {
     pub discovery: &'a Discovery,
     /// The project's simulation options; configurations override them.
     pub sim_options: &'a SimOptions,
-    /// Whether the backend supports GUI mode; without it, every test runs without GUI mode.
-    pub gui_supported: bool,
 }
 
 /// A testcase ready to run.
@@ -251,14 +249,14 @@ impl PlannedTest {
         generics
     }
 
-    /// The command line of a run with `seed` on `backend`.
+    /// The command line of a run with `seed` on `simulator`.
     ///
     /// # Errors
     ///
-    /// Fails if the backend doesn't support the testbench's standard.
-    pub fn command(&self, backend: &Backend, seed: &str) -> Result<Vec<String>, CommandError> {
+    /// Fails if the simulator doesn't support the testbench's standard.
+    pub fn command(&self, simulator: &Simulator, seed: &str) -> Result<Vec<String>, CommandError> {
         let generics = self.generics(seed);
-        backend.simulate_command(&SimulateArgs {
+        simulator.simulate_command(&SimulateArgs {
             vhdl_standard: self.vhdl_standard,
             library: &self.library,
             library_dir: &self.library_dir,
@@ -289,16 +287,15 @@ impl PlannedTest {
 pub struct SimulationPlan {
     /// The tests, sorted by name.
     pub tests: Vec<PlannedTest>,
-    /// Warnings about patterns that match no testcase, that ask for GUI mode but match
-    /// several, or that ask for GUI mode on a backend without it.
+    /// Warnings about patterns that match no testcase, or that ask for GUI mode but match
+    /// several.
     pub diagnostics: Vec<Diagnostic>,
 }
 
 impl SimulationPlan {
     /// Matches `requests` against the testcases of `input.discovery`.
     ///
-    /// A testcase matched by several requests runs once, paused if any of them asks for it and
-    /// the backend supports GUI mode.
+    /// A testcase matched by several requests runs once, paused if any of them asks for it.
     pub fn new(input: &SimulationInput<'_>, requests: &[SimulationRequest]) -> Self {
         let discovery = input.discovery;
         let names: Vec<&str> = discovery
@@ -309,7 +306,7 @@ impl SimulationPlan {
         let resolution = pattern::resolve(
             requests
                 .iter()
-                .map(|request| (request.pattern.as_str(), request.gui && input.gui_supported)),
+                .map(|request| (request.pattern.as_str(), request.gui)),
             &names,
         );
         let runs: FxHashMap<&str, usize> = names
@@ -380,16 +377,7 @@ impl SimulationPlan {
                      {count}; they run without GUI mode"
                 ))
             });
-        let unsupported_gui = (!input.gui_supported && requests.iter().any(|request| request.gui))
-            .then(|| {
-                Diagnostic::warning(
-                    "GUI mode isn't supported by the simulation backend; running without it",
-                )
-            });
-        let diagnostics = unmatched
-            .chain(ambiguous_gui)
-            .chain(unsupported_gui)
-            .collect();
+        let diagnostics = unmatched.chain(ambiguous_gui).collect();
         Self { tests, diagnostics }
     }
 
@@ -520,8 +508,8 @@ impl fmt::Debug for SimulationEvents {
 pub struct SimulationContext {
     /// The working directory of the simulator processes.
     pub workspace_root: Utf8PathBuf,
-    /// The backend that simulates.
-    pub backend: Backend,
+    /// The simulator.
+    pub simulator: Simulator,
     /// Limits the number of concurrent simulations; a paused GUI simulation holds its permit.
     pub limit: ProcessLimit,
     /// Receives the results.
@@ -737,7 +725,7 @@ async fn execute(test: &PlannedTest, context: &SimulationContext) -> Result<Test
     })?;
     let seed = test.seed();
     let command = test
-        .command(&context.backend, &seed)
+        .command(&context.simulator, &seed)
         .map_err(|error| error.to_string())?;
     let header = format!("Seed for {}: {seed}\n", test.name);
     tracing::debug!(name = %test.name, ?command, "starting simulation");
@@ -749,7 +737,7 @@ async fn execute(test: &PlannedTest, context: &SimulationContext) -> Result<Test
         &context.cancel,
     )
     .await
-    .map_err(|error| format!("failed to run {}: {error}", context.backend.program()))?;
+    .map_err(|error| format!("failed to run {}: {error}", context.simulator.path()))?;
     let status = match outcome {
         process::Outcome::Exited(status) => status,
         process::Outcome::Cancelled => return Ok(TestOutcome::Cancelled),

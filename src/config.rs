@@ -5,8 +5,9 @@
 //! Reading `risim-config.toml` into a [`ProjectSpec`].
 //!
 //! ```toml
-//! # Flags for analysis (risim-ghdl.a_flags) and elaboration (risim-ghdl.elab_flags).
-//! options = ["-fsynopsys", "-frelaxed"]
+//! # Options of `risim analyze` and `risim run`: `--relaxed`, or its alias `-frelaxed`, and
+//! # `-fsynopsys`, which has no effect.
+//! options = ["-frelaxed"]
 //!
 //! # Optional VUnit features on top of the defaults (VUnit core, com, OSVVM).
 //! [vunit]
@@ -18,7 +19,7 @@
 //! ```
 //!
 //! Problems become diagnostics with ranges in the file. Only syntax and type errors prevent a
-//! [`ProjectSpec`]; invalid libraries and features are left out of it.
+//! [`ProjectSpec`]; invalid libraries, features and options are left out of it.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -109,10 +110,13 @@ pub fn parse(path: &Utf8Path, content: &str) -> Config {
     }
 }
 
+/// The options that risim-runner accepts in analysis and simulation.
+const OPTIONS: [&str; 3] = ["--relaxed", "-frelaxed", "-fsynopsys"];
+
 #[derive(Deserialize)]
 struct RawConfig {
     #[serde(default)]
-    options: Vec<String>,
+    options: Vec<Spanned<String>>,
     #[serde(default)]
     vunit: RawVunit,
     #[serde(default)]
@@ -259,11 +263,24 @@ impl Parser<'_> {
             });
         }
 
+        let mut options = Vec::new();
+        for option in raw.options {
+            if OPTIONS.contains(&option.get_ref().as_str()) {
+                options.push(option.into_inner());
+            } else {
+                let message = format!(
+                    "unsupported option '{}'; expected one of: {}",
+                    option.get_ref(),
+                    OPTIONS.join(", ")
+                );
+                self.diagnostic(Severity::Error, message, Some(option.span()));
+            }
+        }
         spec.compile_options = CompileOptions {
-            a_flags: raw.options.clone(),
+            a_flags: options.clone(),
         };
         spec.sim_options = SimOptions {
-            elab_flags: Some(raw.options),
+            elab_flags: Some(options),
             ..SimOptions::default()
         };
         spec
@@ -377,6 +394,53 @@ files = ["sim/model/*.vhd", "tb/*.vhd"]
         assert_eq!(
             spec.features.iter().copied().collect::<Vec<_>>(),
             [Feature::Random]
+        );
+    }
+
+    #[test]
+    fn unsupported_options_are_errors() {
+        let config = parse_str(
+            "options = [\"-frelaxed\", \"-Wno-hide\", \"--relaxed\", \"--no-vital-checks\"]\n",
+        );
+        let spec = config.spec.unwrap();
+        assert_eq!(spec.compile_options.a_flags, ["-frelaxed", "--relaxed"]);
+        assert_eq!(
+            spec.sim_options.elab_flags,
+            Some(vec!["-frelaxed".to_owned(), "--relaxed".to_owned()])
+        );
+        let errors: Vec<_> = config
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                (
+                    diagnostic.severity,
+                    diagnostic.message.as_str(),
+                    diagnostic.range.unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            errors,
+            [
+                (
+                    Severity::Error,
+                    "unsupported option '-Wno-hide'; expected one of: --relaxed, -frelaxed, \
+                     -fsynopsys",
+                    Range {
+                        start: Position::new(1, 25),
+                        end: Position::new(1, 35),
+                    }
+                ),
+                (
+                    Severity::Error,
+                    "unsupported option '--no-vital-checks'; expected one of: --relaxed, \
+                     -frelaxed, -fsynopsys",
+                    Range {
+                        start: Position::new(1, 51),
+                        end: Position::new(1, 69),
+                    }
+                ),
+            ]
         );
     }
 

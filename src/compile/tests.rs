@@ -119,8 +119,12 @@ fn compile_set_contains_targets_and_implementation_dependencies() {
     assert_eq!(plan.units(), [vec![0, 1, 2, 3, 4]]);
 
     let tb_file = &plan.files()[4];
-    assert_eq!(tb_file.command[1], "-a");
-    assert_eq!(tb_file.command.last().unwrap(), tb_file.path.as_str());
+    let command = plan.compile_command(&[3, 4]);
+    assert_eq!(command[1], "analyze");
+    assert_eq!(
+        command[command.len() - 2..],
+        [plan.files()[3].path.as_str(), tb_file.path.as_str()]
+    );
     assert!(tb_file.output_file.starts_with(fixture.layout.root()));
 }
 
@@ -187,7 +191,7 @@ fn compile_keys_depend_on_options_and_simulator() {
     fixture.options.a_flags.clear();
 
     let mut identity = fixture.simulator.identity().clone();
-    identity.size = 2;
+    identity.version_output = "risim-runner 0.1.0\nhydrolyze archive format 2\n".to_owned();
     fixture.simulator = Simulator::from_identity(identity).unwrap();
     assert_eq!(fixture.plan(&[pkg], &state).compile_count(), 1);
 }
@@ -316,33 +320,33 @@ fn cycle_outside_the_compile_set_is_ignored() {
 }
 
 #[test]
-fn mixed_standards_are_an_error() {
+fn standards_other_than_2008_are_errors() {
     let mut fixture = Fixture::new();
     fixture
         .library("lib")
-        .library_with_standard("old", VhdlStandard::Vhdl1993);
+        .library_with_standard("old", VhdlStandard::Vhdl1993)
+        .library_with_standard("new", VhdlStandard::Vhdl2019);
     fixture.add("old", "old.vhd", "package old_pkg is end package;");
+    fixture.add("new", "new.vhd", "package new_pkg is end package;");
     let user = fixture.add(
         "lib",
         "user.vhd",
-        "library old; use old.old_pkg.all;\npackage user is end package;",
+        "library old, new; use old.old_pkg.all; use new.new_pkg.all;\npackage user is end package;",
     );
     let plan = fixture.plan(&[user], &CompileState::default());
-    assert_eq!(plan.errors.len(), 1);
-    assert!(plan.errors[0].message.contains("mixed VHDL standards"));
-}
-
-#[test]
-fn vhdl_2019_needs_a_recent_simulator() {
-    let mut fixture = Fixture::new();
-    let mut identity = fixture.simulator.identity().clone();
-    identity.version_output = "GHDL 5.0.1 [simulation adapter]".to_owned();
-    fixture.simulator = Simulator::from_identity(identity).unwrap();
-    fixture.library_with_standard("lib", VhdlStandard::Vhdl2019);
-    let pkg = fixture.add("lib", "pkg.vhd", PKG);
-    let plan = fixture.plan(&[pkg], &CompileState::default());
-    assert_eq!(plan.errors.len(), 1);
-    assert!(plan.errors[0].message.contains("VHDL-2019"));
+    let messages: Vec<&str> = plan
+        .errors
+        .iter()
+        .map(|error| error.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        [
+            "risim supports only VHDL-2008, not VHDL-93",
+            "risim supports only VHDL-2008, not VHDL-2019",
+        ]
+    );
+    assert!(plan.files().is_empty());
 }
 
 #[test]

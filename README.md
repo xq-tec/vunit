@@ -16,7 +16,7 @@ This is a fork of VUnit. The VHDL libraries under `vunit/vhdl` (the testbench ru
 
 The scope of this crate is intentionally limited:
 
-- `risim-ghdl`, riSim's fork of GHDL, analyses all libraries. Two backends simulate: `ghdl` with `risim-ghdl --elab-run`, and `risim` with risim-runner (`risim run`), riSim's own simulator. risim-runner reads the same libraries through the same `risim-ghdl`. Each simulate request selects its backend.
+- risim-runner (`risim`), riSim's simulator, analyses all libraries with `risim analyze` and simulates with `risim run`. It supports VHDL-2008 only.
 - VHDL only. Verilog is not supported yet.
 - There is no command-line interface. Callers open a `Runtime` and drive workspaces through the library API.
 
@@ -32,11 +32,11 @@ The crate provides:
 
 ## Usage
 
-A workspace is opened from a `risim-config.toml`. The `options` list is passed both to analysis (`risim-ghdl -a`) and to elaboration (`risim-ghdl --elab-run`, or `--ghdl-option` of `risim run`):
+A workspace is opened from a `risim-config.toml`. The `options` list is passed both to analysis (`risim analyze`) and to elaboration (`risim run`). It accepts `--relaxed`, its alias `-frelaxed`, and `-fsynopsys`, which has no effect; any other option is a configuration error:
 
 ```toml
-# Flags for analysis and elaboration.
-options = ["-fsynopsys", "-frelaxed"]
+# Options of analysis and elaboration.
+options = ["-frelaxed"]
 
 # Optional VUnit features on top of the defaults (VUnit core, com, OSVVM).
 [vunit]
@@ -50,12 +50,10 @@ files = ["src/**/*.vhd", "tb/*.vhd"]
 A `ProjectSpec` built in code describes the same project, and can also set external libraries, a VHDL standard per library, and configurations, generics and simulation options per testbench or test. Pass it as `ProjectSource::Spec` instead of `ProjectSource::ConfigFile`.
 
 ```rust
-use risim_vunit_frontend::{ProjectSource, Runtime, RuntimeOptions, SimulationRequest, SimulatorKind};
+use risim_vunit_frontend::{ProjectSource, Runtime, RuntimeOptions, SimulationRequest};
 
 let runtime = Runtime::new(RuntimeOptions {
-    risim_ghdl: "/path/to/risim-ghdl".into(),
-    // Optional; without it, the `risim` backend is unavailable.
-    risim_runner: Some("/path/to/risim".into()),
+    risim: "/path/to/risim".into(),
     max_parallel_simulations: parallelism,
     max_parallel_compiles: parallelism,
 })
@@ -67,7 +65,6 @@ let workspace = runtime
 workspace.simulate(
     vec![SimulationRequest { pattern: "my_lib.tb_*".into(), gui: false }],
     None,
-    SimulatorKind::Ghdl,
     None,
 );
 while let Some(event) = receiver.recv().await {
@@ -76,6 +73,8 @@ while let Some(event) = receiver.recv().await {
 ```
 
 Everything a workspace generates goes to `<root>/risim-out/`: the extracted VUnit and OSVVM sources, compiled libraries, compile and test output, and the JSON state files. A lock file keeps other processes from using the same directory at the same time.
+
+The consecutive files of one library that need compiling are analysed by one `risim analyze`, which prints its reports as JSON lines (`--message-format=json`); each report goes to the file of its location. The compiled libraries are kept as long as the path and the `--version` output of `risim` are the same, which names the archive format.
 
 ## Building
 
@@ -92,11 +91,11 @@ cargo build
 cargo test
 ```
 
-- The unit tests and the `operations` integration tests need no simulator. The `operations` test binary doubles as a fake `risim-ghdl` and a fake risim-runner.
-- The `acceptance` tests run VUnit's acceptance projects, the test benches of the VUnit VHDL libraries and a few fixtures of riSim's own with a real simulator. They are skipped unless `RISIM_GHDL` names a `risim-ghdl` executable. Every trial also runs on the `risim` backend as `<name>_risim`, which is skipped unless `RISIM_RUNNER` names a risim-runner executable too:
+- The unit tests and the `operations` integration tests need no simulator. The `operations` test binary doubles as a fake risim-runner. Its trial `real_risim_compiles_uart` compiles VUnit's UART example with the risim-runner named by `RISIM_RUNNER`, and is skipped without it.
+- The `acceptance` tests run VUnit's acceptance projects, the test benches of the VUnit VHDL libraries and a few fixtures of riSim's own with a real simulator. They are skipped unless `RISIM_RUNNER` names a risim-runner executable. Testcases that fail on risim are listed per trial, with the reason:
 
   ```sh
-  RISIM_GHDL=/path/to/risim-ghdl RISIM_RUNNER=/path/to/risim cargo test --test acceptance
+  RISIM_RUNNER=/path/to/risim cargo test --test acceptance
   ```
 
 ## License
