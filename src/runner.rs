@@ -405,6 +405,8 @@ pub enum SimulationEvent {
         name: String,
         /// The simulator output file (`output.txt`).
         output_path: Utf8PathBuf,
+        /// Whether the simulation starts paused ([`PlannedTest::gui`]).
+        gui: bool,
     },
     /// A testcase finished, failed to start, or was cancelled.
     TestFinished {
@@ -667,6 +669,7 @@ async fn run_test(
     context.emit(SimulationEvent::TestStarted {
         name: test.name.clone(),
         output_path: test.paths.output_file.clone(),
+        gui: test.gui,
     });
     let started = Instant::now();
     let mut diagnostics = Vec::new();

@@ -635,7 +635,7 @@ async fn workspace_cancels_one_request() {
     assert!(
         matches!(
             started.last(),
-            Some(WorkspaceEventKind::TestStarted { tags, .. }) if tags_text(tags) == "b,e"
+            Some(WorkspaceEventKind::TestStarted { tags, gui: false, .. }) if tags_text(tags) == "b,e"
         ),
         "{started:#?}"
     );

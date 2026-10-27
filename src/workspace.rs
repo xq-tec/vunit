@@ -216,6 +216,10 @@ pub enum WorkspaceEventKind {
         name: String,
         /// The simulator output file.
         output_path: Utf8PathBuf,
+        /// Whether the simulation starts paused: the effective GUI mode of the testcase, after
+        /// merging the requests of the operation and after the rule that a GUI pattern
+        /// matching several testcases runs them without GUI mode.
+        gui: bool,
     },
     /// A testcase finished, failed to start, or was cancelled.
     TestFinished {

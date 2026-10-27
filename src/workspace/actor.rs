@@ -725,7 +725,11 @@ impl Actor {
                     .push(diagnostic);
                 self.dirty.insert(DiagnosticSource::Simulation);
             },
-            SimulationEvent::TestStarted { name, output_path } => {
+            SimulationEvent::TestStarted {
+                name,
+                output_path,
+                gui,
+            } => {
                 if self
                     .simulation_diagnostics
                     .remove(&Some(name.clone()))
@@ -738,6 +742,7 @@ impl Actor {
                     tags,
                     name,
                     output_path,
+                    gui,
                 });
             },
             SimulationEvent::TestFinished {
