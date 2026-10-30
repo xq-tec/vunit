@@ -23,6 +23,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -831,13 +832,23 @@ async fn cancel_terminates_the_process_tree() {
         &format!("-- fake: spawn-sleeper {pid_file}\n-- fake: hang\npackage pkg is end package;\n"),
     );
     let mut state = CompileState::default();
-    let started = Instant::now();
+    // Times the cancellation alone, not the loading and planning before it, which can be slow
+    // when many tests run at once.
+    let cancelled_at = Arc::new(OnceLock::new());
     let run = workspace
-        .compile_until(&mut state, |event| {
-            matches!(event, CompileEvent::FileStarted { file, .. } if file.ends_with("pkg.vhd"))
+        .compile_until(&mut state, {
+            let cancelled_at = Arc::clone(&cancelled_at);
+            move |event| {
+                let cancel = matches!(event, CompileEvent::FileStarted { file, .. } if file.ends_with("pkg.vhd"));
+                if cancel {
+                    cancelled_at.get_or_init(Instant::now);
+                }
+                cancel
+            }
         })
         .await;
-    assert!(started.elapsed() < Duration::from_secs(10));
+    let cancelled_at = cancelled_at.get().expect("the hanging compile started");
+    assert!(cancelled_at.elapsed() < Duration::from_secs(10));
     assert_eq!(run.report.status, CompileStatus::Cancelled);
     assert_eq!(
         run.statuses(),
@@ -1153,15 +1164,27 @@ async fn cancel_terminates_and_skips_simulations() {
     let previous = results.snapshot()["lib.tb_tests.slow"].clone();
     workspace.take_log();
 
-    let started = Instant::now();
+    // Times the cancellation alone, not the loading and planning before it, which can be slow
+    // when many tests run at once.
+    let cancelled_at = Arc::new(OnceLock::new());
     let run = workspace
         .simulate_until(
             &[("lib.tb_tests.fail*", false), ("lib.tb_tests.slow", false)],
             &results,
-            |event| matches!(event, SimulationEvent::TestStarted { name, .. } if name.contains("fail")),
+            {
+                let cancelled_at = Arc::clone(&cancelled_at);
+                move |event| {
+                    let cancel = matches!(event, SimulationEvent::TestStarted { name, .. } if name.contains("fail"));
+                    if cancel {
+                        cancelled_at.get_or_init(Instant::now);
+                    }
+                    cancel
+                }
+            },
         )
         .await;
-    assert!(started.elapsed() < Duration::from_secs(10));
+    let cancelled_at = cancelled_at.get().expect("the hanging test started");
+    assert!(cancelled_at.elapsed() < Duration::from_secs(10));
     assert_eq!(
         run.outcomes(),
         [
