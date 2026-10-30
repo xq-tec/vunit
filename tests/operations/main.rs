@@ -4,10 +4,10 @@
 
 //! Integration tests of compile and simulation operations.
 //!
-//! The binary doubles as a fake risim-runner (see `fake_risim.rs`), so the tests run everywhere
-//! without a simulator. The trial `real_risim_compiles_uart` uses the risim-runner named by
-//! `RISIM_RUNNER` and is ignored without it; the end-to-end tests with risim-runner are in the
-//! `acceptance` target.
+//! The binary doubles as a fake risim-runner and analyzer (see `fake_risim.rs`), so the tests run
+//! everywhere without a simulator. The trial `real_risim_compiles_uart` uses the risim-runner
+//! named by `RISIM_RUNNER` and the analyzer named by `RISIM_ANALYZER`, and is ignored without
+//! either; the end-to-end tests with risim-runner are in the `acceptance` target.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -143,8 +143,9 @@ fn main() -> ExitCode {
             "simulation_spawn_failure_fails_the_test",
             simulation_spawn_failure_fails_the_test,
         ),
-        trial("real_risim_compiles_uart", real_risim_compiles_uart)
-            .with_ignored_flag(env::var_os("RISIM_RUNNER").is_none()),
+        trial("real_risim_compiles_uart", real_risim_compiles_uart).with_ignored_flag(
+            env::var_os("RISIM_RUNNER").is_none() || env::var_os("RISIM_ANALYZER").is_none(),
+        ),
     ];
     let trials = trials.into_iter().chain(workspace::trials()).collect();
     libtest_mimic::run(&args, trials).exit_code()
@@ -238,7 +239,9 @@ impl Workspace {
             .to_owned();
         let exe = Utf8PathBuf::from_path_buf(env::current_exe().expect("current exe"))
             .expect("UTF-8 path");
-        let simulator = Simulator::detect(&exe).await.expect("detect the fake");
+        let simulator = Simulator::detect(&exe, &exe)
+            .await
+            .expect("detect the fake");
         Self {
             _temp: temp,
             root: root.clone(),
@@ -907,7 +910,7 @@ async fn spawn_failure_fails_the_file() {
     let mut workspace = Workspace::new().await;
     workspace.standard_project();
     let mut identity = workspace.simulator.identity().clone();
-    identity.path = workspace.root.join("missing-risim");
+    identity.analyzer = workspace.root.join("missing-risim");
     workspace.simulator = Simulator::from_identity(identity).expect("valid identity");
     let run = workspace.compile(&mut CompileState::default()).await;
     assert_eq!(run.report.status, CompileStatus::Failed);
@@ -948,11 +951,15 @@ async fn dependency_cycle_fails_the_compile() {
 }
 
 async fn detect_rejects_other_programs() {
-    let missing = Simulator::detect(Utf8Path::new("/nonexistent/risim")).await;
+    let missing = Simulator::detect(
+        Utf8Path::new("/nonexistent/risim-runner"),
+        Utf8Path::new("/nonexistent/risim"),
+    )
+    .await;
     missing.expect_err("the executable doesn't exist");
     #[cfg(unix)]
     {
-        let error = Simulator::detect(Utf8Path::new("/bin/sh"))
+        let error = Simulator::detect(Utf8Path::new("/bin/sh"), Utf8Path::new("/bin/sh"))
             .await
             .expect_err("sh isn't risim-runner");
         assert!(
@@ -1256,14 +1263,15 @@ async fn simulation_spawn_failure_fails_the_test() {
     );
 }
 
-/// Compiles the UART example of VUnit (`tests/operations/uart`) with the real risim-runner, then
-/// recompiles after edits.
+/// Compiles the UART example of VUnit (`tests/operations/uart`) with the real analyzer and
+/// risim-runner, then recompiles after edits.
 #[expect(clippy::print_stderr, reason = "reports timings")]
 async fn real_risim_compiles_uart() {
     let fixtures = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/operations");
     let mut workspace = Workspace::new().await;
-    let risim = Utf8PathBuf::from(env::var("RISIM_RUNNER").expect("RISIM_RUNNER"));
-    workspace.simulator = Simulator::detect(&risim)
+    let runner = Utf8PathBuf::from(env::var("RISIM_RUNNER").expect("RISIM_RUNNER"));
+    let analyzer = Utf8PathBuf::from(env::var("RISIM_ANALYZER").expect("RISIM_ANALYZER"));
+    workspace.simulator = Simulator::detect(&runner, &analyzer)
         .await
         .expect("detect risim-runner");
     let parallelism = thread::available_parallelism().map_or(4, NonZeroUsize::get);

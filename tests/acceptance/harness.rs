@@ -2,7 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! Running a project with the real risim-runner through the public workspace API.
+//! Running a project with the real analyzer and risim-runner through the public workspace API.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -33,6 +33,9 @@ use tokio::sync::mpsc;
 
 /// The environment variable naming the risim-runner executable.
 pub const RISIM_RUNNER: &str = "RISIM_RUNNER";
+
+/// The environment variable naming the analyzer, the riSim CLI `risim`.
+pub const RISIM_ANALYZER: &str = "RISIM_ANALYZER";
 
 /// How long a whole simulate operation may take.
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(900);
@@ -70,13 +73,16 @@ impl Root {
     }
 }
 
-/// A runtime with the risim-runner named by [`RISIM_RUNNER`].
+/// A runtime with the risim-runner named by [`RISIM_RUNNER`] and the analyzer named by
+/// [`RISIM_ANALYZER`].
 pub async fn runtime() -> Runtime {
-    let risim = Utf8PathBuf::from(env::var(RISIM_RUNNER).expect("RISIM_RUNNER"));
+    let runner = Utf8PathBuf::from(env::var(RISIM_RUNNER).expect("RISIM_RUNNER"));
+    let analyzer = Utf8PathBuf::from(env::var(RISIM_ANALYZER).expect("RISIM_ANALYZER"));
     let parallelism =
         std::thread::available_parallelism().unwrap_or(NonZeroUsize::new(4).expect("non-zero"));
     Runtime::new(RuntimeOptions {
-        risim,
+        analyzer,
+        runner,
         max_parallel_simulations: parallelism,
         max_parallel_compiles: parallelism,
     })

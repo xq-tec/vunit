@@ -4,9 +4,9 @@
 
 //! The simulator and its command lines.
 //!
-//! risim-runner (`risim`) analyses every library with `risim analyze`, into the archive
-//! `<library dir>/<library>.hlib`, and simulates with `risim run`, which reads the same archives.
-//! It supports VHDL-2008 only.
+//! riSim has two executables: the analyzer, the riSim CLI `risim`, analyses every library with
+//! `risim analyze`, into the archive `<library dir>/<library>.hlib`, and the runner simulates with
+//! `risim-runner run`, which reads the same archives. They support VHDL-2008 only.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -25,15 +25,21 @@ use crate::process;
 use crate::spec::AssertLevel;
 use crate::vhdl_standard::VhdlStandard;
 
-/// What identifies a risim-runner installation.
+/// What identifies a riSim installation: the runner, the analyzer, and the runner's `--version`.
 ///
 /// Libraries compiled with another identity are discarded. The `--version` output names the
 /// archive format, so a rebuilt risim-runner with the same format keeps the libraries.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SimulatorIdentity {
-    /// The executable.
+    /// The runner executable, which simulates.
     pub path: Utf8PathBuf,
-    /// The output of `--version`.
+    /// The analyzer executable, which analyses.
+    ///
+    /// State stored before the analyzer had its own path loads with an empty one, so that its
+    /// libraries are compiled again.
+    #[serde(default)]
+    pub analyzer: Utf8PathBuf,
+    /// The output of the runner's `--version`.
     pub version_output: String,
 }
 
@@ -92,7 +98,8 @@ pub const fn check_standard(standard: VhdlStandard) -> Result<(), CommandError> 
     }
 }
 
-/// A detected risim-runner executable; cheap enough to clone into every simulation.
+/// A detected risim-runner executable, with the analyzer that compiles for it; cheap enough to
+/// clone into every simulation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Simulator {
     identity: SimulatorIdentity,
@@ -114,33 +121,37 @@ fn parse_version(output: &str) -> Option<Version> {
 }
 
 impl Simulator {
-    /// Runs `<path> --version` and records the identity of the executable.
+    /// Runs `<runner> --version` and records the identity of the runner and the analyzer
+    /// `analyzer`.
+    ///
+    /// The analyzer isn't run: a missing one fails the compiles that need it.
     ///
     /// # Errors
     ///
-    /// Fails if the executable can't be run, or isn't risim-runner.
-    pub async fn detect(path: &Utf8Path) -> Result<Self, DetectError> {
-        let output = process::command(path, ["--version"], None)
+    /// Fails if the runner can't be run, or isn't risim-runner.
+    pub async fn detect(runner: &Utf8Path, analyzer: &Utf8Path) -> Result<Self, DetectError> {
+        let output = process::command(runner, ["--version"], None)
             .output()
             .await
             .map_err(|source| DetectError::Io {
-                path: path.to_owned(),
+                path: runner.to_owned(),
                 source,
             })?;
         let mut version_output = String::from_utf8_lossy(&output.stdout).into_owned();
         if !output.status.success() {
             version_output.push_str(&String::from_utf8_lossy(&output.stderr));
             return Err(DetectError::Version {
-                path: path.to_owned(),
+                path: runner.to_owned(),
                 output: version_output,
             });
         }
         let identity = SimulatorIdentity {
-            path: path.to_owned(),
+            path: runner.to_owned(),
+            analyzer: analyzer.to_owned(),
             version_output,
         };
         Self::from_identity(identity).map_err(|identity| DetectError::Version {
-            path: path.to_owned(),
+            path: runner.to_owned(),
             output: identity.version_output,
         })
     }
@@ -162,9 +173,14 @@ impl Simulator {
         &self.identity
     }
 
-    /// The executable.
+    /// The runner executable.
     pub fn path(&self) -> &Utf8Path {
         &self.identity.path
+    }
+
+    /// The analyzer executable.
+    pub fn analyzer(&self) -> &Utf8Path {
+        &self.identity.analyzer
     }
 
     /// The version.
@@ -172,9 +188,10 @@ impl Simulator {
         self.version
     }
 
-    /// The beginning of a command line of the subcommand `mode`, up to the library paths.
+    /// The beginning of a command line of `executable` with the subcommand `mode`, up to the
+    /// library paths.
     fn base_command(
-        &self,
+        executable: &Utf8Path,
         mode: &str,
         vhdl_standard: VhdlStandard,
         library: &str,
@@ -183,7 +200,7 @@ impl Simulator {
     ) -> Result<Vec<String>, CommandError> {
         check_standard(vhdl_standard)?;
         let mut command = vec![
-            self.path().to_string(),
+            executable.to_string(),
             mode.to_owned(),
             format!("--work={library}"),
             format!("--workdir={library_dir}"),
@@ -194,13 +211,15 @@ impl Simulator {
         Ok(command)
     }
 
-    /// The command line analysing files into one library, which prints the reports as JSON lines.
+    /// The command line of the analyzer analysing files into one library, which prints the
+    /// reports as JSON lines.
     ///
     /// # Errors
     ///
     /// Fails if the standard isn't supported.
     pub fn compile_command(&self, args: &CompileArgs<'_>) -> Result<Vec<String>, CommandError> {
-        let mut command = self.base_command(
+        let mut command = Self::base_command(
+            self.analyzer(),
             "analyze",
             args.vhdl_standard,
             args.library,
@@ -213,13 +232,14 @@ impl Simulator {
         Ok(command)
     }
 
-    /// The command line elaborating and running a testbench.
+    /// The command line of the runner elaborating and running a testbench.
     ///
     /// # Errors
     ///
     /// Fails if the standard isn't supported.
     pub fn simulate_command(&self, args: &SimulateArgs<'_>) -> Result<Vec<String>, CommandError> {
-        let mut command = self.base_command(
+        let mut command = Self::base_command(
+            self.path(),
             "run",
             args.vhdl_standard,
             args.library,
@@ -321,7 +341,8 @@ mod tests {
     #[test]
     fn parses_version() {
         assert_eq!(simulator().version(), Version { major: 0, minor: 1 });
-        assert_eq!(simulator().path(), "/bin/risim");
+        assert_eq!(simulator().path(), "/bin/risim-runner");
+        assert_eq!(simulator().analyzer(), "/bin/risim");
     }
 
     #[test]
@@ -334,6 +355,18 @@ mod tests {
         ] {
             Simulator::from_identity(simulator_identity(output)).unwrap_err();
         }
+    }
+
+    /// An identity stored before the analyzer had its own path loads with an empty one, which
+    /// differs from every detected identity.
+    #[test]
+    fn identity_without_analyzer_loads() {
+        let identity: SimulatorIdentity =
+            serde_json::from_str(r#"{"path":"/bin/risim","version_output":"risim-runner 0.1.0"}"#)
+                .unwrap();
+        assert_eq!(identity.path, "/bin/risim");
+        assert_eq!(identity.analyzer, "");
+        assert_ne!(identity, simulator_identity("risim-runner 0.1.0"));
     }
 
     #[test]
@@ -424,7 +457,7 @@ mod tests {
         assert_eq!(
             simulator.simulate_command(&args).unwrap(),
             [
-                "/bin/risim",
+                "/bin/risim-runner",
                 "run",
                 "--work=lib",
                 "--workdir=/out/libraries/lib",

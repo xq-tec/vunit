@@ -2,7 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! A fake risim-runner. The test binary runs this instead of the tests when `RISIM_FAKE` is set.
+//! A fake risim-runner and analyzer, which the tests use for both. The test binary runs this
+//! instead of the tests when `RISIM_FAKE` is set.
 //!
 //! - `--version` prints a risim-runner version line and the archive format.
 //! - `--sleep <ms>` sleeps.

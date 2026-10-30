@@ -41,11 +41,12 @@ impl TempRoot {
     }
 }
 
-/// The identity of a fake risim-runner at `/bin/risim` that prints `version_output` for
-/// `--version`.
+/// The identity of a fake risim-runner at `/bin/risim-runner` that prints `version_output` for
+/// `--version`, with the analyzer `/bin/risim`.
 pub(crate) fn simulator_identity(version_output: &str) -> SimulatorIdentity {
     SimulatorIdentity {
-        path: "/bin/risim".into(),
+        path: "/bin/risim-runner".into(),
+        analyzer: "/bin/risim".into(),
         version_output: version_output.to_owned(),
     }
 }

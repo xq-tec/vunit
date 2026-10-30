@@ -2,8 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! The resources shared by all workspaces of a process: the detected risim-runner, and the limits
-//! on concurrent compile and simulation processes.
+//! The resources shared by all workspaces of a process: the detected risim-runner and the analyzer,
+//! and the limits on concurrent compile and simulation processes.
 //!
 //! Every workspace of a process should be opened through the same [`Runtime`],
 //! so that the limits apply across workspaces. An operation can lower them for its own
@@ -33,8 +33,10 @@ use crate::workspace::WorkspaceEvent;
 /// The settings of a [`Runtime`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeOptions {
-    /// The risim-runner executable, which compiles and simulates.
-    pub risim: Utf8PathBuf,
+    /// The analyzer, the riSim CLI `risim`, which compiles (`risim analyze`).
+    pub analyzer: Utf8PathBuf,
+    /// The risim-runner executable, which simulates (`risim-runner run`).
+    pub runner: Utf8PathBuf,
     /// The maximum number of simulations running at once, over all workspaces. A paused GUI
     /// simulation counts as running.
     pub max_parallel_simulations: NonZeroUsize,
@@ -70,9 +72,10 @@ impl Runtime {
     ///
     /// Fails if risim-runner can't be run or its version can't be determined.
     pub async fn new(options: RuntimeOptions) -> Result<Self, RuntimeError> {
-        let simulator = Simulator::detect(&options.risim).await?;
+        let simulator = Simulator::detect(&options.runner, &options.analyzer).await?;
         tracing::info!(
             path = %simulator.path(),
+            analyzer = %simulator.analyzer(),
             version = ?simulator.version(),
             "detected risim-runner"
         );

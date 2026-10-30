@@ -255,7 +255,7 @@ fn command_of_an_explicit_test() {
     assert_eq!(
         command[..9],
         [
-            "/bin/risim",
+            "/bin/risim-runner",
             "run",
             "--work=Lib",
             "--workdir=/ws/risim-out/libraries/lib",

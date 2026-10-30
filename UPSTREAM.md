@@ -20,7 +20,7 @@ The fork also fixes seven testcases of `vunit/vhdl/verification_components/test`
 2. Keep `vunit/vhdl/**` and `vunit/verilog/**` from upstream, including their unused `run.py` and `tools/*.py` files, except for the testbench fixes above.
 3. Resolve conflicts on deleted files (the Python package outside `vunit/vhdl` and `vunit/verilog`, the Python tests, `docs/`, `examples/`, `tools/`, `setup.py`, `pyproject.toml` and the Python workflows) by keeping the deletion. Keep this fork's `README.md`, `.gitignore` and `.github/workflows/ci.yml`.
 4. Review `git diff <recorded>..<new> -- vunit/*.py vunit/**/*.py` for logic to port, using the mapping below. Review the changes to `vunit/vhdl/*/run.py` and `tests/acceptance/test_artificial.py` too, and update their translations in `tests/acceptance/`.
-5. Run the acceptance tests with `RISIM_RUNNER` set, and update the expected failures and the risim deviations.
+5. Run the acceptance tests with `RISIM_RUNNER` and `RISIM_ANALYZER` set, and update the expected failures and the risim deviations.
 6. Update the recorded commit in this file.
 
 ## Tests
@@ -66,7 +66,7 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - The compile set includes the files declaring the VHDL configurations the test runs elaborate. VUnit's `--minimal` compiles only the testbench files and their dependencies, which misses them.
 - Recompilation uses compile keys instead of timestamps. Independent libraries compile in parallel and continue after unrelated failures.
 - Duplicate tests, invalid attributes, and testbenches with no or several architectures disable only the affected testbench instead of aborting. Configuration errors (duplicate or empty names, invalid attributes) skip only that configuration.
-- risim-runner analyses (`risim analyze`) and simulates (`risim run`), VHDL-2008 only. GUI mode passes `--paused`, so `sim_flags`, which are risim-runner options, must not also contain `--paused`, `--pause-after` or `--websocket=disable`. The consecutive files of one library that need compiling are analysed by one process.
+- riSim analyses with its CLI (`risim analyze`) and simulates with its runner (`risim-runner run`), VHDL-2008 only. GUI mode passes `--paused`, so `sim_flags`, which are risim-runner options, must not also contain `--paused`, `--pause-after` or `--websocket=disable`. The consecutive files of one library that need compiling are analysed by one process.
 - Testcase patterns are case-insensitive on all platforms (Python's `fnmatch` is case-insensitive only on Windows).
 - Compile and simulation processes run with the workspace root as working directory.
 - Files that are independent of each other compile in the order they were added. VUnit sorts them by path. Both orders respect the dependencies.

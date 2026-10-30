@@ -5,7 +5,7 @@
 //! Reading `risim-config.toml` into a [`ProjectSpec`].
 //!
 //! ```toml
-//! # Options of `risim analyze` and `risim run`: `--relaxed`, or its alias `-frelaxed`, and
+//! # Options of `risim analyze` and `risim-runner run`: `--relaxed`, or its alias `-frelaxed`, and
 //! # `-fsynopsys`, which has no effect.
 //! options = ["-frelaxed"]
 //!

@@ -196,16 +196,16 @@ pub struct CompileOptions {
     pub a_flags: Vec<String>,
 }
 
-/// Options for elaboration and simulation (`risim run`).
+/// Options for elaboration and simulation (`risim-runner run`).
 ///
 /// A test configuration overrides the project, and still-unset fields take their defaults when
 /// the command line is built: empty flag lists, assert stop level `error`, IEEE assertions left
 /// enabled, and a new seed per run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SimOptions {
-    /// Extra elaboration options of `risim run`.
+    /// Extra elaboration options of `risim-runner run`.
     pub elab_flags: Option<Vec<String>>,
-    /// Extra simulation options of `risim run`.
+    /// Extra simulation options of `risim-runner run`.
     pub sim_flags: Option<Vec<String>>,
     /// The lowest assertion severity that stops the simulation; default `error`.
     pub vhdl_assert_stop_level: Option<AssertLevel>,
@@ -252,7 +252,7 @@ pub enum AssertLevel {
 }
 
 impl AssertLevel {
-    /// The name used in configuration files and by `risim run --assert-level`.
+    /// The name used in configuration files and by `risim-runner run --assert-level`.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Warning => "warning",

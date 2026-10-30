@@ -6,7 +6,8 @@
 //! workspace API, mostly ported from VUnit's `tests/acceptance` and the `run.py` scripts of its
 //! VHDL libraries.
 //!
-//! The trials use the risim-runner named by `RISIM_RUNNER` and are ignored without it. With
+//! The trials use the risim-runner named by `RISIM_RUNNER` and the analyzer named by
+//! `RISIM_ANALYZER`, and are ignored without either. With
 //! `ACCEPTANCE_KEEP` set, the temporary workspaces aren't deleted, for debugging.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
@@ -52,7 +53,10 @@ fn main() -> ExitCode {
     libtest_mimic::run(&args, trials.into_iter().collect()).exit_code()
 }
 
-/// The trial `name`, ignored unless risim-runner is available.
+/// The trial `name`, ignored unless risim-runner and the analyzer are available.
 fn trials<F: Future<Output = ()> + 'static>(name: &str, test: fn() -> F) -> Trial {
-    trial::trial(name, test).with_ignored_flag(env::var_os(harness::RISIM_RUNNER).is_none())
+    let missing = [harness::RISIM_RUNNER, harness::RISIM_ANALYZER]
+        .iter()
+        .any(|variable| env::var_os(variable).is_none());
+    trial::trial(name, test).with_ignored_flag(missing)
 }

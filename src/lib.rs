@@ -17,7 +17,7 @@
 //! - test discovery with configurations and testcase patterns: [`discovery`], [`configuration`], [`pattern`]
 //! - diagnostics: [`diagnostics`]
 //! - `risim-out/` directory: [`store`]
-//! - the simulator (risim-runner): [`simulator`], [`process`]
+//! - the simulator (the analyzer `risim` and risim-runner): [`simulator`], [`process`]
 //! - incremental parallel compilation: [`compile`]
 //! - simulation runs with persisted results: [`runner`]
 //! - workspace management and monitoring: [`workspace`], [`watch`], [`runtime`]

@@ -16,7 +16,8 @@ This is a fork of VUnit. The VHDL libraries under `vunit/vhdl` (the testbench ru
 
 The scope of this crate is intentionally limited:
 
-- risim-runner (`risim`), riSim's simulator, analyses all libraries with `risim analyze` and simulates with `risim run`. It supports VHDL-2008 only.
+- riSim has two executables: the riSim CLI `risim` analyses all libraries with `risim analyze`, and the runner `risim-runner` simulates with `risim-runner run`.
+  They support VHDL-2008 only.
 - VHDL only. Verilog is not supported yet.
 - There is no command-line interface. Callers open a `Runtime` and drive workspaces through the library API.
 
@@ -32,7 +33,7 @@ The crate provides:
 
 ## Usage
 
-A workspace is opened from a `risim-config.toml`. The `options` list is passed both to analysis (`risim analyze`) and to elaboration (`risim run`). It accepts `--relaxed`, its alias `-frelaxed`, and `-fsynopsys`, which has no effect; any other option is a configuration error:
+A workspace is opened from a `risim-config.toml`. The `options` list is passed both to analysis (`risim analyze`) and to elaboration (`risim-runner run`). It accepts `--relaxed`, its alias `-frelaxed`, and `-fsynopsys`, which has no effect; any other option is a configuration error:
 
 ```toml
 # Options of analysis and elaboration.
@@ -53,7 +54,8 @@ A `ProjectSpec` built in code describes the same project, and can also set exter
 use risim_vunit_frontend::{ProjectSource, Runtime, RuntimeOptions, SimulationRequest};
 
 let runtime = Runtime::new(RuntimeOptions {
-    risim: "/path/to/risim".into(),
+    analyzer: "/path/to/risim".into(),
+    runner: "/path/to/risim-runner".into(),
     max_parallel_simulations: parallelism,
     max_parallel_compiles: parallelism,
 })
@@ -74,7 +76,7 @@ while let Some(event) = receiver.recv().await {
 
 Everything a workspace generates goes to `<root>/risim-out/`: the extracted VUnit and OSVVM sources, compiled libraries, compile and test output, and the JSON state files. A lock file keeps other processes from using the same directory at the same time.
 
-The consecutive files of one library that need compiling are analysed by one `risim analyze`, which prints its reports as JSON lines (`--message-format=json`); each report goes to the file of its location, and a file whose design units the call made obsolete is compiled again. The compiled libraries are kept as long as the path and the `--version` output of `risim` are the same, which names the archive format.
+The consecutive files of one library that need compiling are analysed by one `risim analyze`, which prints its reports as JSON lines (`--message-format=json`); each report goes to the file of its location, and a file whose design units the call made obsolete is compiled again. The compiled libraries are kept as long as the paths of both executables and the `--version` output of `risim-runner` are the same, which names the archive format.
 
 ## Building
 
@@ -91,11 +93,11 @@ cargo build
 cargo test
 ```
 
-- The unit tests and the `operations` integration tests need no simulator. The `operations` test binary doubles as a fake risim-runner. Its trial `real_risim_compiles_uart` compiles VUnit's UART example with the risim-runner named by `RISIM_RUNNER`, and is skipped without it.
-- The `acceptance` tests run VUnit's acceptance projects, the test benches of the VUnit VHDL libraries and a few fixtures of riSim's own with a real simulator. They are skipped unless `RISIM_RUNNER` names a risim-runner executable. Testcases that fail on risim are listed per trial, with the reason:
+- The unit tests and the `operations` integration tests need no simulator. The `operations` test binary doubles as a fake risim-runner. Its trial `real_risim_compiles_uart` compiles VUnit's UART example with the risim-runner named by `RISIM_RUNNER` and the analyzer (`risim`) named by `RISIM_ANALYZER`, and is skipped without either.
+- The `acceptance` tests run VUnit's acceptance projects, the test benches of the VUnit VHDL libraries and a few fixtures of riSim's own with a real simulator. They are skipped unless `RISIM_RUNNER` names a risim-runner executable and `RISIM_ANALYZER` a `risim` executable. Testcases that fail on risim are listed per trial, with the reason:
 
   ```sh
-  RISIM_RUNNER=/path/to/risim cargo test --test acceptance
+  RISIM_RUNNER=/path/to/risim-runner RISIM_ANALYZER=/path/to/risim cargo test --test acceptance
   ```
 
 ## License

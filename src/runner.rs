@@ -13,8 +13,8 @@
 //!   once, and then a permit of the simulation limit. Tests whose lock is free get permits
 //!   in name order; a test whose lock is held by another simulation waits for it without
 //!   holding up the others. Each test with a permit recreates its output directory, gets a seed
-//!   and its `runner_cfg` generic, and runs the simulator (`risim run`) with stdout and stderr
-//!   redirected to `output.txt`.
+//!   and its `runner_cfg` generic, and runs the simulator (`risim-runner run`) with stdout and
+//!   stderr redirected to `output.txt`.
 //! - **Outcome:** an explicit test passed if `vunit_results` records its start and the end of
 //!   the test suite; a testbench without explicit tests passed if the test suite ended. A
 //!   non-zero exit code fails a passed test from VHDL-2008 on (`has_valid_exit_code`).

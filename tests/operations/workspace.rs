@@ -118,7 +118,8 @@ async fn runtime() -> Runtime {
         .expect("UTF-8 path");
     let four = NonZeroUsize::new(4).expect("non-zero");
     Runtime::new(RuntimeOptions {
-        risim: exe,
+        analyzer: exe.clone(),
+        runner: exe,
         max_parallel_simulations: four,
         max_parallel_compiles: four,
     })
