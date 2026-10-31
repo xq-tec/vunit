@@ -112,6 +112,9 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 
 const CONFIG: &str = "risim-config.toml";
 
+/// The owner record of the tests' runtime.
+const LOCK_OWNER: &str = r#"{"test": true}"#;
+
 /// A runtime with the fake risim-runner.
 async fn runtime() -> Runtime {
     let exe = Utf8PathBuf::from_path_buf(std::env::current_exe().expect("current exe"))
@@ -122,6 +125,7 @@ async fn runtime() -> Runtime {
         runner: exe,
         max_parallel_simulations: four,
         max_parallel_compiles: four,
+        lock_owner: LOCK_OWNER.to_owned(),
     })
     .await
     .expect("create the runtime")
@@ -418,15 +422,21 @@ async fn workspace_lock() {
     let first = open(&runtime, &fixture, spec_source(&fixture)).await;
     let pid = lock_contents(&fixture);
     assert_eq!(pid.trim(), std::process::id().to_string());
+    let owner_file = fixture.layout.owner_file();
+    assert_eq!(
+        fs::read_to_string(&owner_file).expect("read the owner record"),
+        LOCK_OWNER
+    );
     let second = try_open(&runtime, &fixture, spec_source(&fixture)).await;
     assert!(
-        matches!(second, Err(OpenError::Locked { .. })),
+        matches!(&second, Err(OpenError::Locked { owner: Some(owner), .. }) if owner == LOCK_OWNER),
         "{:?}",
         second.err()
     );
     // The failed open changed nothing.
     assert_eq!(lock_contents(&fixture), pid);
     first.handle.close().await;
+    assert!(!owner_file.exists());
     let third = open(&runtime, &fixture, spec_source(&fixture)).await;
     third.handle.close().await;
 }

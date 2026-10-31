@@ -87,6 +87,9 @@ pub enum OpenError {
     Locked {
         /// The lock file.
         path: Utf8PathBuf,
+        /// The owner record of the process that holds the lock, if it wrote one (see
+        /// [`RuntimeOptions::lock_owner`](crate::RuntimeOptions::lock_owner)).
+        owner: Option<String>,
     },
     /// `risim-out/` can't be set up.
     #[error("failed to set up {path}")]
@@ -104,7 +107,7 @@ pub enum OpenError {
 impl From<LockError> for OpenError {
     fn from(error: LockError) -> Self {
         match error {
-            LockError::Locked { path } => Self::Locked { path },
+            LockError::Locked { path, owner } => Self::Locked { path, owner },
             LockError::Io { path, source } => Self::Io { path, source },
         }
     }
@@ -358,7 +361,8 @@ pub(crate) async fn open(
     };
     let config = ProjectConfig::new(source);
     let prepare_root = root.clone();
-    let opened = tokio::task::spawn_blocking(move || prepare(prepare_root, layout, config))
+    let owner = runtime.lock_owner().to_owned();
+    let opened = tokio::task::spawn_blocking(move || prepare(prepare_root, layout, config, &owner))
         .await
         .map_err(|error| OpenError::Io {
             path: root.clone(),
@@ -387,15 +391,16 @@ struct Opened {
     results: ResultStore,
 }
 
-/// Reads the configuration, locks `risim-out/`, extracts the builtins, loads the stored state
-/// and loads the project.
+/// Reads the configuration, locks `risim-out/` for `owner`, extracts the builtins, loads the
+/// stored state and loads the project.
 fn prepare(
     root: Utf8PathBuf,
     layout: OutputLayout,
     mut config: ProjectConfig,
+    owner: &str,
 ) -> Result<Opened, OpenError> {
     config.read()?;
-    let (lock, _previous) = OutputLock::acquire(&layout)?;
+    let (lock, _previous) = OutputLock::acquire(&layout, owner)?;
     let builtins_root = layout.builtins_root();
     let builtins_dir = match builtins::extract(&builtins_root) {
         Ok(dir) => dir,

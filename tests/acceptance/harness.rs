@@ -85,6 +85,7 @@ pub async fn runtime() -> Runtime {
         runner,
         max_parallel_simulations: parallelism,
         max_parallel_compiles: parallelism,
+        lock_owner: r#"{"acceptance": true}"#.to_owned(),
     })
     .await
     .expect("create the runtime")

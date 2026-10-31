@@ -10,6 +10,7 @@
 //! ```text
 //! <workspace>/risim-out/
 //! ├── .lock                     locked while the workspace is open, holds the owner's PID
+//! ├── owner.json                the owner's record, while the workspace is open
 //! ├── state.json                compile state and simulator identity
 //! ├── parse_cache.json          per-file parse results
 //! ├── builtins/<hash>/…         extracted VUnit/OSVVM sources
@@ -73,6 +74,11 @@ impl OutputLayout {
     /// The lock file.
     pub fn lock_file(&self) -> Utf8PathBuf {
         self.root.join(".lock")
+    }
+
+    /// The owner record of the lock (see [`OutputLock`]).
+    pub fn owner_file(&self) -> Utf8PathBuf {
+        self.root.join("owner.json")
     }
 
     /// The compile state.
@@ -363,6 +369,8 @@ pub enum LockError {
     Locked {
         /// The lock file.
         path: Utf8PathBuf,
+        /// The owner record of the process that holds the lock, if it wrote one.
+        owner: Option<String>,
     },
     /// The lock file can't be created or locked.
     #[error("failed to lock {path}")]
@@ -380,9 +388,19 @@ pub enum LockError {
 /// [`release`](Self::release). Dropping the lock without releasing it leaves the PID behind, so
 /// the next owner knows that the previous one crashed. The file is never deleted: deleting it
 /// would let a process lock the deleted file while another locks a new one.
+///
+/// The owner also writes its record, an opaque text from [`RuntimeOptions::lock_owner`], to
+/// `owner.json` after locking, and removes it on release; a process that finds the lock held
+/// gets the record in [`LockError::Locked`].
+/// It is a separate file because on Windows, the lock blocks reading the lock file through
+/// another handle.
+/// A crash leaves the record behind, and the next owner overwrites it.
+///
+/// [`RuntimeOptions::lock_owner`]: crate::RuntimeOptions::lock_owner
 #[derive(Debug)]
 pub struct OutputLock {
     path: Utf8PathBuf,
+    owner_path: Utf8PathBuf,
     file: File,
 }
 
@@ -400,7 +418,7 @@ pub enum PreviousOwner {
 }
 
 impl OutputLock {
-    /// Locks `risim-out/`, creating it if needed.
+    /// Locks `risim-out/` for `owner`, the owner record, creating the directory if needed.
     ///
     /// If the previous owner crashed while compiling, the compile state and the compiled
     /// libraries are deleted, so everything is recompiled. Otherwise the compile state was
@@ -410,7 +428,7 @@ impl OutputLock {
     /// # Errors
     ///
     /// Fails if another process holds the lock, or on I/O errors.
-    pub fn acquire(layout: &OutputLayout) -> Result<(Self, PreviousOwner), LockError> {
+    pub fn acquire(layout: &OutputLayout, owner: &str) -> Result<(Self, PreviousOwner), LockError> {
         let path = layout.lock_file();
         let io_error = |source| LockError::Io {
             path: path.clone(),
@@ -426,7 +444,13 @@ impl OutputLock {
             .map_err(io_error)?;
         match file.try_lock() {
             Ok(()) => {},
-            Err(TryLockError::WouldBlock) => return Err(LockError::Locked { path }),
+            Err(TryLockError::WouldBlock) => {
+                let holder = read_owner(&layout.owner_file());
+                return Err(LockError::Locked {
+                    path,
+                    owner: holder,
+                });
+            },
             Err(TryLockError::Error(error)) => return Err(io_error(error)),
         }
 
@@ -455,18 +479,39 @@ impl OutputLock {
             PreviousOwner::Crashed
         };
 
+        // Before the PID, so that the lock file stays as it was if the record can't be written.
+        let owner_path = layout.owner_file();
+        write_atomic(&owner_path, owner.as_bytes()).map_err(|source| LockError::Io {
+            path: owner_path.clone(),
+            source,
+        })?;
         // The PID marks the lock as taken; it must reach the disk to detect a crash.
         file.set_len(0)
             .and_then(|()| file.rewind())
             .and_then(|()| writeln!(file, "{}", process::id()))
             .and_then(|()| file.sync_data())
             .map_err(io_error)?;
-        Ok((Self { path, file }, previous))
+        Ok((
+            Self {
+                path,
+                owner_path,
+                file,
+            },
+            previous,
+        ))
     }
 
-    /// Marks the lock file as released and unlocks it.
+    /// Removes the owner record, marks the lock file as released and unlocks it.
     pub fn release(self) {
-        let Self { path, file } = self;
+        let Self {
+            path,
+            owner_path,
+            file,
+        } = self;
+        // Before unlocking, so that the record of the next owner stays.
+        if let Err(error) = remove_path(&owner_path) {
+            tracing::warn!(path = %owner_path, %error, "failed to remove the owner record");
+        }
         if let Err(error) = file.set_len(0).and_then(|()| file.sync_data()) {
             tracing::warn!(%path, %error, "failed to clear the lock file");
         }
@@ -474,6 +519,16 @@ impl OutputLock {
             tracing::warn!(%path, %error, "failed to unlock");
         }
     }
+}
+
+/// Reads the owner record `path` of a held lock.
+///
+/// Returns `None` if it is missing, empty or unreadable: the owner hasn't written it yet, or
+/// doesn't write one.
+fn read_owner(path: &Utf8Path) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .filter(|owner| !owner.trim().is_empty())
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -972,39 +1027,74 @@ mod tests {
         assert_eq!(results["lib.tb.a"].duration_ms, None);
     }
 
+    /// The owner record of the tests' locks.
+    const OWNER: &str = r#"{"pid": 1}"#;
+
+    #[test]
+    fn lock_records_its_owner() {
+        let temp = TempRoot::new();
+        let layout = OutputLayout::new(&temp.root);
+        let (lock, _) = OutputLock::acquire(&layout, OWNER).unwrap();
+        assert_eq!(fs::read_to_string(layout.owner_file()).unwrap(), OWNER);
+        let Err(LockError::Locked { path, owner }) = OutputLock::acquire(&layout, "other") else {
+            panic!("the lock isn't exclusive");
+        };
+        assert_eq!(path, layout.lock_file());
+        assert_eq!(owner.as_deref(), Some(OWNER));
+        lock.release();
+        assert!(!layout.owner_file().exists());
+
+        // A crash leaves the record, which the next owner overwrites.
+        let (crashed, _) = OutputLock::acquire(&layout, OWNER).unwrap();
+        drop(crashed);
+        assert_eq!(fs::read_to_string(layout.owner_file()).unwrap(), OWNER);
+        let (next, previous) = OutputLock::acquire(&layout, "next").unwrap();
+        assert_eq!(previous, PreviousOwner::Crashed);
+        assert_eq!(fs::read_to_string(layout.owner_file()).unwrap(), "next");
+
+        // An owner without a record, like an older one.
+        fs::remove_file(layout.owner_file()).unwrap();
+        let Err(LockError::Locked { owner: unknown, .. }) = OutputLock::acquire(&layout, OWNER)
+        else {
+            panic!("the lock isn't exclusive");
+        };
+        assert_eq!(unknown, None);
+        next.release();
+    }
+
     #[test]
     fn lock_excludes_and_detects_crashes() {
         let temp = TempRoot::new();
         let layout = OutputLayout::new(&temp.root);
-        let (lock, previous) = OutputLock::acquire(&layout).unwrap();
+        let (lock, previous) = OutputLock::acquire(&layout, OWNER).unwrap();
         assert_eq!(previous, PreviousOwner::Released);
         assert!(matches!(
-            OutputLock::acquire(&layout),
+            OutputLock::acquire(&layout, OWNER),
             Err(LockError::Locked { .. })
         ));
         lock.release();
         assert_eq!(fs::read(layout.lock_file()).unwrap(), b"");
-        let (released_lock, after_release) = OutputLock::acquire(&layout).unwrap();
+        let (released_lock, after_release) = OutputLock::acquire(&layout, OWNER).unwrap();
         assert_eq!(after_release, PreviousOwner::Released);
         released_lock.release();
 
         // A dropped lock leaves its PID behind, like a crash. Without a compile running, the
         // state is kept.
-        let (crashed_lock, _) = OutputLock::acquire(&layout).unwrap();
+        let (crashed_lock, _) = OutputLock::acquire(&layout, OWNER).unwrap();
         CompileState::default().save(&layout).unwrap();
         fs::create_dir_all(layout.library_dir("lib")).unwrap();
         write_atomic(&layout.results_file(), b"{}").unwrap();
         write_atomic(&layout.parse_cache_file(), b"{}").unwrap();
         drop(crashed_lock);
 
-        let (recovered_lock, recovered) = OutputLock::acquire(&layout).unwrap();
+        let (recovered_lock, recovered) = OutputLock::acquire(&layout, OWNER).unwrap();
         assert_eq!(recovered, PreviousOwner::Crashed);
         assert!(layout.state_file().exists());
         assert!(layout.libraries_dir().exists());
         recovered_lock.release();
 
         // A crash while compiling discards the compile state and the libraries.
-        let (compiling_lock, _) = OutputLock::acquire(&layout).unwrap();
+        let (compiling_lock, _) = OutputLock::acquire(&layout, OWNER).unwrap();
         let compiling = CompileState {
             compiling: true,
             ..CompileState::default()
@@ -1012,7 +1102,7 @@ mod tests {
         compiling.save(&layout).unwrap();
         drop(compiling_lock);
 
-        let (wiped_lock, wiped) = OutputLock::acquire(&layout).unwrap();
+        let (wiped_lock, wiped) = OutputLock::acquire(&layout, OWNER).unwrap();
         assert_eq!(wiped, PreviousOwner::CrashedWhileCompiling);
         assert!(!layout.state_file().exists());
         assert!(!layout.libraries_dir().exists());

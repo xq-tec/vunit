@@ -42,6 +42,11 @@ pub struct RuntimeOptions {
     pub max_parallel_simulations: NonZeroUsize,
     /// The maximum number of compile processes running at once, over all workspaces.
     pub max_parallel_compiles: NonZeroUsize,
+    /// The owner record of this process, an opaque text (by convention a JSON object), which
+    /// every open workspace writes to `risim-out/owner.json` while it holds the lock.
+    ///
+    /// Another process that finds the workspace locked gets it in [`OpenError::Locked`].
+    pub lock_owner: String,
 }
 
 /// The [`Runtime`] can't be created.
@@ -55,6 +60,7 @@ pub enum RuntimeError {
 #[derive(Debug)]
 struct Inner {
     simulator: Simulator,
+    lock_owner: String,
     simulation_semaphore: Arc<Semaphore>,
     compile_semaphore: Arc<Semaphore>,
 }
@@ -82,6 +88,7 @@ impl Runtime {
         Ok(Self {
             inner: Arc::new(Inner {
                 simulator,
+                lock_owner: options.lock_owner,
                 simulation_semaphore: Arc::new(Semaphore::new(
                     options.max_parallel_simulations.get(),
                 )),
@@ -95,6 +102,11 @@ impl Runtime {
         &self.inner.simulator
     }
 
+    /// The owner record of the workspace locks ([`RuntimeOptions::lock_owner`]).
+    pub(crate) fn lock_owner(&self) -> &str {
+        &self.inner.lock_owner
+    }
+
     /// Limits the number of concurrent simulations.
     pub(crate) fn simulation_semaphore(&self) -> &Arc<Semaphore> {
         &self.inner.simulation_semaphore
@@ -105,8 +117,8 @@ impl Runtime {
         &self.inner.compile_semaphore
     }
 
-    /// Opens the workspace at `root`: acquires `risim-out/.lock`, loads the stored state, loads
-    /// the project and starts watching its files.
+    /// Opens the workspace at `root`: acquires `risim-out/.lock` and writes the owner record,
+    /// loads the stored state, loads the project and starts watching its files.
     ///
     /// Events are delivered losslessly through `events`, starting with the testcases and the
     /// diagnostics of the loaded project.
