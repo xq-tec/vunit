@@ -16,6 +16,10 @@
 //! # One table per library, with source globs relative to the workspace root.
 //! [libraries.my_lib]
 //! files = ["src/**/*.vhd", "tb/*.vhd"]
+//!
+//! # The riSim toolchain that the launcher runs for the workspace; ignored here.
+//! [toolchain]
+//! version = "1.4"
 //! ```
 //!
 //! Problems become diagnostics with ranges in the file. Only syntax and type errors prevent a
@@ -121,6 +125,19 @@ struct RawConfig {
     vunit: RawVunit,
     #[serde(default)]
     libraries: BTreeMap<String, RawLibrary>,
+    /// Read by the riSim launcher, which selects the toolchain by it; accepted here so that it
+    /// isn't an unknown key.
+    #[serde(default)]
+    #[expect(dead_code, reason = "only the launcher uses the toolchain version")]
+    toolchain: Option<RawToolchain>,
+}
+
+/// The `[toolchain]` table.
+#[derive(Deserialize)]
+struct RawToolchain {
+    /// The toolchain's version, version prefix or `latest`.
+    #[expect(dead_code, reason = "only the launcher uses the toolchain version")]
+    version: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -574,6 +591,32 @@ standard = "2008"
                     Some(Position::new(5, 1))
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn toolchain_version_is_accepted() {
+        let config = parse_str(
+            r#"
+[toolchain]
+version = "1.4"
+other = 1
+[libraries.lib]
+files = []
+"#,
+        );
+        assert!(config.spec.is_some());
+        let warnings: Vec<_> = config
+            .diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.severity, diagnostic.message.as_str()))
+            .collect();
+        assert_eq!(
+            warnings,
+            [(
+                Severity::Warning,
+                "unknown key 'toolchain.other' is ignored"
+            )]
         );
     }
 

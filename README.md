@@ -46,7 +46,14 @@ features = ["random", "verification_components"]
 # One table per library, with source globs relative to the workspace root.
 [libraries.my_lib]
 files = ["src/**/*.vhd", "tb/*.vhd"]
+
+# The riSim version that the `risim` launcher runs for the workspace; ignored here.
+[toolchain]
+version = "1.4"
 ```
+
+`[toolchain] version` is read by the riSim launcher, which selects the toolchain by it (riSim's `doc/installation.md`); this crate accepts it without a warning and otherwise ignores it.
+Unknown keys, including other keys in `[toolchain]`, are warnings.
 
 A `ProjectSpec` built in code describes the same project, and can also set external libraries, a VHDL standard per library, and configurations, generics and simulation options per testbench or test. Pass it as `ProjectSource::Spec` instead of `ProjectSource::ConfigFile`.
 
