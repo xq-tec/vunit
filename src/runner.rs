@@ -429,8 +429,9 @@ pub enum SimulationEvent {
     ///
     /// Sent when a test doesn't get a thread of the budget at once ([`WaitReason::Budget`],
     /// also for the tests queued behind it), and when the [`LeaseProvider`] reports a state.
-    /// The wait ends with [`TestStarted`](Self::TestStarted), or
-    /// [`TestFinished`](Self::TestFinished) if the test is cancelled.
+    /// A wait before the start ends with [`TestStarted`](Self::TestStarted); one that the
+    /// provider reports while the simulator runs ends with [`ThreadState::Running`].
+    /// Either ends with [`TestFinished`](Self::TestFinished) if the test is cancelled.
     TestThreads {
         /// The testcase name.
         name: String,

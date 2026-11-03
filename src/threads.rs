@@ -382,6 +382,9 @@ pub trait LeaseProvider: Send + Sync + fmt::Debug {
     ///
     /// It may wait, and reports what the test waits for through `events`; a cancel drops the
     /// future.
+    /// The lease's guard may keep a clone of `events`, to report the states of the running
+    /// simulator until it is dropped, which is before the test's
+    /// [`SimulationEvent::TestFinished`].
     /// An error fails the test with its message.
     fn lease<'a>(&'a self, test: &'a str, threads: u32, events: &'a LeaseEvents)
     -> LeaseFuture<'a>;
@@ -391,7 +394,8 @@ pub trait LeaseProvider: Send + Sync + fmt::Debug {
 pub struct Lease {
     /// Extra arguments of the simulator.
     pub args: Vec<String>,
-    /// Kept until the simulator exits.
+    /// Kept until the simulator has exited, or, if the test ends without waiting for that (an
+    /// error while waiting, or a dropped task), until it is killed.
     pub guard: Box<dyn Any + Send>,
 }
 
