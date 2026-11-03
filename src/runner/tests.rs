@@ -7,14 +7,14 @@
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
-use tokio::sync::Semaphore;
-
 use super::*;
 use crate::discovery;
 use crate::spec::ConfigurationSpec;
 use crate::spec::TestConfigSpec;
 use crate::test_support::add_vhdl;
 use crate::test_support::simulator;
+use crate::threads::NoLeases;
+use crate::threads::ThreadBudget;
 
 // -------------------------------------------------------------------------------------------------
 // runner_cfg and seeds
@@ -426,7 +426,9 @@ async fn cancelled_simulation_starts_nothing_despite_free_permits() {
     let context = SimulationContext {
         workspace_root: "/ws".into(),
         simulator: simulator(),
-        limit: ProcessLimit::from(Arc::new(Semaphore::new(8))),
+        limit: SimulationLimit::from(ThreadBudget::new(NonZeroU32::new(8).unwrap())),
+        max_threads_per_test: NonZeroU32::MIN,
+        leases: Arc::new(NoLeases),
         results: Arc::new(ResultStore::load(&fixture.layout)),
         testcase_locks: Arc::default(),
         events: events.into(),

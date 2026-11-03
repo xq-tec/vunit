@@ -260,6 +260,7 @@ impl Simulator {
             command.push("--paused".to_owned());
         }
         command.push(format!("--name={}", args.name));
+        command.extend(args.extra_args.iter().cloned());
         command.extend(args.sim_flags.iter().cloned());
         command.push(match args.top {
             Top::Configuration(name) => name.clone(),
@@ -330,6 +331,9 @@ pub struct SimulateArgs<'a> {
     pub wait: bool,
     /// The testcase name, which links the simulation to the testcase.
     pub name: &'a str,
+    /// Extra risim-runner options of the simulation's lease ([`crate::threads::Lease`]), before
+    /// `sim_flags`.
+    pub extra_args: &'a [String],
 }
 
 #[cfg(test)]
@@ -453,6 +457,7 @@ mod tests {
             disable_ieee_asserts: true,
             wait: true,
             name: "lib.tb.test",
+            extra_args: &["--lease-dir=/leases/1".to_owned()],
         };
         assert_eq!(
             simulator.simulate_command(&args).unwrap(),
@@ -473,6 +478,7 @@ mod tests {
                 "--ieee-asserts=disable",
                 "--paused",
                 "--name=lib.tb.test",
+                "--lease-dir=/leases/1",
                 "--finish-after=1ms",
                 "tb(a)",
             ]
@@ -485,6 +491,7 @@ mod tests {
         args.elab_flags = &[];
         args.sim_flags = &[];
         args.wait = false;
+        args.extra_args = &[];
         let command = simulator.simulate_command(&args).unwrap();
         assert_eq!(
             command[8..],

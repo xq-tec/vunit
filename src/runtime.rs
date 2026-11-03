@@ -2,15 +2,19 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! The resources shared by all workspaces of a process: the detected risim-runner and the analyzer,
-//! and the limits on concurrent compile and simulation processes.
+//! The resources shared by all workspaces of a process.
+//!
+//! They are the detected risim-runner and the analyzer, the limit on concurrent compile
+//! processes, the budget of simulation threads, and the provider of the simulations' leases
+//! ([`crate::threads`]).
 //!
 //! Every workspace of a process should be opened through the same [`Runtime`],
 //! so that the limits apply across workspaces. An operation can lower them for its own
-//! processes with a [`ProcessLimit`].
+//! processes with a [`ProcessLimit`] or a [`SimulationLimit`](crate::threads::SimulationLimit).
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
+use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -24,6 +28,8 @@ use tokio::sync::mpsc;
 
 use crate::simulator::DetectError;
 use crate::simulator::Simulator;
+use crate::threads::LeaseProvider;
+use crate::threads::ThreadBudget;
 use crate::workspace;
 use crate::workspace::OpenError;
 use crate::workspace::ProjectSource;
@@ -31,17 +37,27 @@ use crate::workspace::Workspace;
 use crate::workspace::WorkspaceEvent;
 
 /// The settings of a [`Runtime`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct RuntimeOptions {
     /// The analyzer, the riSim CLI `risim`, which compiles (`risim analyze`).
     pub analyzer: Utf8PathBuf,
     /// The risim-runner executable, which simulates (`risim-runner run`).
     pub runner: Utf8PathBuf,
-    /// The maximum number of simulations running at once, over all workspaces. A paused GUI
-    /// simulation counts as running.
-    pub max_parallel_simulations: NonZeroUsize,
+    /// The simulation threads of all workspaces together; a paused GUI simulation holds its
+    /// threads.
+    ///
+    /// The caller may keep a clone, to resize it.
+    pub threads: ThreadBudget,
+    /// The most threads of the budget that one simulation takes: the threads that a simulation
+    /// can use.
+    ///
+    /// A simulation's share of the free threads is capped by it ([`crate::threads`]).
+    pub max_threads_per_test: NonZeroU32,
     /// The maximum number of compile processes running at once, over all workspaces.
     pub max_parallel_compiles: NonZeroUsize,
+    /// Grants the leases of the simulations; [`NoLeases`](crate::threads::NoLeases) grants
+    /// empty ones.
+    pub leases: Arc<dyn LeaseProvider>,
     /// The owner record of this process, an opaque text (by convention a JSON object), which
     /// every open workspace writes to `risim-out/owner.json` while it holds the lock.
     ///
@@ -61,7 +77,9 @@ pub enum RuntimeError {
 struct Inner {
     simulator: Simulator,
     lock_owner: String,
-    simulation_semaphore: Arc<Semaphore>,
+    threads: ThreadBudget,
+    max_threads_per_test: NonZeroU32,
+    leases: Arc<dyn LeaseProvider>,
     compile_semaphore: Arc<Semaphore>,
 }
 
@@ -89,9 +107,9 @@ impl Runtime {
             inner: Arc::new(Inner {
                 simulator,
                 lock_owner: options.lock_owner,
-                simulation_semaphore: Arc::new(Semaphore::new(
-                    options.max_parallel_simulations.get(),
-                )),
+                threads: options.threads,
+                max_threads_per_test: options.max_threads_per_test,
+                leases: options.leases,
                 compile_semaphore: Arc::new(Semaphore::new(options.max_parallel_compiles.get())),
             }),
         })
@@ -107,9 +125,19 @@ impl Runtime {
         &self.inner.lock_owner
     }
 
-    /// Limits the number of concurrent simulations.
-    pub(crate) fn simulation_semaphore(&self) -> &Arc<Semaphore> {
-        &self.inner.simulation_semaphore
+    /// The simulation threads of all workspaces ([`RuntimeOptions::threads`]).
+    pub fn threads(&self) -> &ThreadBudget {
+        &self.inner.threads
+    }
+
+    /// The most threads that one simulation takes ([`RuntimeOptions::max_threads_per_test`]).
+    pub(crate) fn max_threads_per_test(&self) -> NonZeroU32 {
+        self.inner.max_threads_per_test
+    }
+
+    /// Grants the leases of the simulations ([`RuntimeOptions::leases`]).
+    pub(crate) fn leases(&self) -> &Arc<dyn LeaseProvider> {
+        &self.inner.leases
     }
 
     /// Limits the number of concurrent compile processes.
@@ -138,8 +166,8 @@ impl Runtime {
     }
 }
 
-/// Limits the concurrent processes of an operation: by the shared semaphore of the [`Runtime`]
-/// and, optionally, by a semaphore of the operation; cheap to clone.
+/// Limits the concurrent compile processes of an operation: by the shared semaphore of the
+/// [`Runtime`] and, optionally, by a semaphore of the operation; cheap to clone.
 #[derive(Debug, Clone)]
 pub struct ProcessLimit {
     shared: Arc<Semaphore>,

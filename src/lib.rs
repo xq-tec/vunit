@@ -20,6 +20,7 @@
 //! - the simulator (the analyzer `risim` and risim-runner): [`simulator`], [`process`]
 //! - incremental parallel compilation: [`compile`]
 //! - simulation runs with persisted results: [`runner`]
+//! - the simulation threads, their budget and leases: [`threads`]
 //! - workspace management and monitoring: [`workspace`], [`watch`], [`runtime`]
 //!
 //! Entry points: a [`Runtime`] shared by all workspaces of a process,
@@ -46,6 +47,7 @@ pub mod store;
 mod sync;
 #[cfg(test)]
 mod test_support;
+pub mod threads;
 pub mod vhdl_parser;
 pub mod vhdl_standard;
 pub mod watch;
@@ -61,6 +63,11 @@ pub use crate::runtime::RuntimeOptions;
 pub use crate::store::TestCounts;
 pub use crate::store::TestOutcome;
 pub use crate::store::TestResult;
+pub use crate::threads::Lease;
+pub use crate::threads::LeaseProvider;
+pub use crate::threads::ThreadBudget;
+pub use crate::threads::ThreadState;
+pub use crate::threads::WaitReason;
 pub use crate::workspace::DiagnosticSets;
 pub use crate::workspace::OpenError;
 pub use crate::workspace::ProjectSource;

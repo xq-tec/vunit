@@ -30,6 +30,7 @@ mod operation;
 
 use std::collections::BTreeMap;
 use std::io;
+use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,6 +64,7 @@ use crate::store::ResultStore;
 use crate::store::TestCounts;
 use crate::store::TestOutcome;
 use crate::store::TestResult;
+use crate::threads::ThreadState;
 
 /// Where the project of a workspace comes from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +213,16 @@ pub enum WorkspaceEventKind {
         /// The testcases to run, sorted.
         testcases: Vec<String>,
     },
+    /// A testcase waits for threads, or its simulation's threads changed
+    /// ([`SimulationEvent::TestThreads`](crate::runner::SimulationEvent::TestThreads)).
+    TestThreads {
+        /// The tags of the simulate operation.
+        tags: Vec<RequestTag>,
+        /// The testcase name.
+        name: String,
+        /// What its simulation does with its threads.
+        state: ThreadState,
+    },
     /// The simulator of a testcase is about to be spawned.
     TestStarted {
         /// The tags of the simulate operation.
@@ -287,18 +299,21 @@ impl Workspace {
 
     /// Compiles, then runs the testcases matching `requests`.
     ///
-    /// `max_parallel` limits the compile and simulation processes of the request, in addition
-    /// to the limits of the [`Runtime`]. Merged requests use the smallest limit.
+    /// `max_parallel` limits the compile and simulation processes of the request, and `threads`
+    /// the simulation threads of its simulations together (the operation's thread cap), in
+    /// addition to the limits of the [`Runtime`]. Merged requests use the smallest limits.
     pub fn simulate(
         &self,
         requests: Vec<SimulationRequest>,
         tag: Option<RequestTag>,
         max_parallel: Option<NonZeroUsize>,
+        threads: Option<NonZeroU32>,
     ) {
         self.send(Command::Simulate {
             requests,
             tag,
             max_parallel,
+            threads,
         });
     }
 

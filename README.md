@@ -58,13 +58,20 @@ Unknown keys, including other keys in `[toolchain]`, are warnings.
 A `ProjectSpec` built in code describes the same project, and can also set external libraries, a VHDL standard per library, and configurations, generics and simulation options per testbench or test. Pass it as `ProjectSource::Spec` instead of `ProjectSource::ConfigFile`.
 
 ```rust
-use risim_vunit_frontend::{ProjectSource, Runtime, RuntimeOptions, SimulationRequest};
+use std::num::NonZeroU32;
+use std::sync::Arc;
+
+use risim_vunit_frontend::{ProjectSource, Runtime, RuntimeOptions, SimulationRequest, ThreadBudget};
+use risim_vunit_frontend::threads::NoLeases;
 
 let runtime = Runtime::new(RuntimeOptions {
     analyzer: "/path/to/risim".into(),
     runner: "/path/to/risim-runner".into(),
-    max_parallel_simulations: parallelism,
+    threads: ThreadBudget::new(threads),
+    max_threads_per_test: NonZeroU32::MIN,
     max_parallel_compiles: parallelism,
+    leases: Arc::new(NoLeases),
+    lock_owner: owner,
 })
 .await?;
 let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -75,6 +82,7 @@ workspace.simulate(
     vec![SimulationRequest { pattern: "my_lib.tb_*".into(), gui: false }],
     None,
     None,
+    None,
 );
 while let Some(event) = receiver.recv().await {
     // CompileStarted, FileCompiling, TestStarted, TestFinished, SimulationFinished, …
@@ -83,6 +91,10 @@ while let Some(event) = receiver.recv().await {
 
 Everything a workspace generates goes to `<root>/risim-out/`: the extracted VUnit and OSVVM sources, compiled libraries, compile and test output, and the JSON state files.
 A lock file keeps other processes from using the same directory at the same time, and `owner.json` names the process that holds it (`RuntimeOptions::lock_owner`).
+
+Simulations share a budget of threads (`RuntimeOptions::threads`, resizable), and a simulate request can cap its own threads.
+Each simulation takes a share of the free threads, up to the threads that it can use (`RuntimeOptions::max_threads_per_test`), and asks the `LeaseProvider` of the runtime for a lease of them, whose arguments go to `risim-runner run`; a test waiting for threads reports it as `TestThreads`.
+The `threads` module documents the rules.
 
 The consecutive files of one library that need compiling are analysed by one `risim analyze`, which prints its reports as JSON lines (`--message-format=json`); each report goes to the file of its location, and a file whose design units the call made obsolete is compiled again. The compiled libraries are kept as long as the paths of both executables and the `--version` output of `risim-runner` are the same, which names the archive format.
 

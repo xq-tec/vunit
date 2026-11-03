@@ -6,6 +6,7 @@
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
+use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 
 use super::RequestTag;
@@ -31,8 +32,15 @@ pub(super) enum Operation {
         tags: Vec<RequestTag>,
         /// The maximum number of processes of the operation at once; `None` for no own limit.
         max_parallel: Option<NonZeroUsize>,
+        /// The maximum number of simulation threads of the operation at once; `None` for no
+        /// own limit.
+        threads: Option<NonZeroU32>,
     },
 }
+
+/// The parts of a simulate operation that a compile doesn't have: its requests and its thread
+/// limit.
+type SimulationParts = (Vec<SimulationRequest>, Option<NonZeroU32>);
 
 impl Operation {
     /// A compile operation with the tag and process limit of its request.
@@ -43,16 +51,18 @@ impl Operation {
         }
     }
 
-    /// A simulate operation with the tag and process limit of its request.
+    /// A simulate operation with the tag, the process limit and the thread limit of its request.
     pub(super) fn simulate(
         requests: Vec<SimulationRequest>,
         tag: Option<RequestTag>,
         max_parallel: Option<NonZeroUsize>,
+        threads: Option<NonZeroU32>,
     ) -> Self {
         Self::Simulate {
             requests: merge_requests(Vec::new(), requests),
             tags: tag.into_iter().collect(),
             max_parallel,
+            threads,
         }
     }
 
@@ -97,11 +107,12 @@ impl Operation {
         }
     }
 
-    /// The requests of a simulate operation, the tags, and the process limit.
+    /// The requests and the thread limit of a simulate operation, the tags, and the process
+    /// limit.
     fn into_parts(
         self,
     ) -> (
-        Option<Vec<SimulationRequest>>,
+        Option<SimulationParts>,
         Vec<RequestTag>,
         Option<NonZeroUsize>,
     ) {
@@ -111,7 +122,8 @@ impl Operation {
                 requests,
                 tags,
                 max_parallel,
-            } => (Some(requests), tags, max_parallel),
+                threads,
+            } => (Some((requests, threads)), tags, max_parallel),
         }
     }
 
@@ -120,8 +132,8 @@ impl Operation {
     /// Two compiles stay a compile; anything with a simulate becomes a simulate.
     /// Tags and requests are united, keeping the order they were first requested in; requests
     /// with the same pattern merge into one that runs paused if either does. The merged
-    /// operation has the smallest process limit of the two, so that it keeps the promise of
-    /// either request.
+    /// operation has the smallest process and thread limits of the two, so that it keeps the
+    /// promise of either request.
     #[must_use]
     pub(super) fn merge(self, later: Self) -> Self {
         let (simulation, mut merged_tags, max_parallel) = self.into_parts();
@@ -132,25 +144,31 @@ impl Operation {
             }
         }
         let max_parallel = min_limit(max_parallel, later_max_parallel);
-        if simulation.is_none() && later_simulation.is_none() {
-            return Self::Compile {
-                tags: merged_tags,
-                max_parallel,
+        let (requests, threads, later_requests, later_threads) =
+            match (simulation, later_simulation) {
+                (None, None) => {
+                    return Self::Compile {
+                        tags: merged_tags,
+                        max_parallel,
+                    };
+                },
+                (Some((requests, threads)), None) => (requests, threads, Vec::new(), None),
+                (None, Some((requests, threads))) => (Vec::new(), None, requests, threads),
+                (Some((requests, threads)), Some((later_requests, later_threads))) => {
+                    (requests, threads, later_requests, later_threads)
+                },
             };
-        }
         Self::Simulate {
-            requests: merge_requests(
-                simulation.unwrap_or_default(),
-                later_simulation.unwrap_or_default(),
-            ),
+            requests: merge_requests(requests, later_requests),
             tags: merged_tags,
             max_parallel,
+            threads: min_limit(threads, later_threads),
         }
     }
 }
 
-/// The smaller of two process limits; `None` doesn't limit.
-fn min_limit(limit: Option<NonZeroUsize>, other: Option<NonZeroUsize>) -> Option<NonZeroUsize> {
+/// The smaller of two limits; `None` doesn't limit.
+fn min_limit<T: Ord>(limit: Option<T>, other: Option<T>) -> Option<T> {
     match (limit, other) {
         (Some(limit), Some(other)) => Some(limit.min(other)),
         (limit, None) | (None, limit) => limit,
@@ -218,13 +236,15 @@ mod tests {
 
     #[test]
     fn a_simulate_absorbs_compiles() {
-        let simulate = Operation::simulate(requests(&[("x.*", false)]), tag("s"), None);
+        let threads = NonZeroU32::new(3);
+        let simulate = Operation::simulate(requests(&[("x.*", false)]), tag("s"), None, threads);
         assert_eq!(
             Operation::compile(tag("c"), None).merge(simulate.clone()),
             Operation::Simulate {
                 requests: requests(&[("x.*", false)]),
                 tags: tags(&["c", "s"]),
                 max_parallel: None,
+                threads,
             }
         );
         assert_eq!(
@@ -233,6 +253,7 @@ mod tests {
                 requests: requests(&[("x.*", false)]),
                 tags: tags(&["s", "c"]),
                 max_parallel: None,
+                threads,
             }
         );
     }
@@ -243,10 +264,12 @@ mod tests {
             requests(&[("a", false), ("b", true), ("a", false)]),
             None,
             None,
+            None,
         )
         .merge(Operation::simulate(
             requests(&[("c", false), ("a", true), ("b", false)]),
             tag("t"),
+            None,
             None,
         ));
         assert_eq!(
@@ -255,6 +278,7 @@ mod tests {
                 requests: requests(&[("a", true), ("b", true), ("c", false)]),
                 tags: tags(&["t"]),
                 max_parallel: None,
+                threads: None,
             }
         );
         assert_eq!(
@@ -272,6 +296,7 @@ mod tests {
                 requests(&[("x", false)]),
                 tag("c"),
                 limit(2),
+                None,
             ))
             .merge(Operation::compile(tag("d"), limit(3)));
         assert_eq!(merged.max_parallel(), limit(2));
@@ -287,5 +312,21 @@ mod tests {
                 .max_parallel(),
             limit(1)
         );
+    }
+
+    #[test]
+    fn merges_keep_the_smallest_thread_limit() {
+        let threads = |n| NonZeroU32::new(n);
+        let simulate = |n| Operation::simulate(requests(&[("x", false)]), None, None, threads(n));
+        let Operation::Simulate {
+            threads: merged, ..
+        } = simulate(4)
+            .merge(Operation::simulate(requests(&[]), None, None, None))
+            .merge(simulate(2))
+            .merge(simulate(3))
+        else {
+            panic!("not a simulate");
+        };
+        assert_eq!(merged, threads(2));
     }
 }

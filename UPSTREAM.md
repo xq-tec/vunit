@@ -53,6 +53,7 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 | `watch`                     | — (new)                                                             | `notify` watcher, debouncing, change classification                         |
 | `workspace`                 | — (new)                                                             | Per-workspace actor: state, request merging, operations, events             |
 | `runtime`                   | — (new)                                                             | Shared limits, risim-runner detection across workspaces                     |
+| `threads`                   | — (new)                                                             | Thread budget, shares, operation thread cap, leases of simulations          |
 | `verilog_parser` (deferred) | `parsing/verilog/*`                                                 | Deferred                                                                    |
 
 (\*) Only on the fork's `risim` branch, which held the Python risim-ghdl support.

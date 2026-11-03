@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
+use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::Duration;
 
 use camino::Utf8Path;
@@ -29,6 +31,8 @@ use risim_vunit_frontend::diagnostics::Severity;
 use risim_vunit_frontend::spec::ConfigurationSpec;
 use risim_vunit_frontend::spec::ProjectSpec;
 use risim_vunit_frontend::spec::TestConfigSpec;
+use risim_vunit_frontend::threads::NoLeases;
+use risim_vunit_frontend::threads::ThreadBudget;
 use tokio::sync::mpsc;
 
 /// The environment variable naming the risim-runner executable.
@@ -83,8 +87,13 @@ pub async fn runtime() -> Runtime {
     Runtime::new(RuntimeOptions {
         analyzer,
         runner,
-        max_parallel_simulations: parallelism,
+        threads: ThreadBudget::new(
+            NonZeroU32::try_from(u32::try_from(parallelism.get()).unwrap_or(u32::MAX))
+                .expect("non-zero"),
+        ),
+        max_threads_per_test: NonZeroU32::MIN,
         max_parallel_compiles: parallelism,
+        leases: Arc::new(NoLeases),
         lock_owner: r#"{"acceptance": true}"#.to_owned(),
     })
     .await
@@ -185,6 +194,7 @@ pub async fn simulate_all(runtime: &Runtime, root: &Utf8Path, spec: &ProjectSpec
             gui: false,
         }],
         Some(RequestTag(TAG.to_owned())),
+        None,
         None,
     );
 

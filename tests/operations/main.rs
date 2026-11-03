@@ -18,6 +18,7 @@ mod workspace;
 
 use std::env;
 use std::fs;
+use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -62,6 +63,15 @@ use risim_vunit_frontend::store::TestCounts;
 use risim_vunit_frontend::store::TestOutcome;
 use risim_vunit_frontend::store::TestOutputPaths;
 use risim_vunit_frontend::store::TestResults;
+use risim_vunit_frontend::threads::Lease;
+use risim_vunit_frontend::threads::LeaseEvents;
+use risim_vunit_frontend::threads::LeaseFuture;
+use risim_vunit_frontend::threads::LeaseProvider;
+use risim_vunit_frontend::threads::NoLeases;
+use risim_vunit_frontend::threads::SimulationLimit;
+use risim_vunit_frontend::threads::ThreadBudget;
+use risim_vunit_frontend::threads::ThreadState;
+use risim_vunit_frontend::threads::WaitReason;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -135,6 +145,21 @@ fn main() -> ExitCode {
             non_zero_exit_code_fails_a_passed_test,
         ),
         trial("semaphore_limits_simulations", semaphore_limits_simulations),
+        trial("tests_share_the_threads", tests_share_the_threads),
+        trial(
+            "many_tests_get_one_thread_each",
+            many_tests_get_one_thread_each,
+        ),
+        trial(
+            "a_test_takes_at_most_its_threads",
+            a_test_takes_at_most_its_threads,
+        ),
+        trial("a_full_budget_reports_waits", a_full_budget_reports_waits),
+        trial("the_budget_resizes", the_budget_resizes),
+        trial(
+            "a_refused_lease_fails_the_test",
+            a_refused_lease_fails_the_test,
+        ),
         trial(
             "cancel_terminates_and_skips_simulations",
             cancel_terminates_and_skips_simulations,
@@ -170,7 +195,14 @@ struct Workspace {
     layout: OutputLayout,
     spec: ProjectSpec,
     simulator: Simulator,
+    /// Limits the compile processes.
     semaphore: Arc<Semaphore>,
+    /// The simulation threads.
+    threads: ThreadBudget,
+    /// The most threads that one test takes.
+    max_threads_per_test: NonZeroU32,
+    /// Grants the simulations' leases.
+    leases: Arc<dyn LeaseProvider>,
 }
 
 /// The result of a compile, with the events and when they arrived.
@@ -212,7 +244,7 @@ impl SimRun {
             .collect()
     }
 
-    /// The events without diagnostics, as `(kind, testcase)`.
+    /// The events without diagnostics and thread states, as `(kind, testcase)`.
     fn event_names(&self) -> Vec<(&'static str, String)> {
         self.events
             .iter()
@@ -221,7 +253,18 @@ impl SimRun {
                 SimulationEvent::TestStarted { name, .. } => Some(("test_started", name.clone())),
                 SimulationEvent::TestFinished { name, .. } => Some(("test_finished", name.clone())),
                 SimulationEvent::Finished { .. } => Some(("finished", String::new())),
-                SimulationEvent::Diagnostic { .. } => None,
+                SimulationEvent::Diagnostic { .. } | SimulationEvent::TestThreads { .. } => None,
+            })
+            .collect()
+    }
+
+    /// The thread states of the testcases, in the order they were reported.
+    fn thread_states(&self) -> Vec<(&str, &ThreadState)> {
+        self.events
+            .iter()
+            .filter_map(|event| match event {
+                SimulationEvent::TestThreads { name, state } => Some((name.as_str(), state)),
+                _ => None,
             })
             .collect()
     }
@@ -249,6 +292,9 @@ impl Workspace {
             spec: ProjectSpec::new(),
             simulator,
             semaphore: Arc::new(Semaphore::new(4)),
+            threads: ThreadBudget::new(threads(4)),
+            max_threads_per_test: NonZeroU32::MIN,
+            leases: Arc::new(NoLeases),
         }
     }
 
@@ -401,7 +447,9 @@ impl Workspace {
         let context = SimulationContext {
             workspace_root: self.root.clone(),
             simulator: self.simulator.clone(),
-            limit: ProcessLimit::from(Arc::clone(&self.semaphore)),
+            limit: SimulationLimit::from(self.threads.clone()),
+            max_threads_per_test: self.max_threads_per_test,
+            leases: Arc::clone(&self.leases),
             results: Arc::clone(results),
             testcase_locks: Arc::default(),
             events: events.into(),
@@ -444,6 +492,11 @@ impl Workspace {
         let _ignored = fs::remove_file(&path);
         log.lines().map(str::to_owned).collect()
     }
+}
+
+/// A thread count.
+const fn threads(count: u32) -> NonZeroU32 {
+    NonZeroU32::new(count).expect("non-zero")
 }
 
 fn testbench(name: &str, body: &str) -> String {
@@ -1132,7 +1185,7 @@ async fn non_zero_exit_code_fails_a_passed_test() {
 
 async fn semaphore_limits_simulations() {
     let mut workspace = Workspace::new().await;
-    workspace.semaphore = Arc::new(Semaphore::new(2));
+    workspace.threads = ThreadBudget::new(threads(2));
     simulation_project(&mut workspace);
     for test in ["pass", "fail, really", "slow"] {
         workspace.sim_directive(&format!("lib.tb_tests.{test}"), "sleep 300");
@@ -1155,9 +1208,268 @@ async fn semaphore_limits_simulations() {
     assert_eq!(max_running, 2);
 }
 
+/// Grants leases with the simulator argument `--lease=<threads>`, or fails them with `fail`,
+/// records the threads of every test, and reports them as running.
+#[derive(Debug, Default)]
+struct RecordingLeases {
+    granted: Mutex<Vec<(String, u32)>>,
+    fail: Option<String>,
+}
+
+impl RecordingLeases {
+    /// The threads of the granted leases, in the order they were asked for.
+    fn threads(&self) -> Vec<u32> {
+        let granted = self.granted.lock().expect("lock");
+        granted.iter().map(|&(_, threads)| threads).collect()
+    }
+}
+
+impl LeaseProvider for RecordingLeases {
+    fn lease<'a>(
+        &'a self,
+        test: &'a str,
+        threads: u32,
+        events: &'a LeaseEvents,
+    ) -> LeaseFuture<'a> {
+        self.granted
+            .lock()
+            .expect("lock")
+            .push((test.to_owned(), threads));
+        events.report(ThreadState::Running { threads });
+        let lease = match &self.fail {
+            Some(message) => Err(message.clone()),
+            None => Ok(Lease {
+                args: vec![format!("--lease={threads}")],
+                guard: Box::new(()),
+            }),
+        };
+        Box::pin(std::future::ready(lease))
+    }
+}
+
+/// `lib`: a testbench `tb_many` with the tests `t0`, `t1`, …, `count` in all.
+fn many_tests_project(workspace: &mut Workspace, count: usize) {
+    let runs: Vec<String> = (0..count)
+        .map(|index| format!("run(\"t{index}\")"))
+        .collect();
+    workspace.write(
+        "tb/tb_many.vhd",
+        &format!(
+            "entity tb_many is generic (runner_cfg : string); end entity;\n\
+             architecture tb of tb_many is\nbegin\n  main : process\n  begin\n    \
+             test_runner_setup(runner, runner_cfg);\n    if {} then\n    end if;\n    \
+             test_runner_cleanup(runner);\n  end process;\nend architecture;\n",
+            runs.join(" then\n    elsif ")
+        ),
+    );
+    workspace.spec.add_library("lib", ["tb/*.vhd"]);
+}
+
+/// The tests of an operation share the free threads, if they can use them: 5 tests on 10
+/// threads get 2 each, which their leases get, and the simulator its arguments.
+async fn tests_share_the_threads() {
+    let mut workspace = Workspace::new().await;
+    workspace.threads = ThreadBudget::new(threads(10));
+    workspace.max_threads_per_test = threads(8);
+    let leases = Arc::new(RecordingLeases::default());
+    workspace.leases = Arc::clone(&leases) as Arc<dyn LeaseProvider>;
+    many_tests_project(&mut workspace, 5);
+    for index in 0..5 {
+        workspace.sim_directive(&format!("lib.tb_many.t{index}"), "sleep 300");
+    }
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    let run = workspace
+        .simulate(&[("lib.tb_many.*", false)], &results)
+        .await;
+    assert_eq!(run.report.counts().passed, 5);
+    assert_eq!(leases.threads(), [2; 5]);
+    // The provider's reports reach the listeners.
+    let states = run.thread_states();
+    assert_eq!(states.len(), 5, "{states:?}");
+    assert!(
+        states
+            .iter()
+            .all(|(_, state)| **state == ThreadState::Running { threads: 2 }),
+        "{states:?}"
+    );
+    let paths = TestOutputPaths::new(&workspace.layout, "lib.tb_many.t0");
+    let args = fs::read_to_string(paths.dir.join("args.txt")).expect("args.txt");
+    assert!(args.lines().any(|arg| arg == "--lease=2"), "{args}");
+}
+
+/// 100 tests on 10 threads get one each while more tests wait than there are threads; at most
+/// 10 run at once.
+async fn many_tests_get_one_thread_each() {
+    let mut workspace = Workspace::new().await;
+    workspace.threads = ThreadBudget::new(threads(10));
+    workspace.max_threads_per_test = threads(8);
+    let leases = Arc::new(RecordingLeases::default());
+    workspace.leases = Arc::clone(&leases) as Arc<dyn LeaseProvider>;
+    many_tests_project(&mut workspace, 100);
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    let run = workspace
+        .simulate(&[("lib.tb_many.*", false)], &results)
+        .await;
+    assert_eq!(run.report.counts().passed, 100);
+    let granted = leases.threads();
+    assert_eq!(granted.len(), 100);
+    // Up to the 90th test, at least 11 tests wait, which share at most 10 threads.
+    assert_eq!(granted[..90], [1; 90]);
+    let mut running: i32 = 0;
+    let mut max_running = 0;
+    for line in workspace.take_log() {
+        if line.starts_with("simstart") {
+            running += 1;
+        } else if line.starts_with("simend") {
+            running -= 1;
+        }
+        max_running = max_running.max(running);
+    }
+    assert!(max_running <= 10, "{max_running}");
+}
+
+/// A test takes no more threads than it can use, even when it is alone with a free budget.
+async fn a_test_takes_at_most_its_threads() {
+    let mut workspace = Workspace::new().await;
+    workspace.threads = ThreadBudget::new(threads(10));
+    workspace.max_threads_per_test = threads(3);
+    let leases = Arc::new(RecordingLeases::default());
+    workspace.leases = Arc::clone(&leases) as Arc<dyn LeaseProvider>;
+    many_tests_project(&mut workspace, 2);
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    let run = workspace
+        .simulate(&[("lib.tb_many.*", false)], &results)
+        .await;
+    assert_eq!(run.report.counts().passed, 2);
+    assert_eq!(leases.threads(), [3, 3]);
+
+    // One thread each, as the hub's tests take until the multi-threaded kernel.
+    workspace.max_threads_per_test = NonZeroU32::MIN;
+    let single_leases = Arc::new(RecordingLeases::default());
+    workspace.leases = Arc::clone(&single_leases) as Arc<dyn LeaseProvider>;
+    let single = workspace
+        .simulate(&[("lib.tb_many.t0", false)], &results)
+        .await;
+    assert_eq!(single.report.counts().passed, 1);
+    assert_eq!(single_leases.threads(), [1]);
+}
+
+/// A test that finds no free thread of the budget reports the wait, with the tests queued behind
+/// it, once each; a GUI test takes one thread.
+async fn a_full_budget_reports_waits() {
+    let mut workspace = Workspace::new().await;
+    workspace.threads = ThreadBudget::new(threads(1));
+    simulation_project(&mut workspace);
+    for test in ["fail, really", "pass"] {
+        workspace.sim_directive(&format!("lib.tb_tests.{test}"), "sleep 300");
+    }
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    let run = workspace
+        .simulate(&[("lib.tb_tests.*", false)], &results)
+        .await;
+    assert_eq!(run.report.counts().passed, 3);
+    let budget = ThreadState::Waiting(WaitReason::Budget { threads: 1 });
+    assert_eq!(
+        run.thread_states(),
+        [
+            ("lib.tb_tests.pass", &budget),
+            ("lib.tb_tests.slow", &budget)
+        ]
+    );
+    // The wait comes before the start.
+    let position = |wanted: fn(&SimulationEvent) -> bool| run.events.iter().position(wanted);
+    let waited = position(|event| matches!(event, SimulationEvent::TestThreads { .. }));
+    let started = position(
+        |event| matches!(event, SimulationEvent::TestStarted { name, .. } if name.ends_with("slow")),
+    );
+    assert!(waited.is_some() && waited < started, "{:#?}", run.events);
+
+    workspace.threads = ThreadBudget::new(threads(4));
+    workspace.max_threads_per_test = threads(4);
+    let leases = Arc::new(RecordingLeases::default());
+    workspace.leases = Arc::clone(&leases) as Arc<dyn LeaseProvider>;
+    let gui = workspace
+        .simulate(&[("lib.tb_tests.pass", true)], &results)
+        .await;
+    assert_eq!(gui.report.counts().passed, 1);
+    assert_eq!(leases.threads(), [1]);
+}
+
+/// Growing the budget starts waiting tests at once; shrinking it lets running tests finish and
+/// starts no test until the threads in use fit.
+async fn the_budget_resizes() {
+    let grown = resized_run(1, 3).await;
+    let grown_starts = positions(&grown, "simstart");
+    let first_end = grown.iter().position(|line| line.starts_with("simend"));
+    // All three started before the first one ended.
+    assert!(
+        grown_starts.iter().all(|&start| Some(start) < first_end),
+        "{grown:#?}"
+    );
+
+    let shrunk = resized_run(2, 1).await;
+    let shrunk_starts = positions(&shrunk, "simstart");
+    let ends = positions(&shrunk, "simend");
+    // The third test starts only after both running ones ended.
+    assert_eq!(shrunk_starts.len(), 3, "{shrunk:#?}");
+    assert!(shrunk_starts[2] > ends[1], "{shrunk:#?}");
+}
+
+/// Simulates three tests of 400 ms with a budget of `initial` threads, which is resized to
+/// `resized` when the first test starts; returns the log of the simulator.
+async fn resized_run(initial: u32, resized: u32) -> Vec<String> {
+    let mut workspace = Workspace::new().await;
+    workspace.threads = ThreadBudget::new(threads(initial));
+    many_tests_project(&mut workspace, 3);
+    for index in 0..3 {
+        workspace.sim_directive(&format!("lib.tb_many.t{index}"), "sleep 400");
+    }
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    let budget = workspace.threads.clone();
+    let run = workspace
+        .simulate_until(&[("lib.tb_many.*", false)], &results, move |event| {
+            if matches!(event, SimulationEvent::TestStarted { .. }) {
+                budget.resize(threads(resized));
+            }
+            false
+        })
+        .await;
+    assert_eq!(run.report.counts().passed, 3);
+    assert_eq!(workspace.threads.threads(), threads(resized));
+    workspace.take_log()
+}
+
+/// The positions of the lines of `log` that start with `prefix`.
+fn positions(log: &[String], prefix: &str) -> Vec<usize> {
+    log.iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with(prefix))
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// A lease that isn't granted fails the test with the provider's message.
+async fn a_refused_lease_fails_the_test() {
+    let mut workspace = Workspace::new().await;
+    workspace.leases = Arc::new(RecordingLeases {
+        fail: Some("no threads for you".to_owned()),
+        ..RecordingLeases::default()
+    });
+    simulation_project(&mut workspace);
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    let run = workspace.simulate(&[("*.pass", false)], &results).await;
+    assert_eq!(run.outcomes(), [("lib.tb_tests.pass", TestOutcome::Failed)]);
+    let message = &run.report.diagnostics[0].message;
+    assert!(
+        message.ends_with("failed to lease the simulation threads: no threads for you"),
+        "{message}"
+    );
+    assert!(workspace.take_log().is_empty());
+}
+
 async fn cancel_terminates_and_skips_simulations() {
     let mut workspace = Workspace::new().await;
-    workspace.semaphore = Arc::new(Semaphore::new(1));
+    workspace.threads = ThreadBudget::new(threads(1));
     simulation_project(&mut workspace);
     workspace.sim_directive("lib.tb_tests.fail, really", "hang");
     let results = Arc::new(ResultStore::load(&workspace.layout));

@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
+use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -64,6 +65,8 @@ use crate::store::OutputLock;
 use crate::store::ResultStore;
 use crate::store::TestCounts;
 use crate::sync::lock_unpoisoned;
+use crate::threads::SimulationLimit;
+use crate::threads::ThreadBudget;
 use crate::watch::Change;
 use crate::watch::Debouncer;
 use crate::watch::DirectoryWatcher;
@@ -80,6 +83,7 @@ pub(super) enum Command {
         requests: Vec<SimulationRequest>,
         tag: Option<RequestTag>,
         max_parallel: Option<NonZeroUsize>,
+        threads: Option<NonZeroU32>,
     },
     CancelAll,
     Cancel(RequestTag),
@@ -331,8 +335,9 @@ impl Actor {
                 requests,
                 tag,
                 max_parallel,
+                threads,
             } => {
-                self.request(Operation::simulate(requests, tag, max_parallel))
+                self.request(Operation::simulate(requests, tag, max_parallel, threads))
                     .await;
             },
             Command::CancelAll => self.cancel_all(),
@@ -609,8 +614,21 @@ impl Actor {
             success,
             simulation_patterns: running.operation.simulation_patterns(),
         });
-        if success && let Operation::Simulate { requests, tags, .. } = running.operation {
-            self.start_simulation(&running.model, &requests, tags, running.operation_semaphore);
+        if success
+            && let Operation::Simulate {
+                requests,
+                tags,
+                threads,
+                ..
+            } = running.operation
+        {
+            self.start_simulation(
+                &running.model,
+                &requests,
+                tags,
+                running.operation_semaphore,
+                threads,
+            );
         }
         // An operation that can't compile ends right away, without starting a compile.
         while self.running_compile.is_none()
@@ -644,13 +662,14 @@ impl Actor {
     // ---------------------------------------------------------------------------------------------
 
     /// Runs the testcases of `model` that match `requests`, limited by the runtime and, if
-    /// given, by `operation_semaphore`.
+    /// given, by `operation_semaphore` and to `threads` threads at once.
     fn start_simulation(
         &mut self,
         model: &Model,
         requests: &[SimulationRequest],
         tags: Vec<RequestTag>,
         operation_semaphore: Option<Arc<Semaphore>>,
+        threads: Option<NonZeroU32>,
     ) {
         let plan = SimulationPlan::new(
             &SimulationInput {
@@ -684,10 +703,13 @@ impl Actor {
         let context = SimulationContext {
             workspace_root: self.root.to_path_buf(),
             simulator: self.runtime.simulator().clone(),
-            limit: ProcessLimit::new(
-                Arc::clone(self.runtime.simulation_semaphore()),
+            limit: SimulationLimit::new(
+                self.runtime.threads().clone(),
                 operation_semaphore,
+                threads.map(ThreadBudget::new),
             ),
+            max_threads_per_test: self.runtime.max_threads_per_test(),
+            leases: Arc::clone(self.runtime.leases()),
             results: Arc::clone(&self.results),
             testcase_locks: Arc::clone(&self.testcase_locks),
             events,
@@ -724,6 +746,10 @@ impl Actor {
                     .or_default()
                     .push(diagnostic);
                 self.dirty.insert(DiagnosticSource::Simulation);
+            },
+            SimulationEvent::TestThreads { name, state } => {
+                let tags = simulation.tags.clone();
+                self.emit(WorkspaceEventKind::TestThreads { tags, name, state });
             },
             SimulationEvent::TestStarted {
                 name,

@@ -10,11 +10,12 @@
 //! - **Resolution:** [`SimulationPlan::new`] matches the requested patterns against the
 //!   testcases and prepares a [`PlannedTest`] per match.
 //! - **Run:** each test first takes its testcase lock, so the same testcase never runs twice at
-//!   once, and then a permit of the simulation limit. Tests whose lock is free get permits
-//!   in name order; a test whose lock is held by another simulation waits for it without
-//!   holding up the others. Each test with a permit recreates its output directory, gets a seed
-//!   and its `runner_cfg` generic, and runs the simulator (`risim-runner run`) with stdout and
-//!   stderr redirected to `output.txt`.
+//!   once, then a permit of the simulation limit with its threads ([`crate::threads`]), and then
+//!   the lease of its threads. Tests whose lock is free get permits in name order; a test whose
+//!   lock is held by another simulation waits for it without holding up the others. Each test
+//!   with a lease recreates its output directory, gets a seed and its `runner_cfg` generic, and
+//!   runs the simulator (`risim-runner run`, with the lease's arguments) with stdout and stderr
+//!   redirected to `output.txt`.
 //! - **Outcome:** an explicit test passed if `vunit_results` records its start and the end of
 //!   the test suite; a testbench without explicit tests passed if the test suite ended. A
 //!   non-zero exit code fails a passed test from VHDL-2008 on (`has_valid_exit_code`).
@@ -37,8 +38,11 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::io::Write as _;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -47,6 +51,7 @@ use camino::Utf8PathBuf;
 use rustc_hash::FxHashMap;
 use tokio::sync::OwnedMutexGuard;
 use tokio::sync::mpsc;
+use tokio::task;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -57,8 +62,6 @@ use crate::discovery::Discovery;
 use crate::pattern;
 use crate::process;
 use crate::project::Project;
-use crate::runtime::ProcessLimit;
-use crate::runtime::ProcessPermit;
 use crate::simulator::CommandError;
 use crate::simulator::SimulateArgs;
 use crate::simulator::Simulator;
@@ -73,6 +76,13 @@ use crate::store::TestOutputPaths;
 use crate::store::TestResult;
 use crate::store::Timestamp;
 use crate::sync::lock_unpoisoned;
+use crate::threads::Lease;
+use crate::threads::LeaseEvents;
+use crate::threads::LeaseProvider;
+use crate::threads::SimulationLimit;
+use crate::threads::SimulationPermit;
+use crate::threads::ThreadState;
+use crate::threads::WaitReason;
 use crate::vhdl_parser::latin1;
 use crate::vhdl_standard::VhdlStandard;
 
@@ -255,6 +265,21 @@ impl PlannedTest {
     ///
     /// Fails if the simulator doesn't support the testbench's standard.
     pub fn command(&self, simulator: &Simulator, seed: &str) -> Result<Vec<String>, CommandError> {
+        self.command_with(simulator, seed, &[])
+    }
+
+    /// The command line of a run with `seed` on `simulator`, with the extra risim-runner
+    /// options `extra_args` of its lease.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the simulator doesn't support the testbench's standard.
+    pub fn command_with(
+        &self,
+        simulator: &Simulator,
+        seed: &str,
+        extra_args: &[String],
+    ) -> Result<Vec<String>, CommandError> {
         let generics = self.generics(seed);
         simulator.simulate_command(&SimulateArgs {
             vhdl_standard: self.vhdl_standard,
@@ -269,6 +294,7 @@ impl PlannedTest {
             disable_ieee_asserts: self.disable_ieee_asserts,
             wait: self.gui,
             name: &self.name,
+            extra_args,
         })
     }
 
@@ -399,6 +425,18 @@ pub enum SimulationEvent {
         /// The testcase names, sorted.
         testcases: Vec<String>,
     },
+    /// A testcase waits for threads, or its simulation's threads changed.
+    ///
+    /// Sent when a test doesn't get a thread of the budget at once ([`WaitReason::Budget`],
+    /// also for the tests queued behind it), and when the [`LeaseProvider`] reports a state.
+    /// The wait ends with [`TestStarted`](Self::TestStarted), or
+    /// [`TestFinished`](Self::TestFinished) if the test is cancelled.
+    TestThreads {
+        /// The testcase name.
+        name: String,
+        /// What its simulation does with its threads.
+        state: ThreadState,
+    },
     /// The simulator of a testcase is about to be spawned.
     TestStarted {
         /// The testcase name.
@@ -484,7 +522,7 @@ impl SimulationEvents {
         Self(Arc::new(listener))
     }
 
-    fn send(&self, event: SimulationEvent) {
+    pub(crate) fn send(&self, event: SimulationEvent) {
         (self.0)(event);
     }
 }
@@ -512,8 +550,13 @@ pub struct SimulationContext {
     pub workspace_root: Utf8PathBuf,
     /// The simulator.
     pub simulator: Simulator,
-    /// Limits the number of concurrent simulations; a paused GUI simulation holds its permit.
-    pub limit: ProcessLimit,
+    /// Limits the concurrent simulations and their threads; a paused GUI simulation holds its
+    /// permit.
+    pub limit: SimulationLimit,
+    /// The most threads of the budget that one test takes, which caps its share.
+    pub max_threads_per_test: NonZeroU32,
+    /// Grants the leases of the simulations' threads.
+    pub leases: Arc<dyn LeaseProvider>,
     /// Receives the results.
     pub results: Arc<ResultStore>,
     /// The testcase locks of the workspace.
@@ -555,6 +598,12 @@ pub async fn simulate(plan: SimulationPlan, context: &SimulationContext) -> Simu
     let mut diagnostics = plan.diagnostics;
     let mut tasks = JoinSet::new();
     let mut task_indices = FxHashMap::default();
+    // The tests that have no permit yet, which the free threads are shared among.
+    let waiting = Arc::new(AtomicUsize::new(plan.tests.len()));
+    // When a test waits for the budget, the tests queued behind it wait too, and are reported
+    // with it; the tests before this index have been reported.
+    let names: Vec<String> = plan.tests.iter().map(|test| test.name.clone()).collect();
+    let mut reported = 0;
     // Permits are handed out in plan order, so tests start in the order they were announced.
     // A test whose testcase runs in another simulation waits in its own task instead, so that it
     // doesn't hold up the tests after it.
@@ -563,28 +612,24 @@ pub async fn simulate(plan: SimulationPlan, context: &SimulationContext) -> Simu
         let lock = context.testcase_locks.get(&test.name);
         let context = context.clone();
         let Ok(guard) = Arc::clone(&lock).try_lock_owned() else {
-            let handle = tasks.spawn(async move {
-                let guard = tokio::select! {
-                    biased;
-                    () = context.cancel.cancelled() => None,
-                    guard = lock.lock_owned() => Some(guard),
-                };
-                let Some(guard) = guard else {
-                    return cancelled_before_start(test, &context);
-                };
-                let Some(permit) = acquire_permit(&context).await else {
-                    return cancelled_before_start(test, &context);
-                };
-                run_locked(&test, &context, guard, permit).await
-            });
-            task_indices.insert(handle.id(), index);
+            let waiting = Arc::clone(&waiting);
+            let task = spawn_after_lock(&mut tasks, test, context, lock, waiting, index < reported);
+            task_indices.insert(task, index);
             continue;
         };
+        let queue = Queue {
+            reported: index < reported,
+            behind: &names[(index + 1).max(reported)..],
+        };
+        let (permit, waited) = acquire_permit(&test, &context, &waiting, queue).await;
+        if waited {
+            reported = names.len();
+        }
         // Cancellation wins over a free permit, so no test starts after a cancel.
-        let Some(permit) = acquire_permit(&context).await else {
+        let Some(permit) = permit else {
             drop(guard);
             for (skipped_index, skipped) in std::iter::once((index, test)).chain(pending.by_ref()) {
-                outcomes[skipped_index].1 = cancelled_before_start(skipped, &context).0;
+                outcomes[skipped_index].1 = cancelled_before_start(&skipped, &context).0;
             }
             break;
         };
@@ -624,13 +669,92 @@ pub async fn simulate(plan: SimulationPlan, context: &SimulationContext) -> Simu
     report
 }
 
-/// A permit of the simulation limit, or `None` if the simulation is cancelled first.
-async fn acquire_permit(context: &SimulationContext) -> Option<ProcessPermit> {
-    tokio::select! {
+/// Spawns the task of `tasks` that runs `test` once it gets its testcase lock `lock`, which
+/// another simulation holds, and returns the id of the task.
+///
+/// The test is one of the `waiting` tests; `reported` tells whether its wait for the budget was
+/// reported.
+fn spawn_after_lock(
+    tasks: &mut JoinSet<(TestOutcome, Vec<Diagnostic>)>,
+    test: PlannedTest,
+    context: SimulationContext,
+    lock: Arc<tokio::sync::Mutex<()>>,
+    waiting: Arc<AtomicUsize>,
+    reported: bool,
+) -> task::Id {
+    let handle = tasks.spawn(async move {
+        let guard = tokio::select! {
+            biased;
+            () = context.cancel.cancelled() => None,
+            guard = lock.lock_owned() => Some(guard),
+        };
+        let Some(guard) = guard else {
+            waiting.fetch_sub(1, Ordering::Relaxed);
+            return cancelled_before_start(&test, &context);
+        };
+        let queue = Queue {
+            reported,
+            behind: &[],
+        };
+        let (permit, _) = acquire_permit(&test, &context, &waiting, queue).await;
+        let Some(permit) = permit else {
+            return cancelled_before_start(&test, &context);
+        };
+        run_locked(&test, &context, guard, permit).await
+    });
+    handle.id()
+}
+
+/// Where a test that waits for its permit is in the queue of its simulation.
+struct Queue<'a> {
+    /// Whether the test was reported as waiting for the budget already, behind another test.
+    reported: bool,
+    /// The tests queued behind it that haven't been reported as waiting.
+    behind: &'a [String],
+}
+
+/// A permit of the simulation limit for `test`, one of the `waiting` tests without a permit, or
+/// `None` if the simulation is cancelled first; and whether it waited for the budget.
+///
+/// A test takes at most [`SimulationContext::max_threads_per_test`] threads, and a GUI test one,
+/// since it starts paused.
+/// A test that waits for the budget reports it, unless `queue` says that it was reported, and
+/// the tests behind it in `queue`.
+/// Either way, the test no longer counts as waiting afterwards.
+async fn acquire_permit(
+    test: &PlannedTest,
+    context: &SimulationContext,
+    waiting: &AtomicUsize,
+    queue: Queue<'_>,
+) -> (Option<SimulationPermit>, bool) {
+    let max_threads = if test.gui {
+        NonZeroU32::MIN
+    } else {
+        context.max_threads_per_test
+    };
+    let mut waited = false;
+    let acquire = context
+        .limit
+        .acquire(waiting.load(Ordering::Relaxed), max_threads, |budget| {
+            waited = true;
+            let state = ThreadState::Waiting(WaitReason::Budget {
+                threads: budget.get(),
+            });
+            let own = (!queue.reported).then_some(&test.name);
+            for name in own.into_iter().chain(queue.behind) {
+                context.emit(SimulationEvent::TestThreads {
+                    name: name.clone(),
+                    state: state.clone(),
+                });
+            }
+        });
+    let permit = tokio::select! {
         biased;
         () = context.cancel.cancelled() => None,
-        permit = context.limit.acquire() => permit.ok(),
-    }
+        permit = acquire => permit.ok(),
+    };
+    waiting.fetch_sub(1, Ordering::Relaxed);
+    (permit, waited)
 }
 
 /// Runs a test that holds its testcase lock and a permit, and releases both afterwards.
@@ -638,9 +762,9 @@ async fn run_locked(
     test: &PlannedTest,
     context: &SimulationContext,
     guard: OwnedMutexGuard<()>,
-    permit: ProcessPermit,
+    permit: SimulationPermit,
 ) -> (TestOutcome, Vec<Diagnostic>) {
-    let result = run_test(test, context).await;
+    let result = run_test(test, context, permit.threads()).await;
     drop(permit);
     drop(guard);
     result
@@ -648,23 +772,37 @@ async fn run_locked(
 
 /// Reports a test that was cancelled before it started; its previous result is kept.
 fn cancelled_before_start(
-    test: PlannedTest,
+    test: &PlannedTest,
     context: &SimulationContext,
 ) -> (TestOutcome, Vec<Diagnostic>) {
     context.emit(SimulationEvent::TestFinished {
-        name: test.name,
+        name: test.name.clone(),
         outcome: TestOutcome::Cancelled,
-        output_path: test.paths.output_file,
+        output_path: test.paths.output_file.clone(),
         duration: Duration::ZERO,
     });
     (TestOutcome::Cancelled, Vec::new())
 }
 
-/// Runs one test that holds a simulation permit; returns its outcome and the problems found.
+/// Runs one test that holds a simulation permit of `threads` threads; returns its outcome and
+/// the problems found.
+///
+/// The test first gets the lease of its threads; a cancel while it waits for the lease counts
+/// as a cancel before the start.
 async fn run_test(
     test: &PlannedTest,
     context: &SimulationContext,
+    threads: u32,
 ) -> (TestOutcome, Vec<Diagnostic>) {
+    let events = LeaseEvents::new(test.name.clone(), context.events.clone());
+    let lease = tokio::select! {
+        biased;
+        () = context.cancel.cancelled() => None,
+        lease = context.leases.lease(&test.name, threads, &events) => Some(lease),
+    };
+    let Some(lease) = lease else {
+        return cancelled_before_start(test, context);
+    };
     let started_at = Timestamp::now();
     context.emit(SimulationEvent::TestStarted {
         name: test.name.clone(),
@@ -674,7 +812,7 @@ async fn run_test(
     let started = Instant::now();
     let mut diagnostics = Vec::new();
     // Only a simulator that ran to an outcome measures the duration of the test.
-    let (outcome, completed) = match execute(test, context).await {
+    let (outcome, completed) = match execute(test, context, lease).await {
         Ok(outcome) => (outcome, outcome != TestOutcome::Cancelled),
         Err(message) => {
             append_to_output(&test.paths.output_file, &message);
@@ -694,7 +832,7 @@ async fn run_test(
     // Recording writes and syncs `results.json`, which mustn't block the runtime.
     let results = Arc::clone(&context.results);
     let name = test.name.clone();
-    let recorded = tokio::task::spawn_blocking(move || results.record(&name, result))
+    let recorded = task::spawn_blocking(move || results.record(&name, result))
         .await
         .map_err(io::Error::other)
         .flatten();
@@ -718,17 +856,26 @@ async fn run_test(
     (outcome, diagnostics)
 }
 
-/// Prepares the output directory, runs the simulator and reads the results.
-async fn execute(test: &PlannedTest, context: &SimulationContext) -> Result<TestOutcome, String> {
+/// Prepares the output directory, runs the simulator with the arguments of `lease`, and reads
+/// the results.
+///
+/// The lease is kept until the simulator exits; a lease that wasn't granted fails the test.
+async fn execute(
+    test: &PlannedTest,
+    context: &SimulationContext,
+    lease: Result<Lease, String>,
+) -> Result<TestOutcome, String> {
     test.paths.prepare().map_err(|error| {
         format!(
             "failed to prepare the output directory {}: {error}",
             test.paths.dir
         )
     })?;
+    let lease =
+        lease.map_err(|error| format!("failed to lease the simulation threads: {error}"))?;
     let seed = test.seed();
     let command = test
-        .command(&context.simulator, &seed)
+        .command_with(&context.simulator, &seed, &lease.args)
         .map_err(|error| error.to_string())?;
     let header = format!("Seed for {}: {seed}\n", test.name);
     tracing::debug!(name = %test.name, ?command, "starting simulation");
@@ -741,6 +888,7 @@ async fn execute(test: &PlannedTest, context: &SimulationContext) -> Result<Test
     )
     .await
     .map_err(|error| format!("failed to run {}: {error}", context.simulator.path()))?;
+    drop(lease);
     let status = match outcome {
         process::Outcome::Exited(status) => status,
         process::Outcome::Cancelled => return Ok(TestOutcome::Cancelled),
