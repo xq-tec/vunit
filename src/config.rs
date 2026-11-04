@@ -5,7 +5,7 @@
 //! Reading `risim-config.toml` into a [`ProjectSpec`].
 //!
 //! ```toml
-//! # Options of `risim analyze` and `risim-runner run`: `--relaxed`, or its alias `-frelaxed`, and
+//! # Options of `risim analyze` and of the simulations: `--relaxed`, or its alias `-frelaxed`, and
 //! # `-fsynopsys`, which has no effect.
 //! options = ["-frelaxed"]
 //!
@@ -44,6 +44,7 @@ use crate::diagnostics::Diagnostic;
 use crate::diagnostics::LineIndex;
 use crate::diagnostics::Severity;
 use crate::project::LibraryNames;
+use crate::simulator::RunOptions;
 use crate::spec::CompileOptions;
 use crate::spec::Feature;
 use crate::spec::FilePattern;
@@ -114,8 +115,14 @@ pub fn parse(path: &Utf8Path, content: &str) -> Config {
     }
 }
 
-/// The options that risim-runner accepts in analysis and simulation.
+/// The options of analysis and simulation.
+///
+/// `risim analyze` takes them as they are; a simulation gets the run option `relaxed` from
+/// `--relaxed` and `-frelaxed`, and nothing from `-fsynopsys`.
 const OPTIONS: [&str; 3] = ["--relaxed", "-frelaxed", "-fsynopsys"];
+
+/// The options of `OPTIONS` that make the simulations relaxed.
+const RELAXED: [&str; 2] = ["--relaxed", "-frelaxed"];
 
 #[derive(Deserialize)]
 struct RawConfig {
@@ -293,11 +300,16 @@ impl Parser<'_> {
                 self.diagnostic(Severity::Error, message, Some(option.span()));
             }
         }
-        spec.compile_options = CompileOptions {
-            a_flags: options.clone(),
-        };
+        let mut run_options = RunOptions::new();
+        if options
+            .iter()
+            .any(|option| RELAXED.contains(&option.as_str()))
+        {
+            run_options.insert("relaxed".to_owned(), true.into());
+        }
+        spec.compile_options = CompileOptions { a_flags: options };
         spec.sim_options = SimOptions {
-            elab_flags: Some(options),
+            run_options: Some(run_options),
             ..SimOptions::default()
         };
         spec
@@ -404,10 +416,7 @@ files = ["sim/model/*.vhd", "tb/*.vhd"]
             })
         );
         assert_eq!(spec.compile_options.a_flags, ["-fsynopsys"]);
-        assert_eq!(
-            spec.sim_options.elab_flags,
-            Some(vec!["-fsynopsys".to_owned()])
-        );
+        assert_eq!(spec.sim_options.run_options, Some(RunOptions::new()));
         assert_eq!(
             spec.features.iter().copied().collect::<Vec<_>>(),
             [Feature::Random]
@@ -422,8 +431,8 @@ files = ["sim/model/*.vhd", "tb/*.vhd"]
         let spec = config.spec.unwrap();
         assert_eq!(spec.compile_options.a_flags, ["-frelaxed", "--relaxed"]);
         assert_eq!(
-            spec.sim_options.elab_flags,
-            Some(vec!["-frelaxed".to_owned(), "--relaxed".to_owned()])
+            spec.sim_options.run_options,
+            Some(RunOptions::from_iter([("relaxed".to_owned(), true.into())]))
         );
         let errors: Vec<_> = config
             .diagnostics

@@ -3,7 +3,8 @@
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
 //! The resources shared by all workspaces of a process: the detected risim-runner and the analyzer,
-//! and the limits on concurrent compile and simulation processes.
+//! the run options of every simulation, and the limits on concurrent compile and simulation
+//! processes.
 //!
 //! Every workspace of a process should be opened through the same [`Runtime`],
 //! so that the limits apply across workspaces. An operation can lower them for its own
@@ -23,6 +24,7 @@ use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 
 use crate::simulator::DetectError;
+use crate::simulator::RunOptions;
 use crate::simulator::Simulator;
 use crate::workspace;
 use crate::workspace::OpenError;
@@ -37,6 +39,10 @@ pub struct RuntimeOptions {
     pub analyzer: Utf8PathBuf,
     /// The risim-runner executable, which simulates (`risim-runner run`).
     pub runner: Utf8PathBuf,
+    /// The run options of every simulation, unless the run options of its configuration set them
+    /// ([`Simulator::simulate_command`]), such as the defaults that the application takes from its
+    /// environment.
+    pub run_defaults: RunOptions,
     /// The maximum number of simulations running at once, over all workspaces. A paused GUI
     /// simulation counts as running.
     pub max_parallel_simulations: NonZeroUsize,
@@ -60,6 +66,7 @@ pub enum RuntimeError {
 #[derive(Debug)]
 struct Inner {
     simulator: Simulator,
+    run_defaults: Arc<RunOptions>,
     lock_owner: String,
     simulation_semaphore: Arc<Semaphore>,
     compile_semaphore: Arc<Semaphore>,
@@ -76,7 +83,8 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// Fails if risim-runner can't be run or its version can't be determined.
+    /// Fails if risim-runner can't be run, its version can't be determined, or it reads another
+    /// format of run options ([`Simulator::detect`]).
     pub async fn new(options: RuntimeOptions) -> Result<Self, RuntimeError> {
         let simulator = Simulator::detect(&options.runner, &options.analyzer).await?;
         tracing::info!(
@@ -88,6 +96,7 @@ impl Runtime {
         Ok(Self {
             inner: Arc::new(Inner {
                 simulator,
+                run_defaults: Arc::new(options.run_defaults),
                 lock_owner: options.lock_owner,
                 simulation_semaphore: Arc::new(Semaphore::new(
                     options.max_parallel_simulations.get(),
@@ -100,6 +109,11 @@ impl Runtime {
     /// The detected risim-runner.
     pub fn simulator(&self) -> &Simulator {
         &self.inner.simulator
+    }
+
+    /// The run options of every simulation ([`RuntimeOptions::run_defaults`]).
+    pub(crate) fn run_defaults(&self) -> &Arc<RunOptions> {
+        &self.inner.run_defaults
     }
 
     /// The owner record of the workspace locks ([`RuntimeOptions::lock_owner`]).

@@ -60,6 +60,7 @@ use crate::project::Project;
 use crate::runtime::ProcessLimit;
 use crate::runtime::ProcessPermit;
 use crate::simulator::CommandError;
+use crate::simulator::RunOptions;
 use crate::simulator::SimulateArgs;
 use crate::simulator::Simulator;
 use crate::simulator::Top;
@@ -220,8 +221,7 @@ pub struct PlannedTest {
     /// Whether the entity declares an `output_path` generic that the configuration leaves unset.
     fill_output_path: bool,
     tb_path: Utf8PathBuf,
-    elab_flags: Vec<String>,
-    sim_flags: Vec<String>,
+    run_options: RunOptions,
     assert_level: AssertLevel,
     disable_ieee_asserts: bool,
     seed: Option<String>,
@@ -249,21 +249,28 @@ impl PlannedTest {
         generics
     }
 
-    /// The command line of a run with `seed` on `simulator`.
+    /// The command line of a run with `seed` on `simulator`, with the run options `run_defaults`
+    /// unless the configuration's set them.
     ///
     /// # Errors
     ///
-    /// Fails if the simulator doesn't support the testbench's standard.
-    pub fn command(&self, simulator: &Simulator, seed: &str) -> Result<Vec<String>, CommandError> {
+    /// Fails if the simulator doesn't support the testbench's standard, or if the configuration's
+    /// run options set a key of the simulation ([`Simulator::simulate_command`]).
+    pub fn command(
+        &self,
+        simulator: &Simulator,
+        seed: &str,
+        run_defaults: &RunOptions,
+    ) -> Result<Vec<String>, CommandError> {
         let generics = self.generics(seed);
         simulator.simulate_command(&SimulateArgs {
             vhdl_standard: self.vhdl_standard,
             library: &self.library,
             library_dir: &self.library_dir,
             library_dirs: &self.library_dirs,
-            elab_flags: &self.elab_flags,
             top: &self.top,
-            sim_flags: &self.sim_flags,
+            run_options: &self.run_options,
+            run_defaults,
             generics: &generics,
             assert_level: self.assert_level,
             disable_ieee_asserts: self.disable_ieee_asserts,
@@ -354,8 +361,7 @@ impl SimulationPlan {
                     generics: configuration.generics.clone(),
                     fill_output_path,
                     tb_path: configuration.tb_path.clone(),
-                    elab_flags: sim_options.elab_flags.unwrap_or_default(),
-                    sim_flags: sim_options.sim_flags.unwrap_or_default(),
+                    run_options: sim_options.run_options.unwrap_or_default(),
                     assert_level: sim_options
                         .vhdl_assert_stop_level
                         .unwrap_or(AssertLevel::Error),
@@ -512,6 +518,8 @@ pub struct SimulationContext {
     pub workspace_root: Utf8PathBuf,
     /// The simulator.
     pub simulator: Simulator,
+    /// The run options of every simulation ([`RuntimeOptions::run_defaults`](crate::RuntimeOptions::run_defaults)).
+    pub run_defaults: Arc<RunOptions>,
     /// Limits the number of concurrent simulations; a paused GUI simulation holds its permit.
     pub limit: ProcessLimit,
     /// Receives the results.
@@ -728,7 +736,7 @@ async fn execute(test: &PlannedTest, context: &SimulationContext) -> Result<Test
     })?;
     let seed = test.seed();
     let command = test
-        .command(&context.simulator, &seed)
+        .command(&context.simulator, &seed, &context.run_defaults)
         .map_err(|error| error.to_string())?;
     let header = format!("Seed for {}: {seed}\n", test.name);
     tracing::debug!(name = %test.name, ?command, "starting simulation");

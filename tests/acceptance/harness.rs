@@ -26,6 +26,7 @@ use risim_vunit_frontend::Workspace;
 use risim_vunit_frontend::WorkspaceEvent;
 use risim_vunit_frontend::WorkspaceEventKind;
 use risim_vunit_frontend::diagnostics::Severity;
+use risim_vunit_frontend::simulator::RunOptions;
 use risim_vunit_frontend::spec::ConfigurationSpec;
 use risim_vunit_frontend::spec::ProjectSpec;
 use risim_vunit_frontend::spec::TestConfigSpec;
@@ -83,6 +84,7 @@ pub async fn runtime() -> Runtime {
     Runtime::new(RuntimeOptions {
         analyzer,
         runner,
+        run_defaults: RunOptions::new(),
         max_parallel_simulations: parallelism,
         max_parallel_compiles: parallelism,
         lock_owner: r#"{"acceptance": true}"#.to_owned(),

@@ -8,6 +8,10 @@
 //! `risim analyze`, into the archive `<library dir>/<library>.hlib`, and the runner simulates with
 //! `risim-runner run`, which reads the same archives. They support VHDL-2008 only.
 //!
+//! The runner takes the options of a simulation as one JSON object ([`RunOptions`]), whose
+//! format the runner names in `--version` (`run options format N`); [`Simulator::detect`] rejects
+//! a runner that reads another format than [`RUN_OPTIONS_FORMAT`].
+//!
 //! AI NOTICE: Generated, minimally reviewed.
 
 use std::collections::BTreeMap;
@@ -19,11 +23,41 @@ use camino::Utf8PathBuf;
 use regex::Regex;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Value;
+use serde_json::json;
 use thiserror::Error;
 
 use crate::process;
 use crate::spec::AssertLevel;
 use crate::vhdl_standard::VhdlStandard;
+
+/// The format of the run options that [`Simulator::simulate_command`] writes, their key `format`.
+///
+/// risim-runner names the format that it reads in its `--version` output, on the line
+/// `run options format N`.
+pub const RUN_OPTIONS_FORMAT: u32 = 1;
+
+/// Options of risim-runner, as keys and values of the JSON object of a run, such as
+/// `{"relaxed": true}`.
+///
+/// The keys are the long option names of `risim run`, as riSim's `risim-run-options` describes
+/// them.
+pub type RunOptions = serde_json::Map<String, Value>;
+
+/// The keys of the run options that [`Simulator::simulate_command`] sets for every simulation, so
+/// that the run options of a configuration can't set them.
+pub const SIMULATION_KEYS: [&str; 10] = [
+    "format",
+    "work",
+    "workdir",
+    "library-paths",
+    "top",
+    "generics",
+    "assert-level",
+    "ieee-asserts",
+    "paused",
+    "name",
+];
 
 /// What identifies a riSim installation: the runner, the analyzer, and the runner's `--version`.
 ///
@@ -71,6 +105,26 @@ pub enum DetectError {
         /// What the executable printed.
         output: String,
     },
+    /// risim-runner reads another format of run options than [`RUN_OPTIONS_FORMAT`].
+    #[error(
+        "{path} reads run options format {format}, but this build writes format {RUN_OPTIONS_FORMAT}"
+    )]
+    Format {
+        /// The executable.
+        path: Utf8PathBuf,
+        /// The format that `--version` names.
+        format: String,
+    },
+    /// risim-runner names no format of run options in `--version`, as one from before the JSON
+    /// object does.
+    #[error(
+        "{path} names no run options format in `--version`, so it reads none, but this build \
+         writes format {RUN_OPTIONS_FORMAT}"
+    )]
+    NoFormat {
+        /// The executable.
+        path: Utf8PathBuf,
+    },
 }
 
 /// A command line can't be built.
@@ -81,6 +135,13 @@ pub enum CommandError {
     UnsupportedStandard {
         /// The standard.
         standard: VhdlStandard,
+    },
+    /// The run options of a configuration set a key that every simulation sets
+    /// ([`SIMULATION_KEYS`]).
+    #[error("the run options can't set `{key}`, which every simulation sets itself")]
+    SimulationKey {
+        /// The key.
+        key: &'static str,
     },
 }
 
@@ -111,6 +172,29 @@ static VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^risim-runner ([0-9]+)\.([0-9]+)").unwrap()
 });
 
+/// The line of the `--version` output that names the format of the run options, before the
+/// number.
+const RUN_OPTIONS_FORMAT_LINE: &str = "run options format ";
+
+/// Checks that the `--version` output `output` of the runner `path` names the format of the run
+/// options that this build writes, [`RUN_OPTIONS_FORMAT`].
+fn check_run_options_format(path: &Utf8Path, output: &str) -> Result<(), DetectError> {
+    let format = output
+        .lines()
+        .find_map(|line| line.strip_prefix(RUN_OPTIONS_FORMAT_LINE))
+        .map(str::trim);
+    match format {
+        Some(format) if format.parse() == Ok(RUN_OPTIONS_FORMAT) => Ok(()),
+        Some(format) => Err(DetectError::Format {
+            path: path.to_owned(),
+            format: format.to_owned(),
+        }),
+        None => Err(DetectError::NoFormat {
+            path: path.to_owned(),
+        }),
+    }
+}
+
 /// The major and minor version in the `--version` output `output`.
 fn parse_version(output: &str) -> Option<Version> {
     let captures = VERSION_RE.captures(output)?;
@@ -128,7 +212,8 @@ impl Simulator {
     ///
     /// # Errors
     ///
-    /// Fails if the runner can't be run, or isn't risim-runner.
+    /// Fails if the runner can't be run, isn't risim-runner, or reads another format of run
+    /// options than [`RUN_OPTIONS_FORMAT`].
     pub async fn detect(runner: &Utf8Path, analyzer: &Utf8Path) -> Result<Self, DetectError> {
         let output = process::command(runner, ["--version"], None)
             .output()
@@ -150,10 +235,12 @@ impl Simulator {
             analyzer: analyzer.to_owned(),
             version_output,
         };
-        Self::from_identity(identity).map_err(|identity| DetectError::Version {
+        let simulator = Self::from_identity(identity).map_err(|identity| DetectError::Version {
             path: runner.to_owned(),
             output: identity.version_output,
-        })
+        })?;
+        check_run_options_format(runner, &simulator.identity.version_output)?;
+        Ok(simulator)
     }
 
     /// Creates a simulator from an identity, parsing the version from its `--version` output.
@@ -188,29 +275,6 @@ impl Simulator {
         self.version
     }
 
-    /// The beginning of a command line of `executable` with the subcommand `mode`, up to the
-    /// library paths.
-    fn base_command(
-        executable: &Utf8Path,
-        mode: &str,
-        vhdl_standard: VhdlStandard,
-        library: &str,
-        library_dir: &Utf8Path,
-        library_dirs: &[Utf8PathBuf],
-    ) -> Result<Vec<String>, CommandError> {
-        check_standard(vhdl_standard)?;
-        let mut command = vec![
-            executable.to_string(),
-            mode.to_owned(),
-            format!("--work={library}"),
-            format!("--workdir={library_dir}"),
-        ];
-        for dir in library_dirs {
-            command.extend(["-L".to_owned(), dir.to_string()]);
-        }
-        Ok(command)
-    }
-
     /// The command line of the analyzer analysing files into one library, which prints the
     /// reports as JSON lines.
     ///
@@ -218,57 +282,79 @@ impl Simulator {
     ///
     /// Fails if the standard isn't supported.
     pub fn compile_command(&self, args: &CompileArgs<'_>) -> Result<Vec<String>, CommandError> {
-        let mut command = Self::base_command(
-            self.analyzer(),
-            "analyze",
-            args.vhdl_standard,
-            args.library,
-            args.library_dir,
-            args.library_dirs,
-        )?;
+        check_standard(args.vhdl_standard)?;
+        let mut command = vec![
+            self.analyzer().to_string(),
+            "analyze".to_owned(),
+            format!("--work={}", args.library),
+            format!("--workdir={}", args.library_dir),
+        ];
+        for dir in args.library_dirs {
+            command.extend(["-L".to_owned(), dir.to_string()]);
+        }
         command.push("--message-format=json".to_owned());
         command.extend(args.flags.iter().cloned());
         command.extend(args.files.iter().map(ToString::to_string));
         Ok(command)
     }
 
-    /// The command line of the runner elaborating and running a testbench.
+    /// The command line of the runner elaborating and running a testbench:
+    /// `<runner> run <options>`, with the options of the simulation as one JSON object.
+    ///
+    /// The object has the keys [`SIMULATION_KEYS`], and the run options of the configuration and
+    /// the defaults of the runtime, the former winning.
     ///
     /// # Errors
     ///
-    /// Fails if the standard isn't supported.
+    /// Fails if the standard isn't supported, or if the run options of the configuration set one
+    /// of [`SIMULATION_KEYS`].
     pub fn simulate_command(&self, args: &SimulateArgs<'_>) -> Result<Vec<String>, CommandError> {
-        let mut command = Self::base_command(
-            self.path(),
-            "run",
-            args.vhdl_standard,
-            args.library,
-            args.library_dir,
-            args.library_dirs,
-        )?;
-        command.extend(args.elab_flags.iter().cloned());
-        command.extend(
-            args.generics
-                .iter()
-                .map(|(name, value)| format!("--generic={name}={value}")),
-        );
-        command.push(format!("--assert-level={}", args.assert_level));
-        if args.disable_ieee_asserts {
-            command.push("--ieee-asserts=disable".to_owned());
+        check_standard(args.vhdl_standard)?;
+        if let Some(&key) = SIMULATION_KEYS
+            .iter()
+            .find(|&&key| args.run_options.contains_key(key))
+        {
+            return Err(CommandError::SimulationKey { key });
         }
-        if args.wait {
-            command.push("--paused".to_owned());
-        }
-        command.push(format!("--name={}", args.name));
-        command.extend(args.sim_flags.iter().cloned());
-        command.push(match args.top {
+        let top = match args.top {
             Top::Configuration(name) => name.clone(),
             Top::Entity {
                 entity,
                 architecture,
             } => format!("{entity}({architecture})"),
-        });
-        Ok(command)
+        };
+        let generics: Vec<String> = args
+            .generics
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect();
+        let ieee_asserts = if args.disable_ieee_asserts {
+            "disable"
+        } else {
+            "enable"
+        };
+        let mut options = args.run_defaults.clone();
+        options.extend(args.run_options.clone());
+        options.extend(
+            [
+                ("format", json!(RUN_OPTIONS_FORMAT)),
+                ("work", json!(args.library)),
+                ("workdir", json!(args.library_dir)),
+                ("library-paths", json!(args.library_dirs)),
+                ("top", json!(top)),
+                ("generics", json!(generics)),
+                ("assert-level", json!(args.assert_level.name())),
+                ("ieee-asserts", json!(ieee_asserts)),
+                ("paused", json!(args.wait)),
+                ("name", json!(args.name)),
+            ]
+            .map(|(key, value)| (key.to_owned(), value)),
+        );
+        Ok(vec![
+            self.path().to_string(),
+            "run".to_owned(),
+            Value::Object(options).to_string(),
+        ])
     }
 }
 
@@ -312,14 +398,15 @@ pub struct SimulateArgs<'a> {
     pub library: &'a str,
     /// The directory of that library's archive.
     pub library_dir: &'a Utf8Path,
-    /// The directories of all libraries, passed with `-L`.
+    /// The directories of all libraries, the run option `library-paths`.
     pub library_dirs: &'a [Utf8PathBuf],
-    /// Extra elaboration options, the `options` of the configuration.
-    pub elab_flags: &'a [String],
     /// The unit to elaborate.
     pub top: &'a Top,
-    /// Extra risim-runner options.
-    pub sim_flags: &'a [String],
+    /// The run options of the configuration, which mustn't set [`SIMULATION_KEYS`].
+    pub run_options: &'a RunOptions,
+    /// The run options of every simulation, which the configuration's override
+    /// ([`RuntimeOptions::run_defaults`](crate::RuntimeOptions::run_defaults)).
+    pub run_defaults: &'a RunOptions,
     /// Generic values.
     pub generics: &'a BTreeMap<String, String>,
     /// The assertion severity that stops the simulation.
@@ -426,6 +513,41 @@ mod tests {
         );
     }
 
+    /// The runner must name the format of the run options that this build writes.
+    #[test]
+    fn run_options_format_is_checked() {
+        let path = Utf8Path::new("/bin/risim-runner");
+        let version =
+            |format: &str| format!("risim-runner 0.1.0\nhydrolyze archive format 4\n{format}");
+        check_run_options_format(
+            path,
+            &version(&format!("run options format {RUN_OPTIONS_FORMAT}\n")),
+        )
+        .unwrap();
+        let other = check_run_options_format(
+            path,
+            &version(&format!("run options format {}\n", RUN_OPTIONS_FORMAT + 1)),
+        )
+        .unwrap_err();
+        assert_eq!(
+            other.to_string(),
+            format!(
+                "/bin/risim-runner reads run options format {}, but this build writes format \
+                 {RUN_OPTIONS_FORMAT}",
+                RUN_OPTIONS_FORMAT + 1
+            )
+        );
+        let none = check_run_options_format(path, &version("")).unwrap_err();
+        assert!(matches!(none, DetectError::NoFormat { .. }), "{none}");
+        assert!(
+            none.to_string()
+                .ends_with(&format!("writes format {RUN_OPTIONS_FORMAT}")),
+            "{none}"
+        );
+    }
+
+    /// The options of a simulation are one JSON object: the runtime's defaults, the
+    /// configuration's run options over them, and the simulation's own keys.
     #[test]
     fn simulate_command() {
         let library_dirs = vec![
@@ -436,67 +558,89 @@ mod tests {
             ("a".to_owned(), "1".to_owned()),
             ("runner_cfg".to_owned(), "x : y,z \"q\"".to_owned()),
         ]);
+        let run_options = RunOptions::from_iter([
+            ("relaxed".to_owned(), json!(true)),
+            ("finish-after".to_owned(), json!("1 ms")),
+        ]);
+        let run_defaults = RunOptions::from_iter([
+            ("jit".to_owned(), json!("off")),
+            ("relaxed".to_owned(), json!(false)),
+        ]);
         let simulator = simulator();
         let mut args = SimulateArgs {
             vhdl_standard: VhdlStandard::Vhdl2008,
             library: "lib",
             library_dir: Utf8Path::new("/out/libraries/lib"),
             library_dirs: &library_dirs,
-            elab_flags: &["-frelaxed".to_owned(), "-fsynopsys".to_owned()],
             top: &Top::Entity {
                 entity: "tb".to_owned(),
                 architecture: "a".to_owned(),
             },
-            sim_flags: &["--finish-after=1ms".to_owned()],
+            run_options: &run_options,
+            run_defaults: &run_defaults,
             generics: &generics,
             assert_level: AssertLevel::Error,
             disable_ieee_asserts: true,
             wait: true,
             name: "lib.tb.test",
         };
+        let options = |command: Vec<String>| {
+            let [runner, run, options] = command.as_slice() else {
+                panic!("not a runner, `run` and the options: {command:?}");
+            };
+            assert_eq!(
+                (runner.as_str(), run.as_str()),
+                ("/bin/risim-runner", "run")
+            );
+            serde_json::from_str::<Value>(options).unwrap()
+        };
         assert_eq!(
-            simulator.simulate_command(&args).unwrap(),
-            [
-                "/bin/risim-runner",
-                "run",
-                "--work=lib",
-                "--workdir=/out/libraries/lib",
-                "-L",
-                "/out/libraries/vunit_lib",
-                "-L",
-                "/out/libraries/lib",
-                "-frelaxed",
-                "-fsynopsys",
-                "--generic=a=1",
-                "--generic=runner_cfg=x : y,z \"q\"",
-                "--assert-level=error",
-                "--ieee-asserts=disable",
-                "--paused",
-                "--name=lib.tb.test",
-                "--finish-after=1ms",
-                "tb(a)",
-            ]
+            options(simulator.simulate_command(&args).unwrap()),
+            json!({
+                "format": RUN_OPTIONS_FORMAT,
+                "work": "lib",
+                "workdir": "/out/libraries/lib",
+                "library-paths": ["/out/libraries/vunit_lib", "/out/libraries/lib"],
+                "top": "tb(a)",
+                "generics": ["a=1", "runner_cfg=x : y,z \"q\""],
+                "assert-level": "error",
+                "ieee-asserts": "disable",
+                "paused": true,
+                "name": "lib.tb.test",
+                "relaxed": true,
+                "finish-after": "1 ms",
+                "jit": "off",
+            })
         );
 
         let configuration = Top::Configuration("cfg".to_owned());
+        let no_options = RunOptions::new();
         args.top = &configuration;
         args.assert_level = AssertLevel::Failure;
         args.disable_ieee_asserts = false;
-        args.elab_flags = &[];
-        args.sim_flags = &[];
+        args.run_options = &no_options;
+        args.run_defaults = &no_options;
         args.wait = false;
-        let command = simulator.simulate_command(&args).unwrap();
-        assert_eq!(
-            command[8..],
-            [
-                "--generic=a=1",
-                "--generic=runner_cfg=x : y,z \"q\"",
-                "--assert-level=failure",
-                "--name=lib.tb.test",
-                "cfg",
-            ]
-        );
+        let options = options(simulator.simulate_command(&args).unwrap());
+        assert_eq!(options["top"], "cfg");
+        assert_eq!(options["assert-level"], "failure");
+        assert_eq!(options["ieee-asserts"], "enable");
+        assert_eq!(options["paused"], false);
+        assert_eq!(options.as_object().unwrap().len(), SIMULATION_KEYS.len());
 
+        for key in SIMULATION_KEYS {
+            let setting_key = RunOptions::from_iter([(key.to_owned(), json!(true))]);
+            let args = SimulateArgs {
+                run_options: &setting_key,
+                ..args.clone()
+            };
+            assert_eq!(
+                simulator.simulate_command(&args),
+                Err(CommandError::SimulationKey { key })
+            );
+        }
+
+        args.run_options = &no_options;
         args.vhdl_standard = VhdlStandard::Vhdl1993;
         assert_eq!(
             simulator.simulate_command(&args),

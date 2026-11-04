@@ -27,11 +27,12 @@ use risim_vunit_frontend::Workspace as Handle;
 use risim_vunit_frontend::WorkspaceEvent;
 use risim_vunit_frontend::WorkspaceEventKind;
 use risim_vunit_frontend::diagnostics::Severity;
+use risim_vunit_frontend::simulator::RunOptions;
 use risim_vunit_frontend::store::CompileState;
-use risim_vunit_frontend::store::TestOutputPaths;
 use tokio::sync::mpsc;
 
 use crate::Workspace;
+use crate::run_options;
 use crate::simulation_project;
 use crate::testbench;
 use crate::trial::trial;
@@ -117,12 +118,18 @@ const LOCK_OWNER: &str = r#"{"test": true}"#;
 
 /// A runtime with the fake risim-runner.
 async fn runtime() -> Runtime {
+    runtime_with_defaults(RunOptions::new()).await
+}
+
+/// A runtime with the fake risim-runner and the run options `run_defaults` of every simulation.
+async fn runtime_with_defaults(run_defaults: RunOptions) -> Runtime {
     let exe = Utf8PathBuf::from_path_buf(std::env::current_exe().expect("current exe"))
         .expect("UTF-8 path");
     let four = NonZeroUsize::new(4).expect("non-zero");
     Runtime::new(RuntimeOptions {
         analyzer: exe.clone(),
         runner: exe,
+        run_defaults,
         max_parallel_simulations: four,
         max_parallel_compiles: four,
         lock_owner: LOCK_OWNER.to_owned(),
@@ -1111,20 +1118,18 @@ async fn workspace_rewatches_a_recreated_directory() {
     session.handle.close().await;
 }
 
-/// The arguments of the last simulation of `testcase`, starting with the mode.
-fn simulation_args(fixture: &Workspace, testcase: &str) -> Vec<String> {
-    let paths = TestOutputPaths::new(&fixture.layout, testcase);
-    fs::read_to_string(paths.dir.join("args.txt"))
-        .expect("read args.txt")
-        .lines()
-        .map(str::to_owned)
-        .collect()
-}
-
+/// The simulations of a workspace run with the libraries that it compiled, and with the run
+/// options of the runtime, which those of the project override.
 async fn workspace_simulates_with_the_compiled_libraries() {
     let mut fixture = Workspace::new().await;
     simulation_project(&mut fixture);
-    let runtime = runtime().await;
+    fixture.spec.sim_options.run_options =
+        Some(RunOptions::from_iter([("jit".to_owned(), "eager".into())]));
+    let runtime = runtime_with_defaults(RunOptions::from_iter([
+        ("jit".to_owned(), "off".into()),
+        ("mir-opt".to_owned(), "basic".into()),
+    ]))
+    .await;
     let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
 
     session
@@ -1166,15 +1171,23 @@ async fn workspace_simulates_with_the_compiled_libraries() {
         !log.iter().any(|line| line.starts_with("start ")),
         "{log:?}"
     );
-    let args = simulation_args(&fixture, "lib.tb_tests.pass");
-    assert_eq!(args[0], "run");
-    let workdir = format!("--workdir={}", fixture.layout.library_dir("lib"));
-    assert!(args.contains(&workdir), "{args:?}");
-    assert!(
-        args.iter()
-            .any(|arg| arg.starts_with("--generic=runner_cfg=")),
-        "{args:?}"
+    let options = run_options(&fixture.layout, "lib.tb_tests.pass");
+    assert_eq!(
+        options["workdir"],
+        fixture.layout.library_dir("lib").as_str()
     );
-    assert_eq!(args.last().map(String::as_str), Some("tb_tests(tb)"));
+    assert!(
+        options["generics"]
+            .as_array()
+            .expect("the generics")
+            .iter()
+            .any(|generic| generic
+                .as_str()
+                .is_some_and(|generic| generic.starts_with("runner_cfg="))),
+        "{options}"
+    );
+    assert_eq!(options["top"], "tb_tests(tb)");
+    assert_eq!(options["jit"], "eager");
+    assert_eq!(options["mir-opt"], "basic");
     session.handle.close().await;
 }

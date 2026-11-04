@@ -684,6 +684,7 @@ impl Actor {
         let context = SimulationContext {
             workspace_root: self.root.to_path_buf(),
             simulator: self.runtime.simulator().clone(),
+            run_defaults: Arc::clone(self.runtime.run_defaults()),
             limit: ProcessLimit::new(
                 Arc::clone(self.runtime.simulation_semaphore()),
                 operation_semaphore,

@@ -7,10 +7,13 @@
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
+use serde_json::Value;
+use serde_json::json;
 use tokio::sync::Semaphore;
 
 use super::*;
 use crate::discovery;
+use crate::simulator::RUN_OPTIONS_FORMAT;
 use crate::spec::ConfigurationSpec;
 use crate::spec::TestConfigSpec;
 use crate::test_support::add_vhdl;
@@ -212,11 +215,23 @@ fn testbench(name: &str, generics: &str, tests: &[&str]) -> String {
     )
 }
 
-fn generic_arg<'command>(command: &'command [String], name: &str) -> Option<&'command str> {
-    let prefix = format!("--generic={name}=");
-    command
+/// The run options of the command line of `test` with `seed`, without defaults of the runtime.
+fn run_options(test: &PlannedTest, seed: &str) -> Value {
+    let command = test
+        .command(&simulator(), seed, &RunOptions::new())
+        .unwrap();
+    assert_eq!(command[..2], ["/bin/risim-runner", "run"]);
+    assert_eq!(command.len(), 3, "{command:?}");
+    serde_json::from_str(&command[2]).unwrap()
+}
+
+/// The value of the generic `name` in the run options `options`.
+fn generic<'options>(options: &'options Value, name: &str) -> Option<&'options str> {
+    let prefix = format!("{name}=");
+    options["generics"]
+        .as_array()?
         .iter()
-        .find_map(|arg| arg.strip_prefix(prefix.as_str()))
+        .find_map(|generic| generic.as_str()?.strip_prefix(prefix.as_str()))
 }
 
 #[test]
@@ -243,7 +258,8 @@ fn plan_resolves_patterns_and_merges_gui() {
 fn command_of_an_explicit_test() {
     let mut fixture = Fixture::new();
     fixture.add("/ws/tb/tb_a.vhd", &testbench("Tb_A", "", &["Test, 1"]));
-    fixture.sim_options.elab_flags = Some(vec!["-frelaxed".to_owned()]);
+    fixture.sim_options.run_options =
+        Some(RunOptions::from_iter([("relaxed".to_owned(), true.into())]));
     let plan = fixture.plan(&[("*", true)]);
     let test = &plan.tests[0];
     assert_eq!(test.name, "Lib.Tb_A.Test, 1");
@@ -251,31 +267,24 @@ fn command_of_an_explicit_test() {
         test.paths.dir,
         fixture.layout.test_output_dir("Lib.Tb_A.Test, 1")
     );
-    let command = test.command(&simulator(), "abc").unwrap();
+    let mut options = run_options(test, "abc");
+    let runner_cfg = generic(&options, "runner_cfg").unwrap().to_owned();
+    options.as_object_mut().unwrap().remove("generics");
     assert_eq!(
-        command[..9],
-        [
-            "/bin/risim-runner",
-            "run",
-            "--work=Lib",
-            "--workdir=/ws/risim-out/libraries/lib",
-            "-L",
-            "/ws/risim-out/libraries/lib",
-            "-L",
-            "/ws/risim-out/libraries/other",
-            "-frelaxed",
-        ]
+        options,
+        json!({
+            "format": RUN_OPTIONS_FORMAT,
+            "work": "Lib",
+            "workdir": "/ws/risim-out/libraries/lib",
+            "library-paths": ["/ws/risim-out/libraries/lib", "/ws/risim-out/libraries/other"],
+            "relaxed": true,
+            "top": "Tb_A(a)",
+            "assert-level": "error",
+            "ieee-asserts": "enable",
+            "paused": true,
+            "name": "Lib.Tb_A.Test, 1",
+        })
     );
-    assert_eq!(
-        command[command.len() - 4..],
-        [
-            "--assert-level=error",
-            "--paused",
-            "--name=Lib.Tb_A.Test, 1",
-            "Tb_A(a)"
-        ]
-    );
-    let runner_cfg = generic_arg(&command, "runner_cfg").unwrap();
     assert_eq!(
         runner_cfg,
         RunnerCfg {
@@ -298,25 +307,20 @@ fn output_path_generic_is_filled_unless_set() {
     );
     let plan = fixture.plan(&[("*", false)]);
     let test = &plan.tests[0];
-    let command = test.command(&simulator(), "1").unwrap();
+    let options = run_options(test, "1");
     let expected = directory_generic(&test.paths.dir);
-    assert_eq!(
-        generic_arg(&command, "output_path"),
-        Some(expected.as_str())
-    );
-    assert_eq!(generic_arg(&command, "tb_path"), Some("/ws/"));
-    assert!(!command.contains(&"--paused".to_owned()));
+    assert_eq!(generic(&options, "output_path"), Some(expected.as_str()));
+    assert_eq!(generic(&options, "tb_path"), Some("/ws/"));
+    assert_eq!(options["paused"], false);
 
     fixture.test_configs.push(TestConfigSpec {
         target: "lib.tb_out".to_owned(),
         generics: BTreeMap::from([("Output_Path".to_owned(), "/custom/".to_owned())]),
         ..TestConfigSpec::default()
     });
-    let overridden = fixture.plan(&[("*", false)]).tests[0]
-        .command(&simulator(), "1")
-        .unwrap();
-    assert_eq!(generic_arg(&overridden, "Output_Path"), Some("/custom/"));
-    assert_eq!(generic_arg(&overridden, "output_path"), None);
+    let overridden = run_options(&fixture.plan(&[("*", false)]).tests[0], "1");
+    assert_eq!(generic(&overridden, "Output_Path"), Some("/custom/"));
+    assert_eq!(generic(&overridden, "output_path"), None);
 }
 
 #[test]
@@ -327,7 +331,10 @@ fn configurations_set_options_seed_and_vhdl_configuration() {
         &testbench("tb_cfg", "; value : integer", &["t"]),
     );
     fixture.sim_options = SimOptions {
-        sim_flags: Some(vec!["--finish-after=1ms".to_owned()]),
+        run_options: Some(RunOptions::from_iter([(
+            "finish-after".to_owned(),
+            "1 ms".into(),
+        )])),
         disable_ieee_warnings: Some(true),
         seed: Some("project-seed".to_owned()),
         ..SimOptions::default()
@@ -361,20 +368,47 @@ fn configurations_set_options_seed_and_vhdl_configuration() {
 
     let vhdl_cfg = &plan.tests[0];
     assert_eq!(vhdl_cfg.seed(), "project-seed");
-    let vhdl_cfg_command = vhdl_cfg.command(&simulator(), "s").unwrap();
-    assert_eq!(
-        vhdl_cfg_command[vhdl_cfg_command.len() - 2..],
-        ["--finish-after=1ms", "cfg1"]
-    );
-    assert!(vhdl_cfg_command.contains(&"--assert-level=error".to_owned()));
-    assert!(vhdl_cfg_command.contains(&"--ieee-asserts=disable".to_owned()));
+    let vhdl_cfg_options = run_options(vhdl_cfg, "s");
+    assert_eq!(vhdl_cfg_options["top"], "cfg1");
+    assert_eq!(vhdl_cfg_options["finish-after"], "1 ms");
+    assert_eq!(vhdl_cfg_options["assert-level"], "error");
+    assert_eq!(vhdl_cfg_options["ieee-asserts"], "disable");
 
     let warn = &plan.tests[1];
     assert_eq!(warn.seed(), "config-seed");
-    let warn_command = warn.command(&simulator(), "s").unwrap();
-    assert_eq!(warn_command.last().map(String::as_str), Some("tb_cfg(a)"));
-    assert_eq!(generic_arg(&warn_command, "value"), Some("7"));
-    assert!(warn_command.contains(&"--assert-level=warning".to_owned()));
+    let warn_options = run_options(warn, "s");
+    assert_eq!(warn_options["top"], "tb_cfg(a)");
+    assert_eq!(generic(&warn_options, "value"), Some("7"));
+    assert_eq!(warn_options["assert-level"], "warning");
+}
+
+/// The run options of a configuration override the defaults of the runtime, and can't set a key
+/// of the simulation.
+#[test]
+fn run_options_override_the_defaults() {
+    let mut fixture = Fixture::new();
+    fixture.add("/ws/tb_a.vhd", &testbench("tb_a", "", &[]));
+    fixture.sim_options.run_options =
+        Some(RunOptions::from_iter([("jit".to_owned(), "eager".into())]));
+    let run_defaults = RunOptions::from_iter([
+        ("jit".to_owned(), "off".into()),
+        ("mir-opt".to_owned(), "basic".into()),
+    ]);
+    let plan = fixture.plan(&[("*", false)]);
+    let command = plan.tests[0]
+        .command(&simulator(), "1", &run_defaults)
+        .unwrap();
+    let options: Value = serde_json::from_str(&command[2]).unwrap();
+    assert_eq!(options["jit"], "eager");
+    assert_eq!(options["mir-opt"], "basic");
+
+    fixture.sim_options.run_options =
+        Some(RunOptions::from_iter([("paused".to_owned(), true.into())]));
+    let paused = fixture.plan(&[("*", false)]);
+    assert_eq!(
+        paused.tests[0].command(&simulator(), "1", &run_defaults),
+        Err(CommandError::SimulationKey { key: "paused" })
+    );
 }
 
 #[test]
@@ -388,7 +422,7 @@ fn unsupported_standard_fails_the_command() {
     fixture.add("/ws/tb_19.vhd", &testbench("tb_19", "", &[]));
     let plan = fixture.plan(&[("*", false)]);
     assert_eq!(
-        plan.tests[0].command(&simulator(), "1"),
+        plan.tests[0].command(&simulator(), "1", &RunOptions::new()),
         Err(CommandError::UnsupportedStandard {
             standard: VhdlStandard::Vhdl2019
         })
@@ -401,14 +435,10 @@ fn gui_requests_start_risim_paused() {
     fixture.add("/ws/tb_a.vhd", &testbench("tb_a", "", &["t1", "t2"]));
     let plan = fixture.plan(&[("lib.tb_a.t1", true), ("lib.tb_a.t2", false)]);
     assert_eq!(plan.diagnostics, []);
-    let risim = simulator();
-    let paused: Vec<bool> = plan
+    let paused: Vec<Value> = plan
         .tests
         .iter()
-        .map(|test| {
-            let command = test.command(&risim, "1").unwrap();
-            command.iter().any(|arg| arg == "--paused")
-        })
+        .map(|test| run_options(test, "1")["paused"].clone())
         .collect();
     assert_eq!(paused, [true, false]);
 }
@@ -426,6 +456,7 @@ async fn cancelled_simulation_starts_nothing_despite_free_permits() {
     let context = SimulationContext {
         workspace_root: "/ws".into(),
         simulator: simulator(),
+        run_defaults: Arc::default(),
         limit: ProcessLimit::from(Arc::new(Semaphore::new(8))),
         results: Arc::new(ResultStore::load(&fixture.layout)),
         testcase_locks: Arc::default(),

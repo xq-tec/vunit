@@ -63,6 +63,7 @@ use risim_vunit_frontend::{ProjectSource, Runtime, RuntimeOptions, SimulationReq
 let runtime = Runtime::new(RuntimeOptions {
     analyzer: "/path/to/risim".into(),
     runner: "/path/to/risim-runner".into(),
+    run_defaults: Default::default(),
     max_parallel_simulations: parallelism,
     max_parallel_compiles: parallelism,
 })
@@ -83,6 +84,11 @@ while let Some(event) = receiver.recv().await {
 
 Everything a workspace generates goes to `<root>/risim-out/`: the extracted VUnit and OSVVM sources, compiled libraries, compile and test output, and the JSON state files.
 A lock file keeps other processes from using the same directory at the same time, and `owner.json` names the process that holds it (`RuntimeOptions::lock_owner`).
+
+A simulation runs `risim-runner run <options>`, with its options as one JSON object, whose keys are the long option names of `risim run` (riSim's `risim-run-options`).
+The object has the keys that every simulation sets (`simulator::SIMULATION_KEYS`: the libraries, the top-level unit, the generics, the assertion and GUI options, and the testcase name), the run options of the configuration (`SimOptions::run_options`, such as `relaxed` from the `options` of `risim-config.toml`), and the defaults of the runtime that these don't set (`RuntimeOptions::run_defaults`, such as those that riSim's hub takes from its environment).
+Run options that set a key of the simulation fail the test.
+The runner names the format of the object in `--version` (`run options format N`); a runner that reads another format than `simulator::RUN_OPTIONS_FORMAT`, or names none, can't be used, and `Runtime::new` fails.
 
 The consecutive files of one library that need compiling are analysed by one `risim analyze`, which prints its reports as JSON lines (`--message-format=json`); each report goes to the file of its location, and a file whose design units the call made obsolete is compiled again. The compiled libraries are kept as long as the paths of both executables and the `--version` output of `risim-runner` are the same, which names the archive format.
 
