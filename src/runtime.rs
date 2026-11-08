@@ -126,6 +126,13 @@ impl Runtime {
         &self.inner.simulation_semaphore
     }
 
+    /// The shared limit on concurrent simulations
+    /// ([`RuntimeOptions::max_parallel_simulations`]), for a simulation that the process runs
+    /// outside of a workspace, so that it shares the limit with the testcases.
+    pub fn simulation_limit(&self) -> ProcessLimit {
+        ProcessLimit::from(Arc::clone(&self.inner.simulation_semaphore))
+    }
+
     /// Limits the number of concurrent compile processes.
     pub(crate) fn compile_semaphore(&self) -> &Arc<Semaphore> {
         &self.inner.compile_semaphore

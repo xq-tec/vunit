@@ -90,6 +90,8 @@ The object has the keys that every simulation sets (`simulator::SIMULATION_KEYS`
 Run options that set a key of the simulation fail the test.
 The runner names the format of the object in `--version` (`run options format N`); a runner that reads another format than `simulator::RUN_OPTIONS_FORMAT`, or names none, can't be used, and `Runtime::new` fails.
 
+`Runtime::simulation_limit` returns the shared limit of parallel simulations (`max_parallel_simulations`) as a `ProcessLimit`, so that a simulation that the application runs outside of a workspace, such as a standalone run of riSim's hub, waits for it like a testcase.
+
 The consecutive files of one library that need compiling are analysed by one `risim analyze`, which prints its reports as JSON lines (`--message-format=json`); each report goes to the file of its location, and a file whose design units the call made obsolete is compiled again. The compiled libraries are kept as long as the paths of both executables and the `--version` output of `risim-runner` are the same, which names the archive format.
 
 ## Building
