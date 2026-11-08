@@ -35,7 +35,7 @@ use crate::vhdl_standard::VhdlStandard;
 ///
 /// risim-runner names the format that it reads in its `--version` output, on the line
 /// `run options format N`.
-pub const RUN_OPTIONS_FORMAT: u32 = 1;
+pub const RUN_OPTIONS_FORMAT: u32 = 2;
 
 /// Options of risim-runner, as keys and values of the JSON object of a run, such as
 /// `{"relaxed": true}`.
@@ -43,6 +43,30 @@ pub const RUN_OPTIONS_FORMAT: u32 = 1;
 /// The keys are the long option names of `risim run`, as riSim's `risim-run-options` describes
 /// them.
 pub type RunOptions = serde_json::Map<String, Value>;
+
+/// The key of the optimization preset in the run options.
+const OPT_LEVEL_KEY: &str = "opt-level";
+
+/// The prefix of the keys of the run options that set an optimization row or group, such as
+/// `opt.wake-guards`.
+const OPT_PREFIX: &str = "opt.";
+
+/// Sets the keys of the run options `layer` in `options`, the keys of an earlier layer.
+///
+/// A key of `layer` replaces the same key of `options`; besides, as in riSim's
+/// `risim-run-options`, a layer that sets `opt-level` drops the `opt.*` keys of `options`, and a
+/// layer that sets `opt.<name>` drops the keys `opt.<name>.*` of `options`, the rows of the group
+/// `<name>`. So a preset or a group of a later layer isn't undone by a row of an earlier one.
+pub fn overlay_run_options(options: &mut RunOptions, layer: &RunOptions) {
+    if layer.contains_key(OPT_LEVEL_KEY) {
+        options.retain(|key, _| !key.starts_with(OPT_PREFIX));
+    }
+    for key in layer.keys().filter(|key| key.starts_with(OPT_PREFIX)) {
+        let rows = format!("{key}.");
+        options.retain(|earlier, _| !earlier.starts_with(&rows));
+    }
+    options.extend(layer.clone());
+}
 
 /// The keys of the run options that [`Simulator::simulate_command`] sets for every simulation, so
 /// that the run options of a configuration can't set them.
@@ -301,8 +325,8 @@ impl Simulator {
     /// The command line of the runner elaborating and running a testbench:
     /// `<runner> run <options>`, with the options of the simulation as one JSON object.
     ///
-    /// The object has the keys [`SIMULATION_KEYS`], and the run options of the configuration and
-    /// the defaults of the runtime, the former winning.
+    /// The object has the keys [`SIMULATION_KEYS`], and the run options of the configuration over
+    /// the defaults of the runtime ([`overlay_run_options`]).
     ///
     /// # Errors
     ///
@@ -334,7 +358,7 @@ impl Simulator {
             "enable"
         };
         let mut options = args.run_defaults.clone();
-        options.extend(args.run_options.clone());
+        overlay_run_options(&mut options, args.run_options);
         options.extend(
             [
                 ("format", json!(RUN_OPTIONS_FORMAT)),
@@ -546,6 +570,61 @@ mod tests {
         );
     }
 
+    /// A later layer replaces the same keys; its `opt-level` drops the earlier `opt.*` keys, and
+    /// its `opt.<name>` the earlier `opt.<name>.*` keys, but not those of other names.
+    #[test]
+    fn overlay_run_options_by_the_layer_rule() {
+        let overlaid = |earlier: &Value, layer: Value| {
+            let (Value::Object(mut options), Value::Object(layer)) = (earlier.clone(), layer)
+            else {
+                unreachable!("objects");
+            };
+            overlay_run_options(&mut options, &layer);
+            Value::Object(options)
+        };
+        let earlier = json!({
+            "jit": "off",
+            "opt-level": "full",
+            "opt.wake-guards": "off",
+            "opt.mir": "off",
+            "opt.mir.cse": "on",
+            "opt.mirror": "on",
+        });
+        assert_eq!(
+            overlaid(&earlier, json!({"jit": "eager", "opt.wake-guards": "on"})),
+            json!({
+                "jit": "eager",
+                "opt-level": "full",
+                "opt.wake-guards": "on",
+                "opt.mir": "off",
+                "opt.mir.cse": "on",
+                "opt.mirror": "on",
+            })
+        );
+        assert_eq!(
+            overlaid(&earlier, json!({"opt.mir": "on"})),
+            json!({
+                "jit": "off",
+                "opt-level": "full",
+                "opt.wake-guards": "off",
+                "opt.mir": "on",
+                "opt.mirror": "on",
+            })
+        );
+        assert_eq!(
+            overlaid(
+                &earlier,
+                json!({"opt-level": "off", "opt.collapse-signals": "on"})
+            ),
+            json!({"jit": "off", "opt-level": "off", "opt.collapse-signals": "on"})
+        );
+        // A layer's own keys stay, also those of a group and its rows.
+        assert_eq!(
+            overlaid(&json!({}), json!({"opt.mir": "off", "opt.mir.cse": "on"})),
+            json!({"opt.mir": "off", "opt.mir.cse": "on"})
+        );
+    }
+
     /// The options of a simulation are one JSON object: the runtime's defaults, the
     /// configuration's run options over them, and the simulation's own keys.
     #[test]
@@ -561,10 +640,12 @@ mod tests {
         let run_options = RunOptions::from_iter([
             ("relaxed".to_owned(), json!(true)),
             ("finish-after".to_owned(), json!("1 ms")),
+            ("opt-level".to_owned(), json!("off")),
         ]);
         let run_defaults = RunOptions::from_iter([
             ("jit".to_owned(), json!("off")),
             ("relaxed".to_owned(), json!(false)),
+            ("opt.wake-guards".to_owned(), json!("off")),
         ]);
         let simulator = simulator();
         let mut args = SimulateArgs {
@@ -609,6 +690,7 @@ mod tests {
                 "name": "lib.tb.test",
                 "relaxed": true,
                 "finish-after": "1 ms",
+                "opt-level": "off",
                 "jit": "off",
             })
         );

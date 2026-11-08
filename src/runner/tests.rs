@@ -382,17 +382,20 @@ fn configurations_set_options_seed_and_vhdl_configuration() {
     assert_eq!(warn_options["assert-level"], "warning");
 }
 
-/// The run options of a configuration override the defaults of the runtime, and can't set a key
-/// of the simulation.
+/// The run options of a configuration override the defaults of the runtime by the layer rule of
+/// `overlay_run_options`, and can't set a key of the simulation.
 #[test]
 fn run_options_override_the_defaults() {
     let mut fixture = Fixture::new();
     fixture.add("/ws/tb_a.vhd", &testbench("tb_a", "", &[]));
-    fixture.sim_options.run_options =
-        Some(RunOptions::from_iter([("jit".to_owned(), "eager".into())]));
+    fixture.sim_options.run_options = Some(RunOptions::from_iter([
+        ("jit".to_owned(), "eager".into()),
+        ("opt.wake-guards".to_owned(), "on".into()),
+    ]));
     let run_defaults = RunOptions::from_iter([
         ("jit".to_owned(), "off".into()),
-        ("mir-opt".to_owned(), "basic".into()),
+        ("opt-level".to_owned(), "off".into()),
+        ("opt.wake-guards".to_owned(), "off".into()),
     ]);
     let plan = fixture.plan(&[("*", false)]);
     let command = plan.tests[0]
@@ -400,7 +403,8 @@ fn run_options_override_the_defaults() {
         .unwrap();
     let options: Value = serde_json::from_str(&command[2]).unwrap();
     assert_eq!(options["jit"], "eager");
-    assert_eq!(options["mir-opt"], "basic");
+    assert_eq!(options["opt-level"], "off");
+    assert_eq!(options["opt.wake-guards"], "on");
 
     fixture.sim_options.run_options =
         Some(RunOptions::from_iter([("paused".to_owned(), true.into())]));

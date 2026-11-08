@@ -1127,7 +1127,7 @@ async fn workspace_simulates_with_the_compiled_libraries() {
         Some(RunOptions::from_iter([("jit".to_owned(), "eager".into())]));
     let runtime = runtime_with_defaults(RunOptions::from_iter([
         ("jit".to_owned(), "off".into()),
-        ("mir-opt".to_owned(), "basic".into()),
+        ("opt.mir".to_owned(), "off".into()),
     ]))
     .await;
     let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
@@ -1188,6 +1188,6 @@ async fn workspace_simulates_with_the_compiled_libraries() {
     );
     assert_eq!(options["top"], "tb_tests(tb)");
     assert_eq!(options["jit"], "eager");
-    assert_eq!(options["mir-opt"], "basic");
+    assert_eq!(options["opt.mir"], "off");
     session.handle.close().await;
 }
