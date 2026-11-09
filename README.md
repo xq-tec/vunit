@@ -87,7 +87,7 @@ let workspace = runtime
     .open_workspace(root, ProjectSource::ConfigFile("risim-config.toml".into()), events)
     .await?;
 workspace.simulate(
-    vec![SimulationRequest { pattern: "my_lib.tb_*".into(), gui: false }],
+    vec![SimulationRequest { pattern: "my_lib.tb_*".into(), gui: false, ..Default::default() }],
     None,
     None,
 );
@@ -102,6 +102,8 @@ A lock file keeps other processes from using the same directory at the same time
 A simulation runs `risim-runner run <options>`, with its options as one JSON object, whose keys are the long option names of `risim run` (riSim's `risim-run-options`).
 The object has the keys that every simulation sets (`simulator::SIMULATION_KEYS`: the libraries, the top-level unit, the generics, the assertion and GUI options, and the testcase name), the run options of the configuration (`SimOptions::run_options`, such as `relaxed` from the `options` of `risim-config.toml` and the keys of its `[run]`), and the defaults of the runtime that these don't set (`RuntimeOptions::run_defaults`, such as those that riSim's hub takes from its environment).
 The run options go over the defaults by the layer rule of riSim's `risim-run-options` (`simulator::overlay_run_options`), and those of a test configuration over the project's by the same rule: a later layer's `opt-level` drops the `opt.*` keys of the earlier ones, and its `opt.<name>` the keys `opt.<name>.*`.
+The run options of a `SimulationRequest` (`options`, such as the optimizations that riSim's GUI chooses) go over those of the configuration by the same rule.
+Simulates whose requests have different run options don't merge, and a testcase that several requests with different run options match runs once, with those of the first, and a warning.
 Run options that set a key of the simulation fail the test.
 The runner names the format of the object in `--version` (`run options format N`); a runner that reads another format than `simulator::RUN_OPTIONS_FORMAT`, or names none, can't be used, and `Runtime::new` fails.
 

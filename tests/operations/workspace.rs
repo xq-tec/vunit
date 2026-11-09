@@ -50,6 +50,10 @@ pub fn trials() -> Vec<Trial> {
             workspace_merges_requests_while_compiling,
         ),
         trial(
+            "workspace_queues_simulates_with_other_options",
+            workspace_queues_simulates_with_other_options,
+        ),
+        trial(
             "workspace_limits_processes_per_request",
             workspace_limits_processes_per_request,
         ),
@@ -196,6 +200,7 @@ fn requests(patterns: &[&str]) -> Vec<SimulationRequest> {
         .map(|pattern| SimulationRequest {
             pattern: (*pattern).to_owned(),
             gui: false,
+            ..SimulationRequest::default()
         })
         .collect()
 }
@@ -499,6 +504,52 @@ async fn workspace_merges_requests_while_compiling() {
     );
     assert_eq!(events.len(), 12, "{events:#?}");
     assert_eq!(events[11], "simulation_finished b,c,d 2/0/0");
+    session.handle.close().await;
+}
+
+/// Simulates whose requests have different run options queue one behind the other instead of
+/// merging, and each runs with its own options.
+async fn workspace_queues_simulates_with_other_options() {
+    let mut fixture = Workspace::new().await;
+    simulation_project(&mut fixture);
+    let runtime = runtime().await;
+    let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
+    let at = |level: &str| {
+        requests(&["lib.tb_tests.pass"])
+            .into_iter()
+            .map(|request| SimulationRequest {
+                options: RunOptions::from_iter([("opt-level".to_owned(), level.into())]),
+                ..request
+            })
+            .collect()
+    };
+
+    session.handle.compile(tag("a"), None);
+    session.handle.simulate(at("off"), tag("b"), None);
+    session.handle.simulate(at("off"), tag("c"), None);
+    session.handle.simulate(at("full"), tag("d"), None);
+    let merged = summary(&session.operation("b").await);
+    assert!(
+        merged.contains(&"simulation_finished b,c 1/0/0".to_owned()),
+        "{merged:#?}"
+    );
+    assert_eq!(
+        run_options(&fixture.layout, "lib.tb_tests.pass")["opt-level"],
+        "off"
+    );
+    let events = summary(&session.operation("d").await);
+    assert!(
+        events.contains(&"compile_started d 0".to_owned()),
+        "{events:#?}"
+    );
+    assert_eq!(
+        events.last().map(String::as_str),
+        Some("simulation_finished d 1/0/0")
+    );
+    assert_eq!(
+        run_options(&fixture.layout, "lib.tb_tests.pass")["opt-level"],
+        "full"
+    );
     session.handle.close().await;
 }
 

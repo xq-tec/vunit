@@ -186,6 +186,7 @@ pub async fn simulate_all(runtime: &Runtime, root: &Utf8Path, spec: &ProjectSpec
         vec![SimulationRequest {
             pattern: "*".to_owned(),
             gui: false,
+            ..SimulationRequest::default()
         }],
         Some(RequestTag(TAG.to_owned())),
         None,

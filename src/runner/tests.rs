@@ -173,16 +173,21 @@ impl Fixture {
     }
 
     fn plan(&self, requests: &[(&str, bool)]) -> SimulationPlan {
-        let discovery = discovery::discover(&self.project, &self.test_configs);
-        assert_eq!(discovery.project_diagnostics, []);
-        assert_eq!(discovery.config_diagnostics, []);
         let requests: Vec<SimulationRequest> = requests
             .iter()
             .map(|&(pattern, gui)| SimulationRequest {
                 pattern: pattern.to_owned(),
                 gui,
+                ..SimulationRequest::default()
             })
             .collect();
+        self.plan_requests(&requests)
+    }
+
+    fn plan_requests(&self, requests: &[SimulationRequest]) -> SimulationPlan {
+        let discovery = discovery::discover(&self.project, &self.test_configs);
+        assert_eq!(discovery.project_diagnostics, []);
+        assert_eq!(discovery.config_diagnostics, []);
         SimulationPlan::new(
             &SimulationInput {
                 layout: &self.layout,
@@ -190,7 +195,7 @@ impl Fixture {
                 discovery: &discovery,
                 sim_options: &self.sim_options,
             },
-            &requests,
+            requests,
         )
     }
 }
@@ -412,6 +417,46 @@ fn run_options_override_the_defaults() {
     assert_eq!(
         paused.tests[0].command(&simulator(), "1", &run_defaults),
         Err(CommandError::SimulationKey { key: "paused" })
+    );
+}
+
+/// The run options of a request go over those of the configuration by the layer rule, and a
+/// testcase that requests with different options match runs with those of the first of them.
+#[test]
+fn request_options_override_the_configuration() {
+    let mut fixture = Fixture::new();
+    fixture.add("/ws/tb_a.vhd", &testbench("tb_a", "", &["t1", "t2"]));
+    fixture.sim_options.run_options = Some(RunOptions::from_iter([
+        ("relaxed".to_owned(), true.into()),
+        ("opt.wake-guards".to_owned(), "off".into()),
+    ]));
+    let request = |pattern: &str, options: &[(&str, &str)]| SimulationRequest {
+        pattern: pattern.to_owned(),
+        gui: false,
+        options: options
+            .iter()
+            .map(|&(key, value)| (key.to_owned(), value.into()))
+            .collect(),
+    };
+    let plan = fixture.plan_requests(&[
+        request("lib.tb_a.t1", &[("opt-level", "off")]),
+        request("*", &[("opt.mir", "off")]),
+    ]);
+    let [t1, t2] = [&plan.tests[0], &plan.tests[1]].map(|test| run_options(test, "1"));
+    assert_eq!(t1["relaxed"], true);
+    assert_eq!(t1["opt-level"], "off");
+    // The preset of the request drops the configuration's rows.
+    assert_eq!(t1.get("opt.wake-guards"), None);
+    assert_eq!(t1.get("opt.mir"), None);
+    assert_eq!(t2.get("opt-level"), None);
+    assert_eq!(t2["opt.wake-guards"], "off");
+    assert_eq!(t2["opt.mir"], "off");
+    assert_eq!(
+        plan.diagnostics,
+        [Diagnostic::warning(
+            "requests with different run options match 'Lib.tb_a.t1'; it runs once, with those of \
+             'lib.tb_a.t1'"
+        )]
     );
 }
 

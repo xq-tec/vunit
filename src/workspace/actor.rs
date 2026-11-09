@@ -347,7 +347,8 @@ impl Actor {
 
     /// Starts `operation`, or queues it if a compile is running.
     ///
-    /// A queued operation merges into the last queued one.
+    /// A queued operation merges into the last queued one, unless both simulate with different
+    /// run options; then it queues behind it.
     async fn request(&mut self, operation: Operation) {
         if self.closing.is_some() {
             tracing::debug!(root = %self.root, "ignoring a request to a closing workspace");
@@ -358,7 +359,11 @@ impl Actor {
             return;
         }
         let operation = match self.queued.pop_back() {
-            Some(last) => last.merge(operation),
+            Some(last) if last.merges_with(&operation) => last.merge(operation),
+            Some(last) => {
+                self.queued.push_back(last);
+                operation
+            },
             None => operation,
         };
         self.queued.push_back(operation);

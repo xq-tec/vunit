@@ -8,7 +8,8 @@
 //! `test/runner.py`, for a single test per simulation:
 //!
 //! - **Resolution:** [`SimulationPlan::new`] matches the requested patterns against the
-//!   testcases and prepares a [`PlannedTest`] per match.
+//!   testcases and prepares a [`PlannedTest`] per match, with the run options of the first
+//!   request that matches it.
 //! - **Run:** each test first takes its testcase lock, so the same testcase never runs twice at
 //!   once, and then a permit of the simulation limit. Tests whose lock is free get permits
 //!   in name order; a test whose lock is held by another simulation waits for it without
@@ -55,6 +56,7 @@ use crate::configuration::directory_generic;
 use crate::diagnostics::Diagnostic;
 use crate::discovery::Discovery;
 use crate::pattern;
+use crate::pattern::Pattern;
 use crate::process;
 use crate::project::Project;
 use crate::runtime::ProcessLimit;
@@ -64,6 +66,7 @@ use crate::simulator::RunOptions;
 use crate::simulator::SimulateArgs;
 use crate::simulator::Simulator;
 use crate::simulator::Top;
+use crate::simulator::overlay_run_options;
 use crate::spec::AssertLevel;
 use crate::spec::SimOptions;
 use crate::store::OutputLayout;
@@ -179,12 +182,18 @@ pub fn outcome(results_pass: bool, exit_success: bool, standard: VhdlStandard) -
 // -------------------------------------------------------------------------------------------------
 
 /// A request to run the testcases matching `pattern`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SimulationRequest {
     /// A testcase pattern (`fnmatch`, case-insensitive).
     pub pattern: String,
     /// Whether to start the simulations paused, for a waveform viewer.
     pub gui: bool,
+    /// The run options of the request, such as a GUI's optimizations, which go over those of the
+    /// configuration by the layer rule of [`overlay_run_options`].
+    ///
+    /// They mustn't set a key of the simulation
+    /// ([`SIMULATION_KEYS`](crate::simulator::SIMULATION_KEYS)); the caller checks them.
+    pub options: RunOptions,
 }
 
 /// Everything a simulation plan is made from.
@@ -295,14 +304,15 @@ pub struct SimulationPlan {
     /// The tests, sorted by name.
     pub tests: Vec<PlannedTest>,
     /// Warnings about patterns that match no testcase, or that ask for GUI mode but match
-    /// several.
+    /// several, and about testcases that requests with different run options match.
     pub diagnostics: Vec<Diagnostic>,
 }
 
 impl SimulationPlan {
     /// Matches `requests` against the testcases of `input.discovery`.
     ///
-    /// A testcase matched by several requests runs once, paused if any of them asks for it.
+    /// A testcase matched by several requests runs once, paused if any of them asks for it, and
+    /// with the run options of the first of them over those of its configuration.
     pub fn new(input: &SimulationInput<'_>, requests: &[SimulationRequest]) -> Self {
         let discovery = input.discovery;
         let names: Vec<&str> = discovery
@@ -323,6 +333,7 @@ impl SimulationPlan {
             .collect();
         let library_dirs: Arc<[Utf8PathBuf]> =
             compile::library_dirs(input.project, input.layout).into();
+        let mut request_options = RequestOptions::new(requests);
 
         let tests = resolution
             .entries
@@ -332,6 +343,10 @@ impl SimulationPlan {
                 let testbench = discovery.testbenches.get(run.testbench)?;
                 let configuration = &run.configuration;
                 let sim_options = input.sim_options.overridden_by(&configuration.sim_options);
+                let mut run_options = sim_options.run_options.unwrap_or_default();
+                if let Some(options) = request_options.of(&name) {
+                    overlay_run_options(&mut run_options, options);
+                }
                 let top = configuration.vhdl_configuration_name.clone().map_or_else(
                     || Top::Entity {
                         entity: testbench.entity.clone(),
@@ -361,7 +376,7 @@ impl SimulationPlan {
                     generics: configuration.generics.clone(),
                     fill_output_path,
                     tb_path: configuration.tb_path.clone(),
-                    run_options: sim_options.run_options.unwrap_or_default(),
+                    run_options,
                     assert_level: sim_options
                         .vhdl_assert_stop_level
                         .unwrap_or(AssertLevel::Error),
@@ -383,13 +398,59 @@ impl SimulationPlan {
                      {count}; they run without GUI mode"
                 ))
             });
-        let diagnostics = unmatched.chain(ambiguous_gui).collect();
+        let conflicting_options = request_options.conflicts.into_iter().map(|(name, pattern)| {
+            Diagnostic::warning(format!(
+                "requests with different run options match '{name}'; it runs once, with those of \
+                 '{pattern}'"
+            ))
+        });
+        let diagnostics = unmatched
+            .chain(ambiguous_gui)
+            .chain(conflicting_options)
+            .collect();
         Self { tests, diagnostics }
     }
 
     /// The testcase names, sorted.
     pub fn testcases(&self) -> Vec<String> {
         self.tests.iter().map(|test| test.name.clone()).collect()
+    }
+}
+
+/// The run options of the requests of a plan, by testcase.
+struct RequestOptions<'a> {
+    /// The requests, with their compiled patterns.
+    requests: Vec<(&'a SimulationRequest, Pattern)>,
+    /// The testcases that requests with different run options match, with the pattern of the
+    /// first of them, whose options they run with.
+    conflicts: Vec<(String, String)>,
+}
+
+impl<'a> RequestOptions<'a> {
+    fn new(requests: &'a [SimulationRequest]) -> Self {
+        Self {
+            requests: requests
+                .iter()
+                .map(|request| (request, Pattern::new(&request.pattern)))
+                .collect(),
+            conflicts: Vec::new(),
+        }
+    }
+
+    /// Returns the run options of the testcase `name`: those of the first request that matches
+    /// it, if any; records a conflict if a later one has others.
+    fn of(&mut self, name: &str) -> Option<&'a RunOptions> {
+        let mut matching = self
+            .requests
+            .iter()
+            .filter(|(_, pattern)| pattern.matches(name))
+            .map(|&(request, _)| request);
+        let first = matching.next()?;
+        if matching.any(|request| request.options != first.options) {
+            self.conflicts
+                .push((name.to_owned(), first.pattern.clone()));
+        }
+        Some(&first.options)
     }
 }
 

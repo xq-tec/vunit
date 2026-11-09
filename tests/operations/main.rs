@@ -377,6 +377,7 @@ impl Workspace {
             .map(|&(pattern, gui)| SimulationRequest {
                 pattern: pattern.to_owned(),
                 gui,
+                ..SimulationRequest::default()
             })
             .collect();
         let plan = SimulationPlan::new(
