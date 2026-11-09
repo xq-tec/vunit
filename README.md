@@ -39,6 +39,14 @@ A workspace is opened from a `risim-config.toml`. The `options` list is passed b
 # Options of analysis and elaboration.
 options = ["-frelaxed"]
 
+# Options of the simulations: the optimization preset, and rows or groups over it.
+[run]
+opt-level = "full"
+
+[run.opt]
+wake-guards = "off"
+"mir.cse" = "off"
+
 # Optional VUnit features on top of the defaults (VUnit core, com, OSVVM).
 [vunit]
 features = ["random", "verification_components"]
@@ -53,7 +61,12 @@ version = "1.4"
 ```
 
 `[toolchain] version` is read by the riSim launcher, which selects the toolchain by it (riSim's `doc/installation.md`); this crate accepts it without a warning and otherwise ignores it.
-Unknown keys, including other keys in `[toolchain]`, are warnings.
+Unknown keys, including other keys in `[toolchain]` and `[run]`, are warnings.
+
+`[run]` sets run options of every simulation: `opt-level` the run option `opt-level`, and each key `NAME` of `[run.opt]` the run option `opt.NAME` (riSim's `risim-run-options`).
+The values are strings.
+A dotted name is quoted (`"mir.cse" = "off"`); a table in `[run.opt]`, such as `mir.cse = "off"` or `[run.opt.mir]`, is an error that names the quoted form.
+`RuntimeOptions::check_run_options` checks each of these keys when the file is read, as riSim's hub does with `risim_run_options::validate_partial`; a key that it rejects is a configuration error and is left out.
 
 A `ProjectSpec` built in code describes the same project, and can also set external libraries, a VHDL standard per library, and configurations, generics and simulation options per testbench or test. Pass it as `ProjectSource::Spec` instead of `ProjectSource::ConfigFile`.
 
@@ -64,6 +77,7 @@ let runtime = Runtime::new(RuntimeOptions {
     analyzer: "/path/to/risim".into(),
     runner: "/path/to/risim-runner".into(),
     run_defaults: Default::default(),
+    check_run_options: None,
     max_parallel_simulations: parallelism,
     max_parallel_compiles: parallelism,
 })
@@ -86,8 +100,8 @@ Everything a workspace generates goes to `<root>/risim-out/`: the extracted VUni
 A lock file keeps other processes from using the same directory at the same time, and `owner.json` names the process that holds it (`RuntimeOptions::lock_owner`).
 
 A simulation runs `risim-runner run <options>`, with its options as one JSON object, whose keys are the long option names of `risim run` (riSim's `risim-run-options`).
-The object has the keys that every simulation sets (`simulator::SIMULATION_KEYS`: the libraries, the top-level unit, the generics, the assertion and GUI options, and the testcase name), the run options of the configuration (`SimOptions::run_options`, such as `relaxed` from the `options` of `risim-config.toml`), and the defaults of the runtime that these don't set (`RuntimeOptions::run_defaults`, such as those that riSim's hub takes from its environment).
-The run options of the configuration go over the defaults by the layer rule of riSim's `risim-run-options` (`simulator::overlay_run_options`): their `opt-level` drops the `opt.*` keys of the defaults, and their `opt.<name>` the keys `opt.<name>.*`.
+The object has the keys that every simulation sets (`simulator::SIMULATION_KEYS`: the libraries, the top-level unit, the generics, the assertion and GUI options, and the testcase name), the run options of the configuration (`SimOptions::run_options`, such as `relaxed` from the `options` of `risim-config.toml` and the keys of its `[run]`), and the defaults of the runtime that these don't set (`RuntimeOptions::run_defaults`, such as those that riSim's hub takes from its environment).
+The run options go over the defaults by the layer rule of riSim's `risim-run-options` (`simulator::overlay_run_options`), and those of a test configuration over the project's by the same rule: a later layer's `opt-level` drops the `opt.*` keys of the earlier ones, and its `opt.<name>` the keys `opt.<name>.*`.
 Run options that set a key of the simulation fail the test.
 The runner names the format of the object in `--version` (`run options format N`); a runner that reads another format than `simulator::RUN_OPTIONS_FORMAT`, or names none, can't be used, and `Runtime::new` fails.
 

@@ -18,6 +18,7 @@ use crate::diagnostics::error_chain;
 use crate::discovery;
 use crate::discovery::Discovery;
 use crate::project::Project;
+use crate::simulator::CheckRunOptions;
 use crate::sources;
 use crate::sources::SourceCache;
 use crate::spec::ProjectSpec;
@@ -58,13 +59,16 @@ pub(super) struct ProjectConfig {
     spec: Option<ProjectSpec>,
     /// The problems found when the configuration file was last read.
     config_file_diagnostics: Vec<Diagnostic>,
+    /// The check of the run options of the configuration file.
+    check_run_options: Option<CheckRunOptions>,
 }
 
 impl ProjectConfig {
-    /// Creates a configuration from `source`.
+    /// Creates a configuration from `source`, whose configuration file's run options
+    /// `check_run_options` checks.
     ///
     /// The configuration file path, if any, is absolute. A configuration file isn't read yet.
-    pub(super) fn new(source: ProjectSource) -> Self {
+    pub(super) fn new(source: ProjectSource, check_run_options: Option<CheckRunOptions>) -> Self {
         let (config_file, spec) = match source {
             ProjectSource::ConfigFile(path) => (Some(path), None),
             ProjectSource::Spec(spec) => (None, Some(spec)),
@@ -73,6 +77,7 @@ impl ProjectConfig {
             config_file,
             spec,
             config_file_diagnostics: Vec::new(),
+            check_run_options,
         }
     }
 
@@ -87,7 +92,7 @@ impl ProjectConfig {
         let Some(path) = &self.config_file else {
             return Ok(());
         };
-        match config::load(path) {
+        match config::load(path, self.check_run_options) {
             Ok(config) => {
                 if let Some(spec) = config.spec {
                     self.spec = Some(spec);

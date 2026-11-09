@@ -27,6 +27,7 @@ use risim_vunit_frontend::Workspace as Handle;
 use risim_vunit_frontend::WorkspaceEvent;
 use risim_vunit_frontend::WorkspaceEventKind;
 use risim_vunit_frontend::diagnostics::Severity;
+use risim_vunit_frontend::simulator::CheckRunOptions;
 use risim_vunit_frontend::simulator::RunOptions;
 use risim_vunit_frontend::store::CompileState;
 use tokio::sync::mpsc;
@@ -101,6 +102,10 @@ pub fn trials() -> Vec<Trial> {
             "workspace_simulates_with_the_compiled_libraries",
             workspace_simulates_with_the_compiled_libraries,
         ),
+        trial(
+            "workspace_checks_the_run_options_of_the_config",
+            workspace_checks_the_run_options_of_the_config,
+        ),
     ]
 }
 
@@ -123,6 +128,15 @@ async fn runtime() -> Runtime {
 
 /// A runtime with the fake risim-runner and the run options `run_defaults` of every simulation.
 async fn runtime_with_defaults(run_defaults: RunOptions) -> Runtime {
+    runtime_with_check(run_defaults, None).await
+}
+
+/// A runtime with the fake risim-runner, the run options `run_defaults` of every simulation, and
+/// the check `check_run_options` of the configuration's run options.
+async fn runtime_with_check(
+    run_defaults: RunOptions,
+    check_run_options: Option<CheckRunOptions>,
+) -> Runtime {
     let exe = Utf8PathBuf::from_path_buf(std::env::current_exe().expect("current exe"))
         .expect("UTF-8 path");
     let four = NonZeroUsize::new(4).expect("non-zero");
@@ -130,6 +144,7 @@ async fn runtime_with_defaults(run_defaults: RunOptions) -> Runtime {
         analyzer: exe.clone(),
         runner: exe,
         run_defaults,
+        check_run_options,
         max_parallel_simulations: four,
         max_parallel_compiles: four,
         lock_owner: LOCK_OWNER.to_owned(),
@@ -1189,5 +1204,65 @@ async fn workspace_simulates_with_the_compiled_libraries() {
     assert_eq!(options["top"], "tb_tests(tb)");
     assert_eq!(options["jit"], "eager");
     assert_eq!(options["opt.mir"], "off");
+    session.handle.close().await;
+}
+
+/// Rejects the run option `opt.bad`, as a check of the configuration's run options.
+fn reject_bad(options: &RunOptions) -> Result<(), String> {
+    if options.contains_key("opt.bad") {
+        Err("unknown optimization `bad`".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+/// The `[run]` table of the configuration sets run options over the runtime's, by the layer
+/// rule, without the keys that the runtime's check rejects, which are configuration errors.
+async fn workspace_checks_the_run_options_of_the_config() {
+    let mut fixture = Workspace::new().await;
+    simulation_project(&mut fixture);
+    fixture.write(
+        CONFIG,
+        "[libraries.lib]\nfiles = [\"tb/*.vhd\"]\n\n[run]\nopt-level = \"off\"\n\n\
+         [run.opt]\nwake-guards = \"on\"\nbad = \"on\"\n",
+    );
+    let runtime = runtime_with_check(
+        RunOptions::from_iter([
+            ("jit".to_owned(), "off".into()),
+            ("opt.mir".to_owned(), "off".into()),
+        ]),
+        Some(reject_bad),
+    )
+    .await;
+    let mut session = open(&runtime, &fixture, config_source()).await;
+    session
+        .until(|event| has_error(event, DiagnosticSource::Config))
+        .await;
+    let snapshot = session.handle.snapshot();
+    let config = snapshot.diagnostics.get(DiagnosticSource::Config);
+    let messages: Vec<&str> = config
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        ["invalid 'bad' in [run.opt]: unknown optimization `bad`"]
+    );
+
+    session
+        .handle
+        .simulate(requests(&["lib.tb_tests.pass"]), tag("a"), None);
+    let events = summary(&session.operation("a").await);
+    assert_eq!(
+        events.last().map(String::as_str),
+        Some("simulation_finished a 1/0/0")
+    );
+    let options = run_options(&fixture.layout, "lib.tb_tests.pass");
+    assert_eq!(options["jit"], "off");
+    assert_eq!(options["opt-level"], "off");
+    assert_eq!(options["opt.wake-guards"], "on");
+    // The project's `opt-level` drops the runtime's `opt.mir`.
+    assert_eq!(options.get("opt.mir"), None);
+    assert_eq!(options.get("opt.bad"), None);
     session.handle.close().await;
 }

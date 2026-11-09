@@ -85,6 +85,7 @@ pub async fn runtime() -> Runtime {
         analyzer,
         runner,
         run_defaults: RunOptions::new(),
+        check_run_options: None,
         max_parallel_simulations: parallelism,
         max_parallel_compiles: parallelism,
         lock_owner: r#"{"acceptance": true}"#.to_owned(),

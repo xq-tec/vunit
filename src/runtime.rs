@@ -23,6 +23,7 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 
+use crate::simulator::CheckRunOptions;
 use crate::simulator::DetectError;
 use crate::simulator::RunOptions;
 use crate::simulator::Simulator;
@@ -33,7 +34,7 @@ use crate::workspace::Workspace;
 use crate::workspace::WorkspaceEvent;
 
 /// The settings of a [`Runtime`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct RuntimeOptions {
     /// The analyzer, the riSim CLI `risim`, which compiles (`risim analyze`).
     pub analyzer: Utf8PathBuf,
@@ -43,6 +44,12 @@ pub struct RuntimeOptions {
     /// ([`Simulator::simulate_command`]), such as the defaults that the application takes from its
     /// environment.
     pub run_defaults: RunOptions,
+    /// Checks the run options of the `[run]` table of `risim-config.toml`, one key at a time;
+    /// an error becomes a configuration diagnostic, and the key is left out
+    /// ([`config::load`](crate::config::load)).
+    ///
+    /// `None` takes them unchecked, for the runner to check.
+    pub check_run_options: Option<CheckRunOptions>,
     /// The maximum number of simulations running at once, over all workspaces. A paused GUI
     /// simulation counts as running.
     pub max_parallel_simulations: NonZeroUsize,
@@ -67,6 +74,7 @@ pub enum RuntimeError {
 struct Inner {
     simulator: Simulator,
     run_defaults: Arc<RunOptions>,
+    check_run_options: Option<CheckRunOptions>,
     lock_owner: String,
     simulation_semaphore: Arc<Semaphore>,
     compile_semaphore: Arc<Semaphore>,
@@ -97,6 +105,7 @@ impl Runtime {
             inner: Arc::new(Inner {
                 simulator,
                 run_defaults: Arc::new(options.run_defaults),
+                check_run_options: options.check_run_options,
                 lock_owner: options.lock_owner,
                 simulation_semaphore: Arc::new(Semaphore::new(
                     options.max_parallel_simulations.get(),
@@ -114,6 +123,12 @@ impl Runtime {
     /// The run options of every simulation ([`RuntimeOptions::run_defaults`]).
     pub(crate) fn run_defaults(&self) -> &Arc<RunOptions> {
         &self.inner.run_defaults
+    }
+
+    /// The check of the run options of `risim-config.toml`
+    /// ([`RuntimeOptions::check_run_options`]).
+    pub(crate) fn check_run_options(&self) -> Option<CheckRunOptions> {
+        self.inner.check_run_options
     }
 
     /// The owner record of the workspace locks ([`RuntimeOptions::lock_owner`]).

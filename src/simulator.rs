@@ -44,6 +44,10 @@ pub const RUN_OPTIONS_FORMAT: u32 = 2;
 /// them.
 pub type RunOptions = serde_json::Map<String, Value>;
 
+/// A check of run options that are one layer of a run's options, not all of them, such as riSim's
+/// `risim_run_options::validate_partial`; it returns the message of the first problem.
+pub type CheckRunOptions = fn(&RunOptions) -> Result<(), String>;
+
 /// The key of the optimization preset in the run options.
 const OPT_LEVEL_KEY: &str = "opt-level";
 

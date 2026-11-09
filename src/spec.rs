@@ -22,6 +22,7 @@ use thiserror::Error;
 
 use crate::diagnostics::Range;
 use crate::simulator::RunOptions;
+use crate::simulator::overlay_run_options;
 use crate::vhdl_standard::VhdlStandard;
 
 /// The whole project: libraries and their sources, options and test configurations.
@@ -204,12 +205,12 @@ pub struct CompileOptions {
 /// enabled, and a new seed per run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SimOptions {
-    /// Extra options of the runner, keys of its JSON object such as `relaxed` or `finish-after`,
+    /// Extra options of the runner, keys of its JSON object such as `relaxed` or `opt-level`,
     /// which override the runtime's defaults.
     ///
     /// They can't set the keys that every simulation sets
-    /// ([`SIMULATION_KEYS`](crate::simulator::SIMULATION_KEYS)); a configuration that sets them
-    /// replaces those of the project as a whole.
+    /// ([`SIMULATION_KEYS`](crate::simulator::SIMULATION_KEYS)); those of a configuration go
+    /// over those of the project by the layer rule of [`overlay_run_options`].
     pub run_options: Option<RunOptions>,
     /// The lowest assertion severity that stops the simulation; default `error`.
     pub vhdl_assert_stop_level: Option<AssertLevel>,
@@ -220,14 +221,20 @@ pub struct SimOptions {
 }
 
 impl SimOptions {
-    /// Returns these options with every field that `overrides` sets replaced.
+    /// Returns these options with every field that `overrides` sets replaced, except the run
+    /// options, where those of `overrides` go over these by [`overlay_run_options`].
     #[must_use]
     pub fn overridden_by(&self, overrides: &Self) -> Self {
+        let run_options = match (&self.run_options, &overrides.run_options) {
+            (Some(earlier), Some(layer)) => {
+                let mut options = earlier.clone();
+                overlay_run_options(&mut options, layer);
+                Some(options)
+            },
+            (earlier, layer) => layer.clone().or_else(|| earlier.clone()),
+        };
         Self {
-            run_options: overrides
-                .run_options
-                .clone()
-                .or_else(|| self.run_options.clone()),
+            run_options,
             vhdl_assert_stop_level: overrides
                 .vhdl_assert_stop_level
                 .or(self.vhdl_assert_stop_level),
@@ -335,13 +342,36 @@ mod tests {
         assert_eq!(merged.disable_ieee_warnings, Some(true));
         assert_eq!(merged.vhdl_assert_stop_level, None);
 
-        // A configuration's run options replace the project's, key by key or not at all.
-        let finish = RunOptions::from_iter([("finish-after".to_owned(), "1 ms".into())]);
-        let finishing = SimOptions {
-            run_options: Some(finish.clone()),
+        // A configuration's run options go over the project's by the layer rule: its
+        // `opt-level` drops the project's `opt.*` keys.
+        let project = SimOptions {
+            run_options: Some(RunOptions::from_iter([
+                ("relaxed".to_owned(), true.into()),
+                ("opt.wake-guards".to_owned(), "off".into()),
+            ])),
             ..SimOptions::default()
         };
-        assert_eq!(base.overridden_by(&finishing).run_options, Some(finish));
+        let configuration = SimOptions {
+            run_options: Some(RunOptions::from_iter([
+                ("finish-after".to_owned(), "1 ms".into()),
+                ("opt-level".to_owned(), "on".into()),
+            ])),
+            ..SimOptions::default()
+        };
+        assert_eq!(
+            project.overridden_by(&configuration).run_options,
+            Some(RunOptions::from_iter([
+                ("relaxed".to_owned(), true.into()),
+                ("finish-after".to_owned(), "1 ms".into()),
+                ("opt-level".to_owned(), "on".into()),
+            ]))
+        );
+        assert_eq!(
+            SimOptions::default()
+                .overridden_by(&configuration)
+                .run_options,
+            configuration.run_options
+        );
     }
 
     #[test]
