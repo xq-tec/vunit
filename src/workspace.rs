@@ -15,8 +15,9 @@
 //!   compile.
 //! - **Operations:** a compile, or a simulate, which compiles first and then runs the matching
 //!   testcases. At most one compile runs per workspace. A request arriving while a compile runs
-//!   merges into the queued operation, if there is one (see `operation.rs`), so at most one
-//!   operation waits. After its compile, a simulate runs its tests while the next operation may
+//!   merges into the last queued operation, if there is one (see `operation.rs`), so at most one
+//!   operation waits, except that simulates with different run options queue one behind the
+//!   other. After its compile, a simulate runs its tests while the next operation may
 //!   already compile.
 //! - **Cancel:** [`Workspace::cancel_all`] cancels the running compile, the queued operations,
 //!   and all running and waiting tests. [`Workspace::cancel`] cancels only what one request asked
@@ -374,7 +375,7 @@ pub(crate) async fn open(
         ProjectSource::ConfigFile(path) => ProjectSource::ConfigFile(absolute(&root.join(path))?),
         ProjectSource::Spec(spec) => ProjectSource::Spec(spec),
     };
-    let config = ProjectConfig::new(source);
+    let config = ProjectConfig::new(source, runtime.check_run_options());
     let prepare_root = root.clone();
     let owner = runtime.lock_owner().to_owned();
     let opened = tokio::task::spawn_blocking(move || prepare(prepare_root, layout, config, &owner))

@@ -29,13 +29,15 @@ use risim_vunit_frontend::Workspace as Handle;
 use risim_vunit_frontend::WorkspaceEvent;
 use risim_vunit_frontend::WorkspaceEventKind;
 use risim_vunit_frontend::diagnostics::Severity;
+use risim_vunit_frontend::simulator::CheckRunOptions;
+use risim_vunit_frontend::simulator::RunOptions;
 use risim_vunit_frontend::store::CompileState;
-use risim_vunit_frontend::store::TestOutputPaths;
 use risim_vunit_frontend::threads::NoLeases;
 use risim_vunit_frontend::threads::ThreadBudget;
 use tokio::sync::mpsc;
 
 use crate::Workspace;
+use crate::run_options;
 use crate::simulation_project;
 use crate::testbench;
 use crate::trial::trial;
@@ -50,6 +52,10 @@ pub fn trials() -> Vec<Trial> {
         trial(
             "workspace_merges_requests_while_compiling",
             workspace_merges_requests_while_compiling,
+        ),
+        trial(
+            "workspace_queues_simulates_with_other_options",
+            workspace_queues_simulates_with_other_options,
         ),
         trial(
             "workspace_limits_processes_per_request",
@@ -108,6 +114,10 @@ pub fn trials() -> Vec<Trial> {
             "workspace_simulates_with_the_compiled_libraries",
             workspace_simulates_with_the_compiled_libraries,
         ),
+        trial(
+            "workspace_checks_the_run_options_of_the_config",
+            workspace_checks_the_run_options_of_the_config,
+        ),
     ]
 }
 
@@ -125,12 +135,28 @@ const LOCK_OWNER: &str = r#"{"test": true}"#;
 
 /// A runtime with the fake risim-runner.
 async fn runtime() -> Runtime {
+    runtime_with_defaults(RunOptions::new()).await
+}
+
+/// A runtime with the fake risim-runner and the run options `run_defaults` of every simulation.
+async fn runtime_with_defaults(run_defaults: RunOptions) -> Runtime {
+    runtime_with_check(run_defaults, None).await
+}
+
+/// A runtime with the fake risim-runner, the run options `run_defaults` of every simulation, and
+/// the check `check_run_options` of the configuration's run options.
+async fn runtime_with_check(
+    run_defaults: RunOptions,
+    check_run_options: Option<CheckRunOptions>,
+) -> Runtime {
     let exe = Utf8PathBuf::from_path_buf(std::env::current_exe().expect("current exe"))
         .expect("UTF-8 path");
     let four = NonZeroUsize::new(4).expect("non-zero");
     Runtime::new(RuntimeOptions {
         analyzer: exe.clone(),
         runner: exe,
+        run_defaults,
+        check_run_options,
         threads: ThreadBudget::new(NonZeroU32::new(4).expect("non-zero")),
         max_threads_per_test: NonZeroU32::MIN,
         max_parallel_compiles: four,
@@ -184,6 +210,7 @@ fn requests(patterns: &[&str]) -> Vec<SimulationRequest> {
         .map(|pattern| SimulationRequest {
             pattern: (*pattern).to_owned(),
             gui: false,
+            ..SimulationRequest::default()
         })
         .collect()
 }
@@ -492,6 +519,64 @@ async fn workspace_merges_requests_while_compiling() {
     );
     assert_eq!(events.len(), 12, "{events:#?}");
     assert_eq!(events[11], "simulation_finished b,c,d 2/0/0");
+    session.handle.close().await;
+}
+
+/// Simulates whose requests have different run options queue one behind the other instead of
+/// merging, and each runs with its own options.
+async fn workspace_queues_simulates_with_other_options() {
+    let mut fixture = Workspace::new().await;
+    simulation_project(&mut fixture);
+    let runtime = runtime().await;
+    let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
+    let at = |pattern: &str, level: &str| {
+        requests(&[pattern])
+            .into_iter()
+            .map(|request| SimulationRequest {
+                options: RunOptions::from_iter([("opt-level".to_owned(), level.into())]),
+                ..request
+            })
+            .collect()
+    };
+
+    // `d` runs another testcase, so that each run writes its own `options.json`. The simulations of
+    // `b,c` and `d` may then overlap and end in either order, and so may `d`'s compile and the
+    // simulation of `b,c`.
+    session.handle.compile(tag("a"), None);
+    session
+        .handle
+        .simulate(at("lib.tb_tests.pass", "off"), tag("b"), None, None);
+    session
+        .handle
+        .simulate(at("lib.tb_tests.pass", "off"), tag("c"), None, None);
+    session
+        .handle
+        .simulate(at("lib.tb_implicit.all", "full"), tag("d"), None, None);
+    let mut events = Vec::new();
+    let mut running = vec!["b", "d"];
+    while !running.is_empty() {
+        let event = session.next().await;
+        if let WorkspaceEventKind::SimulationFinished { tags, .. } = &event {
+            running.retain(|name| !has_tag(tags, name));
+        }
+        events.push(event);
+    }
+    let events = summary(&events);
+    for expected in [
+        "compile_started d 0",
+        "simulation_finished b,c 1/0/0",
+        "simulation_finished d 1/0/0",
+    ] {
+        assert!(events.contains(&expected.to_owned()), "{events:#?}");
+    }
+    assert_eq!(
+        run_options(&fixture.layout, "lib.tb_tests.pass")["opt-level"],
+        "off"
+    );
+    assert_eq!(
+        run_options(&fixture.layout, "lib.tb_implicit.all")["opt-level"],
+        "full"
+    );
     session.handle.close().await;
 }
 
@@ -1149,20 +1234,18 @@ async fn workspace_rewatches_a_recreated_directory() {
     session.handle.close().await;
 }
 
-/// The arguments of the last simulation of `testcase`, starting with the mode.
-fn simulation_args(fixture: &Workspace, testcase: &str) -> Vec<String> {
-    let paths = TestOutputPaths::new(&fixture.layout, testcase);
-    fs::read_to_string(paths.dir.join("args.txt"))
-        .expect("read args.txt")
-        .lines()
-        .map(str::to_owned)
-        .collect()
-}
-
+/// The simulations of a workspace run with the libraries that it compiled, and with the run
+/// options of the runtime, which those of the project override.
 async fn workspace_simulates_with_the_compiled_libraries() {
     let mut fixture = Workspace::new().await;
     simulation_project(&mut fixture);
-    let runtime = runtime().await;
+    fixture.spec.sim_options.run_options =
+        Some(RunOptions::from_iter([("jit".to_owned(), "eager".into())]));
+    let runtime = runtime_with_defaults(RunOptions::from_iter([
+        ("jit".to_owned(), "off".into()),
+        ("opt.mir".to_owned(), "off".into()),
+    ]))
+    .await;
     let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
 
     session
@@ -1204,15 +1287,83 @@ async fn workspace_simulates_with_the_compiled_libraries() {
         !log.iter().any(|line| line.starts_with("start ")),
         "{log:?}"
     );
-    let args = simulation_args(&fixture, "lib.tb_tests.pass");
-    assert_eq!(args[0], "run");
-    let workdir = format!("--workdir={}", fixture.layout.library_dir("lib"));
-    assert!(args.contains(&workdir), "{args:?}");
-    assert!(
-        args.iter()
-            .any(|arg| arg.starts_with("--generic=runner_cfg=")),
-        "{args:?}"
+    let options = run_options(&fixture.layout, "lib.tb_tests.pass");
+    assert_eq!(
+        options["workdir"],
+        fixture.layout.library_dir("lib").as_str()
     );
-    assert_eq!(args.last().map(String::as_str), Some("tb_tests(tb)"));
+    assert!(
+        options["generics"]
+            .as_array()
+            .expect("the generics")
+            .iter()
+            .any(|generic| generic
+                .as_str()
+                .is_some_and(|generic| generic.starts_with("runner_cfg="))),
+        "{options}"
+    );
+    assert_eq!(options["top"], "tb_tests(tb)");
+    assert_eq!(options["jit"], "eager");
+    assert_eq!(options["opt.mir"], "off");
+    session.handle.close().await;
+}
+
+/// Rejects the run option `opt.bad`, as a check of the configuration's run options.
+fn reject_bad(options: &RunOptions) -> Result<(), String> {
+    if options.contains_key("opt.bad") {
+        Err("unknown optimization `bad`".to_owned())
+    } else {
+        Ok(())
+    }
+}
+
+/// The `[run]` table of the configuration sets run options over the runtime's, by the layer
+/// rule, without the keys that the runtime's check rejects, which are configuration errors.
+async fn workspace_checks_the_run_options_of_the_config() {
+    let mut fixture = Workspace::new().await;
+    simulation_project(&mut fixture);
+    fixture.write(
+        CONFIG,
+        "[libraries.lib]\nfiles = [\"tb/*.vhd\"]\n\n[run]\nopt-level = \"off\"\n\n\
+         [run.opt]\nwake-guards = \"on\"\nbad = \"on\"\n",
+    );
+    let runtime = runtime_with_check(
+        RunOptions::from_iter([
+            ("jit".to_owned(), "off".into()),
+            ("opt.mir".to_owned(), "off".into()),
+        ]),
+        Some(reject_bad),
+    )
+    .await;
+    let mut session = open(&runtime, &fixture, config_source()).await;
+    session
+        .until(|event| has_error(event, DiagnosticSource::Config))
+        .await;
+    let snapshot = session.handle.snapshot();
+    let config = snapshot.diagnostics.get(DiagnosticSource::Config);
+    let messages: Vec<&str> = config
+        .iter()
+        .map(|diagnostic| diagnostic.message.as_str())
+        .collect();
+    assert_eq!(
+        messages,
+        ["invalid 'bad' in [run.opt]: unknown optimization `bad`"]
+    );
+
+    session
+        .handle
+        .simulate(requests(&["lib.tb_tests.pass"]), tag("a"), None, None);
+    let events = summary(&session.operation("a").await);
+    assert_eq!(
+        events.last().map(String::as_str),
+        Some("simulation_finished a 1/0/0")
+    );
+    let options = run_options(&fixture.layout, "lib.tb_tests.pass");
+    assert_eq!(options["jit"], "off");
+    assert_eq!(options["opt-level"], "off");
+    assert_eq!(options["opt.wake-guards"], "on");
+    // The project's `opt-level` drops the runtime's `opt.mir`.
+    assert_eq!(options.get("opt.mir"), None);
+    assert_eq!(options.get("opt.bad"), None);
     session.handle.close().await;
 }

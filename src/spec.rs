@@ -21,6 +21,8 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::diagnostics::Range;
+use crate::simulator::RunOptions;
+use crate::simulator::overlay_run_options;
 use crate::vhdl_standard::VhdlStandard;
 
 /// The whole project: libraries and their sources, options and test configurations.
@@ -199,14 +201,17 @@ pub struct CompileOptions {
 /// Options for elaboration and simulation (`risim-runner run`).
 ///
 /// A test configuration overrides the project, and still-unset fields take their defaults when
-/// the command line is built: empty flag lists, assert stop level `error`, IEEE assertions left
+/// the command line is built: no run options, assert stop level `error`, IEEE assertions left
 /// enabled, and a new seed per run.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SimOptions {
-    /// Extra elaboration options of `risim-runner run`.
-    pub elab_flags: Option<Vec<String>>,
-    /// Extra simulation options of `risim-runner run`.
-    pub sim_flags: Option<Vec<String>>,
+    /// Extra options of the runner, keys of its JSON object such as `relaxed` or `opt-level`,
+    /// which override the runtime's defaults.
+    ///
+    /// They can't set the keys that every simulation sets
+    /// ([`SIMULATION_KEYS`](crate::simulator::SIMULATION_KEYS)); those of a configuration go
+    /// over those of the project by the layer rule of [`overlay_run_options`].
+    pub run_options: Option<RunOptions>,
     /// The lowest assertion severity that stops the simulation; default `error`.
     pub vhdl_assert_stop_level: Option<AssertLevel>,
     /// Whether to disable assertions from the IEEE libraries; default `false`.
@@ -216,18 +221,20 @@ pub struct SimOptions {
 }
 
 impl SimOptions {
-    /// Returns these options with every field that `overrides` sets replaced.
+    /// Returns these options with every field that `overrides` sets replaced, except the run
+    /// options, where those of `overrides` go over these by [`overlay_run_options`].
     #[must_use]
     pub fn overridden_by(&self, overrides: &Self) -> Self {
+        let run_options = match (&self.run_options, &overrides.run_options) {
+            (Some(earlier), Some(layer)) => {
+                let mut options = earlier.clone();
+                overlay_run_options(&mut options, layer);
+                Some(options)
+            },
+            (earlier, layer) => layer.clone().or_else(|| earlier.clone()),
+        };
         Self {
-            elab_flags: overrides
-                .elab_flags
-                .clone()
-                .or_else(|| self.elab_flags.clone()),
-            sim_flags: overrides
-                .sim_flags
-                .clone()
-                .or_else(|| self.sim_flags.clone()),
+            run_options,
             vhdl_assert_stop_level: overrides
                 .vhdl_assert_stop_level
                 .or(self.vhdl_assert_stop_level),
@@ -252,7 +259,7 @@ pub enum AssertLevel {
 }
 
 impl AssertLevel {
-    /// The name used in configuration files and by `risim-runner run --assert-level`.
+    /// The name used in configuration files and by the run option `assert-level`.
     pub const fn name(self) -> &'static str {
         match self {
             Self::Warning => "warning",
@@ -318,8 +325,9 @@ mod tests {
 
     #[test]
     fn sim_options_override_set_fields() {
+        let relaxed = RunOptions::from_iter([("relaxed".to_owned(), true.into())]);
         let base = SimOptions {
-            elab_flags: Some(vec!["-fsynopsys".to_owned()]),
+            run_options: Some(relaxed),
             seed: Some("1".to_owned()),
             ..SimOptions::default()
         };
@@ -329,10 +337,41 @@ mod tests {
             ..SimOptions::default()
         };
         let merged = base.overridden_by(&overrides);
-        assert_eq!(merged.elab_flags, base.elab_flags);
+        assert_eq!(merged.run_options, base.run_options);
         assert_eq!(merged.seed.as_deref(), Some("2"));
         assert_eq!(merged.disable_ieee_warnings, Some(true));
         assert_eq!(merged.vhdl_assert_stop_level, None);
+
+        // A configuration's run options go over the project's by the layer rule: its
+        // `opt-level` drops the project's `opt.*` keys.
+        let project = SimOptions {
+            run_options: Some(RunOptions::from_iter([
+                ("relaxed".to_owned(), true.into()),
+                ("opt.wake-guards".to_owned(), "off".into()),
+            ])),
+            ..SimOptions::default()
+        };
+        let configuration = SimOptions {
+            run_options: Some(RunOptions::from_iter([
+                ("finish-after".to_owned(), "1 ms".into()),
+                ("opt-level".to_owned(), "on".into()),
+            ])),
+            ..SimOptions::default()
+        };
+        assert_eq!(
+            project.overridden_by(&configuration).run_options,
+            Some(RunOptions::from_iter([
+                ("relaxed".to_owned(), true.into()),
+                ("finish-after".to_owned(), "1 ms".into()),
+                ("opt-level".to_owned(), "on".into()),
+            ]))
+        );
+        assert_eq!(
+            SimOptions::default()
+                .overridden_by(&configuration)
+                .run_options,
+            configuration.run_options
+        );
     }
 
     #[test]

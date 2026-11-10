@@ -5,7 +5,8 @@
 //! A fake risim-runner and analyzer, which the tests use for both. The test binary runs this
 //! instead of the tests when `RISIM_FAKE` is set.
 //!
-//! - `--version` prints a risim-runner version line and the archive format.
+//! - `--version` prints a risim-runner version line, the archive format and the format of the run
+//!   options.
 //! - `--sleep <ms>` sleeps.
 //! - `analyze … <file>…` "analyses" the files one after the other: it appends
 //!   `start <work> <file name>` and `end <work> <file name>` to `fake-risim.log` in the working
@@ -22,11 +23,11 @@
 //!
 //!   Each call also appends `<work> <file name>…` to `fake-calls.log`, and at its end writes the
 //!   archive `<workdir>/<work>.hlib`.
-//! - `run … --name=<testcase>` "simulates" the testcase: it appends `simstart <testcase>` and
-//!   `simend <testcase>` to the log, writes its arguments, including `run`, to `args.txt` in the
-//!   output path from `runner_cfg` (`--generic=runner_cfg=`), and follows the directives for the
-//!   testcase in `fake-sim.txt` in the working directory (lines `<testcase>\t<directive>`), in
-//!   order:
+//! - `run <options>` "simulates" the testcase that the key `name` of the JSON object `options`
+//!   names: it appends `simstart <testcase>` and `simend <testcase>` to the log, writes the
+//!   options to `options.json` in the output path from `runner_cfg` (of the key `generics`), and
+//!   follows the directives for the testcase in `fake-sim.txt` in the working directory (lines
+//!   `<testcase>\t<directive>`), in order:
 //!   - `fail`: the test starts but the suite doesn't complete, exit code 1;
 //!   - `no-results`: don't write `vunit_results`;
 //!   - `exit <code>`: set the exit code;
@@ -52,6 +53,9 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
+use risim_vunit_frontend::simulator::RUN_OPTIONS_FORMAT;
+use serde_json::Value;
+
 /// The environment variable that turns the test binary into the fake simulator.
 pub const ENV: &str = "RISIM_FAKE";
 
@@ -68,7 +72,10 @@ pub fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("--version") => {
-            println!("risim-runner 0.1.0-fake\nhydrolyze archive format 1");
+            println!(
+                "risim-runner 0.1.0-fake\nhydrolyze archive format 1\nrun options format \
+                 {RUN_OPTIONS_FORMAT}"
+            );
             ExitCode::SUCCESS
         },
         Some("--sleep") => {
@@ -77,7 +84,7 @@ pub fn main() -> ExitCode {
             ExitCode::SUCCESS
         },
         Some("analyze") => analyse(&args[1..]),
-        Some("run") => simulate(&args),
+        Some("run") if args.len() == 2 => simulate(&args[1]),
         _ => {
             eprintln!("fake risim-runner: unsupported arguments {args:?}");
             ExitCode::from(2)
@@ -248,17 +255,19 @@ fn decode_dict(encoded: &str) -> Vec<(String, String)> {
     entries
 }
 
-/// Simulates the testcase of `args`, which start with `run`.
-fn simulate(args: &[String]) -> ExitCode {
-    let name = args
-        .iter()
-        .find_map(|arg| arg.strip_prefix("--name="))
-        .unwrap_or("?")
-        .to_owned();
+/// Simulates the testcase of the run options `options`, a JSON object.
+fn simulate(options: &str) -> ExitCode {
+    let Ok(options) = serde_json::from_str::<Value>(options) else {
+        eprintln!("fake risim-runner: the run options aren't JSON: {options}");
+        return ExitCode::from(2);
+    };
+    let name = options["name"].as_str().unwrap_or("?").to_owned();
     log(&format!("simstart {name}"));
-    let runner_cfg = args
-        .iter()
-        .find_map(|arg| arg.strip_prefix("--generic=runner_cfg="))
+    let runner_cfg = options["generics"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find_map(|generic| generic.as_str()?.strip_prefix("runner_cfg="))
         .map(decode_dict)
         .unwrap_or_default();
     let value = |key: &str| {
@@ -269,7 +278,8 @@ fn simulate(args: &[String]) -> ExitCode {
             .unwrap_or_default()
     };
     let output_path = value("output path");
-    fs::write(format!("{output_path}args.txt"), args.join("\n")).expect("write args.txt");
+    fs::write(format!("{output_path}options.json"), options.to_string())
+        .expect("write options.json");
 
     let directives = fs::read_to_string(SIM_DIRECTIVES).unwrap_or_default();
     let mut code = 0;

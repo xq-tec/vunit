@@ -28,6 +28,7 @@ use risim_vunit_frontend::Workspace;
 use risim_vunit_frontend::WorkspaceEvent;
 use risim_vunit_frontend::WorkspaceEventKind;
 use risim_vunit_frontend::diagnostics::Severity;
+use risim_vunit_frontend::simulator::RunOptions;
 use risim_vunit_frontend::spec::ConfigurationSpec;
 use risim_vunit_frontend::spec::ProjectSpec;
 use risim_vunit_frontend::spec::TestConfigSpec;
@@ -87,6 +88,8 @@ pub async fn runtime() -> Runtime {
     Runtime::new(RuntimeOptions {
         analyzer,
         runner,
+        run_defaults: RunOptions::new(),
+        check_run_options: None,
         threads: ThreadBudget::new(
             NonZeroU32::try_from(u32::try_from(parallelism.get()).unwrap_or(u32::MAX))
                 .expect("non-zero"),
@@ -192,6 +195,7 @@ pub async fn simulate_all(runtime: &Runtime, root: &Utf8Path, spec: &ProjectSpec
         vec![SimulationRequest {
             pattern: "*".to_owned(),
             gui: false,
+            ..SimulationRequest::default()
         }],
         Some(RequestTag(TAG.to_owned())),
         None,

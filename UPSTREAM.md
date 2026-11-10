@@ -67,7 +67,10 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - The compile set includes the files declaring the VHDL configurations the test runs elaborate. VUnit's `--minimal` compiles only the testbench files and their dependencies, which misses them.
 - Recompilation uses compile keys instead of timestamps. Independent libraries compile in parallel and continue after unrelated failures.
 - Duplicate tests, invalid attributes, and testbenches with no or several architectures disable only the affected testbench instead of aborting. Configuration errors (duplicate or empty names, invalid attributes) skip only that configuration.
-- riSim analyses with its CLI (`risim analyze`) and simulates with its runner (`risim-runner run`), VHDL-2008 only. GUI mode passes `--paused`, so `sim_flags`, which are risim-runner options, must not also contain `--paused`, `--pause-after` or `--websocket=disable`. The consecutive files of one library that need compiling are analysed by one process.
+- riSim analyses with its CLI (`risim analyze`) and simulates with its runner (`risim-runner run`), VHDL-2008 only.
+  The runner takes the options of a simulation as one JSON object; instead of the simulator flags of VUnit (`ghdl.elab_flags`, `ghdl.sim_flags`), a configuration sets run options, keys of that object (`SimOptions::run_options`), over those of the project by the layer rule of riSim's `risim-run-options`; the `options` of `risim-config.toml` set `relaxed`, and its `[run]` table the optimization keys.
+  Run options can't set the keys that every simulation sets (`SIMULATION_KEYS`), among them `paused`, which GUI mode sets; with GUI mode, they must not set `pause-after` or `websocket: disable` either, which the runner rejects.
+  The consecutive files of one library that need compiling are analysed by one process.
 - Testcase patterns are case-insensitive on all platforms (Python's `fnmatch` is case-insensitive only on Windows).
 - Compile and simulation processes run with the workspace root as working directory.
 - Files that are independent of each other compile in the order they were added. VUnit sorts them by path. Both orders respect the dependencies.

@@ -8,13 +8,14 @@
 //! `test/runner.py`, for a single test per simulation:
 //!
 //! - **Resolution:** [`SimulationPlan::new`] matches the requested patterns against the
-//!   testcases and prepares a [`PlannedTest`] per match.
+//!   testcases and prepares a [`PlannedTest`] per match, with the run options of the first
+//!   request that matches it.
 //! - **Run:** each test first takes its testcase lock, so the same testcase never runs twice at
 //!   once, then a permit of the simulation limit with its threads ([`crate::threads`]), and then
 //!   the lease of its threads. Tests whose lock is free get permits in name order; a test whose
 //!   lock is held by another simulation waits for it without holding up the others. Each test
 //!   with a lease recreates its output directory, gets a seed and its `runner_cfg` generic, and
-//!   runs the simulator (`risim-runner run`, with the lease's arguments) with stdout and stderr
+//!   runs the simulator (`risim-runner run`, with the lease's run options) with stdout and stderr
 //!   redirected to `output.txt`.
 //! - **Outcome:** an explicit test passed if `vunit_results` records its start and the end of
 //!   the test suite; a testbench without explicit tests passed if the test suite ended. A
@@ -60,12 +61,15 @@ use crate::configuration::directory_generic;
 use crate::diagnostics::Diagnostic;
 use crate::discovery::Discovery;
 use crate::pattern;
+use crate::pattern::Pattern;
 use crate::process;
 use crate::project::Project;
 use crate::simulator::CommandError;
+use crate::simulator::RunOptions;
 use crate::simulator::SimulateArgs;
 use crate::simulator::Simulator;
 use crate::simulator::Top;
+use crate::simulator::overlay_run_options;
 use crate::spec::AssertLevel;
 use crate::spec::SimOptions;
 use crate::store::OutputLayout;
@@ -188,12 +192,18 @@ pub fn outcome(results_pass: bool, exit_success: bool, standard: VhdlStandard) -
 // -------------------------------------------------------------------------------------------------
 
 /// A request to run the testcases matching `pattern`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SimulationRequest {
     /// A testcase pattern (`fnmatch`, case-insensitive).
     pub pattern: String,
     /// Whether to start the simulations paused, for a waveform viewer.
     pub gui: bool,
+    /// The run options of the request, such as a GUI's optimizations, which go over those of the
+    /// configuration by the layer rule of [`overlay_run_options`].
+    ///
+    /// They mustn't set a key of the simulation
+    /// ([`SIMULATION_KEYS`](crate::simulator::SIMULATION_KEYS)); the caller checks them.
+    pub options: RunOptions,
 }
 
 /// Everything a simulation plan is made from.
@@ -230,8 +240,7 @@ pub struct PlannedTest {
     /// Whether the entity declares an `output_path` generic that the configuration leaves unset.
     fill_output_path: bool,
     tb_path: Utf8PathBuf,
-    elab_flags: Vec<String>,
-    sim_flags: Vec<String>,
+    run_options: RunOptions,
     assert_level: AssertLevel,
     disable_ieee_asserts: bool,
     seed: Option<String>,
@@ -259,26 +268,36 @@ impl PlannedTest {
         generics
     }
 
-    /// The command line of a run with `seed` on `simulator`.
+    /// The command line of a run with `seed` on `simulator`, with the run options `run_defaults`
+    /// unless the configuration's set them.
     ///
     /// # Errors
     ///
-    /// Fails if the simulator doesn't support the testbench's standard.
-    pub fn command(&self, simulator: &Simulator, seed: &str) -> Result<Vec<String>, CommandError> {
-        self.command_with(simulator, seed, &[])
+    /// Fails if the simulator doesn't support the testbench's standard, or if the configuration's
+    /// run options set a key of the simulation ([`Simulator::simulate_command`]).
+    pub fn command(
+        &self,
+        simulator: &Simulator,
+        seed: &str,
+        run_defaults: &RunOptions,
+    ) -> Result<Vec<String>, CommandError> {
+        self.command_with(simulator, seed, run_defaults, &RunOptions::new())
     }
 
-    /// The command line of a run with `seed` on `simulator`, with the extra risim-runner
-    /// options `extra_args` of its lease.
+    /// The command line of a run with `seed` on `simulator`, with the run options `run_defaults`
+    /// unless the configuration's set them, and the run options `lease_options` of its lease over
+    /// all of them.
     ///
     /// # Errors
     ///
-    /// Fails if the simulator doesn't support the testbench's standard.
+    /// Fails if the simulator doesn't support the testbench's standard, or if the configuration's
+    /// run options set a key of the simulation ([`Simulator::simulate_command`]).
     pub fn command_with(
         &self,
         simulator: &Simulator,
         seed: &str,
-        extra_args: &[String],
+        run_defaults: &RunOptions,
+        lease_options: &RunOptions,
     ) -> Result<Vec<String>, CommandError> {
         let generics = self.generics(seed);
         simulator.simulate_command(&SimulateArgs {
@@ -286,15 +305,15 @@ impl PlannedTest {
             library: &self.library,
             library_dir: &self.library_dir,
             library_dirs: &self.library_dirs,
-            elab_flags: &self.elab_flags,
             top: &self.top,
-            sim_flags: &self.sim_flags,
+            run_options: &self.run_options,
+            run_defaults,
             generics: &generics,
             assert_level: self.assert_level,
             disable_ieee_asserts: self.disable_ieee_asserts,
             wait: self.gui,
             name: &self.name,
-            extra_args,
+            lease_options,
         })
     }
 
@@ -314,14 +333,15 @@ pub struct SimulationPlan {
     /// The tests, sorted by name.
     pub tests: Vec<PlannedTest>,
     /// Warnings about patterns that match no testcase, or that ask for GUI mode but match
-    /// several.
+    /// several, and about testcases that requests with different run options match.
     pub diagnostics: Vec<Diagnostic>,
 }
 
 impl SimulationPlan {
     /// Matches `requests` against the testcases of `input.discovery`.
     ///
-    /// A testcase matched by several requests runs once, paused if any of them asks for it.
+    /// A testcase matched by several requests runs once, paused if any of them asks for it, and
+    /// with the run options of the first of them over those of its configuration.
     pub fn new(input: &SimulationInput<'_>, requests: &[SimulationRequest]) -> Self {
         let discovery = input.discovery;
         let names: Vec<&str> = discovery
@@ -342,6 +362,7 @@ impl SimulationPlan {
             .collect();
         let library_dirs: Arc<[Utf8PathBuf]> =
             compile::library_dirs(input.project, input.layout).into();
+        let mut request_options = RequestOptions::new(requests);
 
         let tests = resolution
             .entries
@@ -351,6 +372,10 @@ impl SimulationPlan {
                 let testbench = discovery.testbenches.get(run.testbench)?;
                 let configuration = &run.configuration;
                 let sim_options = input.sim_options.overridden_by(&configuration.sim_options);
+                let mut run_options = sim_options.run_options.unwrap_or_default();
+                if let Some(options) = request_options.of(&name) {
+                    overlay_run_options(&mut run_options, options);
+                }
                 let top = configuration.vhdl_configuration_name.clone().map_or_else(
                     || Top::Entity {
                         entity: testbench.entity.clone(),
@@ -380,8 +405,7 @@ impl SimulationPlan {
                     generics: configuration.generics.clone(),
                     fill_output_path,
                     tb_path: configuration.tb_path.clone(),
-                    elab_flags: sim_options.elab_flags.unwrap_or_default(),
-                    sim_flags: sim_options.sim_flags.unwrap_or_default(),
+                    run_options,
                     assert_level: sim_options
                         .vhdl_assert_stop_level
                         .unwrap_or(AssertLevel::Error),
@@ -403,13 +427,59 @@ impl SimulationPlan {
                      {count}; they run without GUI mode"
                 ))
             });
-        let diagnostics = unmatched.chain(ambiguous_gui).collect();
+        let conflicting_options = request_options.conflicts.into_iter().map(|(name, pattern)| {
+            Diagnostic::warning(format!(
+                "requests with different run options match '{name}'; it runs once, with those of \
+                 '{pattern}'"
+            ))
+        });
+        let diagnostics = unmatched
+            .chain(ambiguous_gui)
+            .chain(conflicting_options)
+            .collect();
         Self { tests, diagnostics }
     }
 
     /// The testcase names, sorted.
     pub fn testcases(&self) -> Vec<String> {
         self.tests.iter().map(|test| test.name.clone()).collect()
+    }
+}
+
+/// The run options of the requests of a plan, by testcase.
+struct RequestOptions<'a> {
+    /// The requests, with their compiled patterns.
+    requests: Vec<(&'a SimulationRequest, Pattern)>,
+    /// The testcases that requests with different run options match, with the pattern of the
+    /// first of them, whose options they run with.
+    conflicts: Vec<(String, String)>,
+}
+
+impl<'a> RequestOptions<'a> {
+    fn new(requests: &'a [SimulationRequest]) -> Self {
+        Self {
+            requests: requests
+                .iter()
+                .map(|request| (request, Pattern::new(&request.pattern)))
+                .collect(),
+            conflicts: Vec::new(),
+        }
+    }
+
+    /// Returns the run options of the testcase `name`: those of the first request that matches
+    /// it, if any; records a conflict if a later one has others.
+    fn of(&mut self, name: &str) -> Option<&'a RunOptions> {
+        let mut matching = self
+            .requests
+            .iter()
+            .filter(|(_, pattern)| pattern.matches(name))
+            .map(|&(request, _)| request);
+        let first = matching.next()?;
+        if matching.any(|request| request.options != first.options) {
+            self.conflicts
+                .push((name.to_owned(), first.pattern.clone()));
+        }
+        Some(&first.options)
     }
 }
 
@@ -551,6 +621,8 @@ pub struct SimulationContext {
     pub workspace_root: Utf8PathBuf,
     /// The simulator.
     pub simulator: Simulator,
+    /// The run options of every simulation ([`RuntimeOptions::run_defaults`](crate::RuntimeOptions::run_defaults)).
+    pub run_defaults: Arc<RunOptions>,
     /// Limits the concurrent simulations and their threads; a paused GUI simulation holds its
     /// permit.
     pub limit: SimulationLimit,
@@ -857,7 +929,7 @@ async fn run_test(
     (outcome, diagnostics)
 }
 
-/// Prepares the output directory, runs the simulator with the arguments of `lease`, and reads
+/// Prepares the output directory, runs the simulator with the run options of `lease`, and reads
 /// the results.
 ///
 /// The lease is kept until the simulator exits; a lease that wasn't granted fails the test.
@@ -876,7 +948,12 @@ async fn execute(
         lease.map_err(|error| format!("failed to lease the simulation threads: {error}"))?;
     let seed = test.seed();
     let command = test
-        .command_with(&context.simulator, &seed, &lease.args)
+        .command_with(
+            &context.simulator,
+            &seed,
+            &context.run_defaults,
+            &lease.options,
+        )
         .map_err(|error| error.to_string())?;
     let header = format!("Seed for {}: {seed}\n", test.name);
     tracing::debug!(name = %test.name, ?command, "starting simulation");

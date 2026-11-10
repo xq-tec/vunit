@@ -4,13 +4,13 @@
 
 //! The resources shared by all workspaces of a process.
 //!
-//! They are the detected risim-runner and the analyzer, the limit on concurrent compile
-//! processes, the budget of simulation threads, and the provider of the simulations' leases
-//! ([`crate::threads`]).
+//! They are the detected risim-runner and the analyzer, the run options of every simulation, the
+//! limit on concurrent compile processes, the budget of simulation threads, and the provider of
+//! the simulations' leases ([`crate::threads`]).
 //!
 //! Every workspace of a process should be opened through the same [`Runtime`],
 //! so that the limits apply across workspaces. An operation can lower them for its own
-//! processes with a [`ProcessLimit`] or a [`SimulationLimit`](crate::threads::SimulationLimit).
+//! processes with a [`ProcessLimit`] or a [`SimulationLimit`].
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -26,9 +26,12 @@ use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 
+use crate::simulator::CheckRunOptions;
 use crate::simulator::DetectError;
+use crate::simulator::RunOptions;
 use crate::simulator::Simulator;
 use crate::threads::LeaseProvider;
+use crate::threads::SimulationLimit;
 use crate::threads::ThreadBudget;
 use crate::workspace;
 use crate::workspace::OpenError;
@@ -43,6 +46,16 @@ pub struct RuntimeOptions {
     pub analyzer: Utf8PathBuf,
     /// The risim-runner executable, which simulates (`risim-runner run`).
     pub runner: Utf8PathBuf,
+    /// The run options of every simulation, unless the run options of its configuration set them
+    /// ([`Simulator::simulate_command`]), such as the defaults that the application takes from its
+    /// environment.
+    pub run_defaults: RunOptions,
+    /// Checks the run options of the `[run]` table of `risim-config.toml`, one key at a time;
+    /// an error becomes a configuration diagnostic, and the key is left out
+    /// ([`config::load`](crate::config::load)).
+    ///
+    /// `None` takes them unchecked, for the runner to check.
+    pub check_run_options: Option<CheckRunOptions>,
     /// The simulation threads of all workspaces together; a paused GUI simulation holds its
     /// threads.
     ///
@@ -76,6 +89,8 @@ pub enum RuntimeError {
 #[derive(Debug)]
 struct Inner {
     simulator: Simulator,
+    run_defaults: Arc<RunOptions>,
+    check_run_options: Option<CheckRunOptions>,
     lock_owner: String,
     threads: ThreadBudget,
     max_threads_per_test: NonZeroU32,
@@ -94,7 +109,8 @@ impl Runtime {
     ///
     /// # Errors
     ///
-    /// Fails if risim-runner can't be run or its version can't be determined.
+    /// Fails if risim-runner can't be run, its version can't be determined, or it reads another
+    /// format of run options ([`Simulator::detect`]).
     pub async fn new(options: RuntimeOptions) -> Result<Self, RuntimeError> {
         let simulator = Simulator::detect(&options.runner, &options.analyzer).await?;
         tracing::info!(
@@ -106,6 +122,8 @@ impl Runtime {
         Ok(Self {
             inner: Arc::new(Inner {
                 simulator,
+                run_defaults: Arc::new(options.run_defaults),
+                check_run_options: options.check_run_options,
                 lock_owner: options.lock_owner,
                 threads: options.threads,
                 max_threads_per_test: options.max_threads_per_test,
@@ -120,6 +138,17 @@ impl Runtime {
         &self.inner.simulator
     }
 
+    /// The run options of every simulation ([`RuntimeOptions::run_defaults`]).
+    pub(crate) fn run_defaults(&self) -> &Arc<RunOptions> {
+        &self.inner.run_defaults
+    }
+
+    /// The check of the run options of `risim-config.toml`
+    /// ([`RuntimeOptions::check_run_options`]).
+    pub(crate) fn check_run_options(&self) -> Option<CheckRunOptions> {
+        self.inner.check_run_options
+    }
+
     /// The owner record of the workspace locks ([`RuntimeOptions::lock_owner`]).
     pub(crate) fn lock_owner(&self) -> &str {
         &self.inner.lock_owner
@@ -131,13 +160,21 @@ impl Runtime {
     }
 
     /// The most threads that one simulation takes ([`RuntimeOptions::max_threads_per_test`]).
-    pub(crate) fn max_threads_per_test(&self) -> NonZeroU32 {
+    pub fn max_threads_per_test(&self) -> NonZeroU32 {
         self.inner.max_threads_per_test
     }
 
-    /// Grants the leases of the simulations ([`RuntimeOptions::leases`]).
-    pub(crate) fn leases(&self) -> &Arc<dyn LeaseProvider> {
+    /// Grants the leases of the simulations ([`RuntimeOptions::leases`]), also of a simulation
+    /// that the process runs outside of a workspace.
+    pub fn leases(&self) -> &Arc<dyn LeaseProvider> {
         &self.inner.leases
+    }
+
+    /// The shared limit on the simulations' threads ([`RuntimeOptions::threads`]), for a
+    /// simulation that the process runs outside of a workspace, so that it shares the budget
+    /// with the testcases.
+    pub fn simulation_limit(&self) -> SimulationLimit {
+        SimulationLimit::from(self.inner.threads.clone())
     }
 
     /// Limits the number of concurrent compile processes.

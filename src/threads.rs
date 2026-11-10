@@ -19,7 +19,7 @@
 //! - **Operation:** [`SimulationLimit`] adds the limits of an operation: its number of processes
 //!   (`max_parallel`) and its thread cap, a [`ThreadBudget`] of its own.
 //! - **Leases:** before spawning the simulator, a test asks the [`LeaseProvider`] of the runtime
-//!   for a [`Lease`] of its threads: extra runner arguments, and a guard that is kept until the
+//!   for a [`Lease`] of its threads: run options of the simulator, and a guard that is kept until the
 //!   simulator exits.
 //!   The provider may wait, and reports what the test waits for through [`LeaseEvents`].
 //!   [`NoLeases`] grants empty leases at once.
@@ -44,6 +44,7 @@ use tokio::sync::Semaphore;
 
 use crate::runner::SimulationEvent;
 use crate::runner::SimulationEvents;
+use crate::simulator::RunOptions;
 use crate::sync::lock_unpoisoned;
 
 // -------------------------------------------------------------------------------------------------
@@ -392,18 +393,19 @@ pub trait LeaseProvider: Send + Sync + fmt::Debug {
 
 /// The lease of a simulation.
 pub struct Lease {
-    /// Extra arguments of the simulator.
-    pub args: Vec<String>,
+    /// Run options of the simulator, such as `lease-dir`, which go over the simulation's others
+    /// ([`SimulateArgs::lease_options`](crate::simulator::SimulateArgs::lease_options)).
+    pub options: RunOptions,
     /// Kept until the simulator has exited, or, if the test ends without waiting for that (an
     /// error while waiting, or a dropped task), until it is killed.
     pub guard: Box<dyn Any + Send>,
 }
 
 impl Lease {
-    /// A lease without arguments and without a guard.
+    /// A lease without run options and without a guard.
     pub fn empty() -> Self {
         Self {
-            args: Vec::new(),
+            options: RunOptions::new(),
             guard: Box::new(()),
         }
     }
@@ -412,7 +414,7 @@ impl Lease {
 impl fmt::Debug for Lease {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Lease")
-            .field("args", &self.args)
+            .field("options", &self.options)
             .finish_non_exhaustive()
     }
 }
@@ -441,7 +443,7 @@ pub struct LeaseEvents {
 
 impl LeaseEvents {
     /// The reporter of the test `name`, which sends to `events`.
-    pub(crate) const fn new(name: String, events: SimulationEvents) -> Self {
+    pub const fn new(name: String, events: SimulationEvents) -> Self {
         Self { name, events }
     }
 

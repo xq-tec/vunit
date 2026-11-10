@@ -2,7 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! Compile and simulate operations, and how queued requests merge.
+//! Compile and simulate operations, and how queued requests merge: simulates whose requests
+//! have different run options don't.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -127,13 +128,31 @@ impl Operation {
         }
     }
 
-    /// Merges a later request into this queued one.
+    /// Whether `later` may merge into this queued operation: unless both simulate and not all
+    /// their requests have the same run options, which then run in operations of their own.
+    pub(super) fn merges_with(&self, later: &Self) -> bool {
+        let (
+            Self::Simulate { requests, .. },
+            Self::Simulate {
+                requests: later_requests,
+                ..
+            },
+        ) = (self, later)
+        else {
+            return true;
+        };
+        let mut all = requests.iter().chain(later_requests);
+        all.next()
+            .is_none_or(|first| all.all(|request| request.options == first.options))
+    }
+
+    /// Merges a later request into this queued one, if it [`merges_with`](Self::merges_with) it.
     ///
     /// Two compiles stay a compile; anything with a simulate becomes a simulate.
     /// Tags and requests are united, keeping the order they were first requested in; requests
-    /// with the same pattern merge into one that runs paused if either does. The merged
-    /// operation has the smallest process and thread limits of the two, so that it keeps the
-    /// promise of either request.
+    /// with the same pattern and run options merge into one that runs paused if either does.
+    /// The merged operation has the smallest process and thread limits of the two, so that it
+    /// keeps the promise of either request.
     #[must_use]
     pub(super) fn merge(self, later: Self) -> Self {
         let (simulation, mut merged_tags, max_parallel) = self.into_parts();
@@ -175,16 +194,15 @@ fn min_limit<T: Ord>(limit: Option<T>, other: Option<T>) -> Option<T> {
     }
 }
 
-/// Appends `later` to `requests`, merging requests with the same pattern.
+/// Appends `later` to `requests`, merging requests with the same pattern and run options.
 fn merge_requests(
     mut requests: Vec<SimulationRequest>,
     later: Vec<SimulationRequest>,
 ) -> Vec<SimulationRequest> {
     for request in later {
-        match requests
-            .iter_mut()
-            .find(|existing| existing.pattern == request.pattern)
-        {
+        match requests.iter_mut().find(|existing| {
+            existing.pattern == request.pattern && existing.options == request.options
+        }) {
             Some(existing) => existing.gui |= request.gui,
             None => requests.push(request),
         }
@@ -195,6 +213,7 @@ fn merge_requests(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::simulator::RunOptions;
 
     #[expect(clippy::unnecessary_wraps, reason = "requests take optional tags")]
     fn tag(name: &str) -> Option<RequestTag> {
@@ -214,8 +233,70 @@ mod tests {
             .map(|&(pattern, gui)| SimulationRequest {
                 pattern: pattern.to_owned(),
                 gui,
+                options: RunOptions::new(),
             })
             .collect()
+    }
+
+    /// The requests `entries` with the run options `{"opt-level": level}`.
+    fn requests_at(level: &str, entries: &[(&str, bool)]) -> Vec<SimulationRequest> {
+        let options = RunOptions::from_iter([("opt-level".to_owned(), level.into())]);
+        requests(entries)
+            .into_iter()
+            .map(|request| SimulationRequest {
+                options: options.clone(),
+                ..request
+            })
+            .collect()
+    }
+
+    #[test]
+    fn simulates_with_different_options_dont_merge() {
+        let simulate = |requests| Operation::simulate(requests, tag("s"), None, None);
+        let off = simulate(requests_at("off", &[("a", false)]));
+        let full = simulate(requests_at("full", &[("b", false)]));
+        let default = simulate(requests(&[("c", false)]));
+        assert!(!off.merges_with(&full));
+        assert!(!off.merges_with(&default));
+        assert!(off.merges_with(&simulate(requests_at("off", &[("b", true)]))));
+        assert!(default.merges_with(&simulate(requests(&[("a", false)]))));
+        // A simulate without requests has no run options to keep apart.
+        assert!(simulate(Vec::new()).merges_with(&full));
+        // Compiles merge with anything.
+        assert!(off.merges_with(&Operation::compile(tag("c"), None)));
+        assert!(Operation::compile(tag("c"), None).merges_with(&off));
+        // An operation whose requests have different options merges with no other simulate.
+        let mixed = simulate(
+            requests_at("off", &[("a", false)])
+                .into_iter()
+                .chain(requests_at("full", &[("a", true)]))
+                .collect(),
+        );
+        assert!(!mixed.merges_with(&off));
+    }
+
+    #[test]
+    fn requests_with_the_same_pattern_but_other_options_stay_apart() {
+        let merged = Operation::simulate(
+            requests_at("off", &[("a", false)])
+                .into_iter()
+                .chain(requests_at("full", &[("a", true)]))
+                .chain(requests_at("off", &[("a", true)]))
+                .collect(),
+            None,
+            None,
+            None,
+        );
+        let Operation::Simulate { requests, .. } = merged else {
+            panic!("not a simulate");
+        };
+        assert_eq!(
+            requests,
+            requests_at("off", &[("a", true)])
+                .into_iter()
+                .chain(requests_at("full", &[("a", true)]))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -50,6 +50,7 @@ use risim_vunit_frontend::runner::SimulationPlan;
 use risim_vunit_frontend::runner::SimulationReport;
 use risim_vunit_frontend::runner::SimulationRequest;
 use risim_vunit_frontend::runtime::ProcessLimit;
+use risim_vunit_frontend::simulator::RunOptions;
 use risim_vunit_frontend::simulator::Simulator;
 use risim_vunit_frontend::sources;
 use risim_vunit_frontend::sources::SourceCache;
@@ -72,6 +73,7 @@ use risim_vunit_frontend::threads::SimulationLimit;
 use risim_vunit_frontend::threads::ThreadBudget;
 use risim_vunit_frontend::threads::ThreadState;
 use risim_vunit_frontend::threads::WaitReason;
+use serde_json::Value;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -167,6 +169,10 @@ fn main() -> ExitCode {
         trial(
             "simulation_spawn_failure_fails_the_test",
             simulation_spawn_failure_fails_the_test,
+        ),
+        trial(
+            "run_options_that_set_a_simulation_key_fail_the_test",
+            run_options_that_set_a_simulation_key_fail_the_test,
         ),
         trial("real_risim_compiles_uart", real_risim_compiles_uart).with_ignored_flag(
             env::var_os("RISIM_RUNNER").is_none() || env::var_os("RISIM_ANALYZER").is_none(),
@@ -417,6 +423,7 @@ impl Workspace {
             .map(|&(pattern, gui)| SimulationRequest {
                 pattern: pattern.to_owned(),
                 gui,
+                ..SimulationRequest::default()
             })
             .collect();
         let plan = SimulationPlan::new(
@@ -447,6 +454,7 @@ impl Workspace {
         let context = SimulationContext {
             workspace_root: self.root.clone(),
             simulator: self.simulator.clone(),
+            run_defaults: Arc::default(),
             limit: SimulationLimit::from(self.threads.clone()),
             max_threads_per_test: self.max_threads_per_test,
             leases: Arc::clone(&self.leases),
@@ -497,6 +505,14 @@ impl Workspace {
 /// A thread count.
 const fn threads(count: u32) -> NonZeroU32 {
     NonZeroU32::new(count).expect("non-zero")
+}
+
+/// The run options of the last simulation of `testcase` by the fake simulator, from its
+/// `options.json`.
+fn run_options(layout: &OutputLayout, testcase: &str) -> Value {
+    let paths = TestOutputPaths::new(layout, testcase);
+    let options = fs::read_to_string(paths.dir.join("options.json")).expect("read options.json");
+    serde_json::from_str(&options).expect("the run options")
 }
 
 fn testbench(name: &str, body: &str) -> String {
@@ -1114,33 +1130,35 @@ async fn simulates_and_records_results() {
         "test_start:fail, really\n"
     );
 
-    // The command line: `runner_cfg`, the filled `output_path` generic, and GUI mode.
-    let args = |testcase: &str| {
-        let paths = TestOutputPaths::new(&workspace.layout, testcase);
-        fs::read_to_string(paths.dir.join("args.txt")).expect("args.txt")
-    };
-    let pass_args = args("lib.tb_tests.pass");
+    // The run options: `runner_cfg`, the filled `output_path` generic, and GUI mode.
+    let options = |testcase: &str| run_options(&workspace.layout, testcase);
+    let generics = |run_options: &Value| run_options["generics"].to_string();
+    let pass_options = options("lib.tb_tests.pass");
+    let pass_generics = generics(&pass_options);
     let pass_dir = TestOutputPaths::new(&workspace.layout, "lib.tb_tests.pass").dir;
     assert!(
-        pass_args.contains(&format!("--generic=output_path={pass_dir}/")),
-        "{pass_args}"
+        pass_generics.contains(&format!("\"output_path={pass_dir}/\"")),
+        "{pass_generics}"
     );
     assert!(
-        pass_args.contains("enabled_test_cases : pass,"),
-        "{pass_args}"
+        pass_generics.contains("enabled_test_cases : pass,"),
+        "{pass_generics}"
     );
-    assert!(pass_args.contains("seed : 0123456789abcdef"), "{pass_args}");
     assert!(
-        pass_args.contains("--name=lib.tb_tests.pass"),
-        "{pass_args}"
+        pass_generics.contains("seed : 0123456789abcdef"),
+        "{pass_generics}"
     );
-    assert!(!pass_args.contains("--paused"), "{pass_args}");
-    assert!(args("lib.tb_tests.fail, really").contains("enabled_test_cases : fail,,,, really,"));
-    let implicit_args = args("lib.tb_implicit.all");
-    assert!(implicit_args.contains("--paused"), "{implicit_args}");
+    assert_eq!(pass_options["name"], "lib.tb_tests.pass");
+    assert_eq!(pass_options["paused"], false);
     assert!(
-        implicit_args.contains("enabled_test_cases : ,"),
-        "{implicit_args}"
+        generics(&options("lib.tb_tests.fail, really"))
+            .contains("enabled_test_cases : fail,,,, really,")
+    );
+    let implicit_options = options("lib.tb_implicit.all");
+    assert_eq!(implicit_options["paused"], true);
+    assert!(
+        generics(&implicit_options).contains("enabled_test_cases : ,"),
+        "{implicit_options}"
     );
 
     // The results are persisted.
@@ -1208,7 +1226,7 @@ async fn semaphore_limits_simulations() {
     assert_eq!(max_running, 2);
 }
 
-/// Grants leases with the simulator argument `--lease=<threads>`, or fails them with `fail`,
+/// Grants leases with the run option `{"lease": <threads>}`, or fails them with `fail`,
 /// records the threads of every test, and reports them as running.
 #[derive(Debug, Default)]
 struct RecordingLeases {
@@ -1239,7 +1257,7 @@ impl LeaseProvider for RecordingLeases {
         let lease = match &self.fail {
             Some(message) => Err(message.clone()),
             None => Ok(Lease {
-                args: vec![format!("--lease={threads}")],
+                options: RunOptions::from_iter([("lease".to_owned(), threads.into())]),
                 guard: Box::new(()),
             }),
         };
@@ -1266,7 +1284,7 @@ fn many_tests_project(workspace: &mut Workspace, count: usize) {
 }
 
 /// The tests of an operation share the free threads, if they can use them: 5 tests on 10
-/// threads get 2 each, which their leases get, and the simulator its arguments.
+/// threads get 2 each, which their leases get, and the simulator their run options.
 async fn tests_share_the_threads() {
     let mut workspace = Workspace::new().await;
     workspace.threads = ThreadBudget::new(threads(10));
@@ -1292,9 +1310,8 @@ async fn tests_share_the_threads() {
             .all(|(_, state)| **state == ThreadState::Running { threads: 2 }),
         "{states:?}"
     );
-    let paths = TestOutputPaths::new(&workspace.layout, "lib.tb_many.t0");
-    let args = fs::read_to_string(paths.dir.join("args.txt")).expect("args.txt");
-    assert!(args.lines().any(|arg| arg == "--lease=2"), "{args}");
+    let options = run_options(&workspace.layout, "lib.tb_many.t0");
+    assert_eq!(options["lease"], 2, "{options}");
 }
 
 /// 100 tests on 10 threads get one each while more tests wait than there are threads; at most
@@ -1573,6 +1590,25 @@ async fn simulation_spawn_failure_fails_the_test() {
             .iter()
             .any(|event| matches!(event, SimulationEvent::Diagnostic { .. }))
     );
+}
+
+/// Run options of the configuration that set a key of the simulation fail the test with the
+/// error of its command line, and nothing runs.
+async fn run_options_that_set_a_simulation_key_fail_the_test() {
+    let mut workspace = Workspace::new().await;
+    simulation_project(&mut workspace);
+    workspace.spec.sim_options.run_options =
+        Some(RunOptions::from_iter([("paused".to_owned(), true.into())]));
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    let run = workspace.simulate(&[("*.pass", false)], &results).await;
+    assert_eq!(run.outcomes(), [("lib.tb_tests.pass", TestOutcome::Failed)]);
+    let message = &run.report.diagnostics[0].message;
+    let expected = "the run options can't set `paused`, which every simulation sets itself";
+    assert!(message.ends_with(expected), "{message}");
+    let paths = TestOutputPaths::new(&workspace.layout, "lib.tb_tests.pass");
+    let output = fs::read_to_string(&paths.output_file).expect("output.txt");
+    assert!(output.contains(expected), "{output}");
+    assert!(workspace.take_log().is_empty());
 }
 
 /// Compiles the UART example of VUnit (`tests/operations/uart`) with the real analyzer and
