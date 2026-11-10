@@ -179,9 +179,10 @@ struct RawVunit {
 /// The `[run]` table.
 #[derive(Default, Deserialize)]
 struct RawRun {
-    /// The optimization preset, the run option `opt-level`.
+    /// The optimization preset, the run option `opt-level`: a name, or the number of one; any
+    /// value, so that another type is an error at the value.
     #[serde(rename = "opt-level")]
-    opt_level: Option<Spanned<String>>,
+    opt_level: Option<Spanned<toml::Value>>,
     /// The modes of rows and groups, the run options `opt.<name>`; any value, so that a table
     /// gets the error that names the quoted form.
     #[serde(default)]
@@ -364,13 +365,27 @@ impl Parser<'_> {
         };
         if let Some(level) = run.opt_level {
             let span = level.span();
-            self.run_option(
-                "opt-level".to_owned(),
-                level.into_inner(),
-                "'opt-level' in [run]",
-                Some(span),
-                run_options,
-            );
+            let level = match level.into_inner() {
+                toml::Value::String(level) => Some(level),
+                // `-O 2` is a preset too.
+                toml::Value::Integer(level) => Some(level.to_string()),
+                other => {
+                    let message = format!(
+                        "'opt-level' in [run] is a preset, such as \"full\" or 2, not {other}"
+                    );
+                    self.diagnostic(Severity::Error, message, Some(span.clone()));
+                    None
+                },
+            };
+            if let Some(level) = level {
+                self.run_option(
+                    "opt-level".to_owned(),
+                    level,
+                    "'opt-level' in [run]",
+                    Some(span),
+                    run_options,
+                );
+            }
         }
         // In file order; the map sorts them by name.
         let mut settings: Vec<_> = run
@@ -806,6 +821,37 @@ wake-guards = "off"
                 ("opt.wake-guards".to_owned(), "off".into()),
                 ("opt.mir.cse".to_owned(), "on".into()),
             ]))
+        );
+    }
+
+    /// An integer `opt-level` is the preset of that number, as with `-O 2`; another type is an
+    /// error at the value, and the other keys still count.
+    #[test]
+    fn run_table_takes_an_integer_level() {
+        let integer = parse_str("[run]\nopt-level = 2\n");
+        assert_eq!(messages(&integer), []);
+        assert_eq!(
+            integer.spec.unwrap().sim_options.run_options,
+            Some(RunOptions::from_iter([(
+                "opt-level".to_owned(),
+                "2".into()
+            )]))
+        );
+        let boolean = parse_str("[run]\nopt-level = true\n[run.opt]\nwake-guards = \"off\"\n");
+        assert_eq!(
+            messages(&boolean),
+            [(
+                Severity::Error,
+                "'opt-level' in [run] is a preset, such as \"full\" or 2, not true",
+                Some(Position::new(2, 13)),
+            )]
+        );
+        assert_eq!(
+            boolean.spec.unwrap().sim_options.run_options,
+            Some(RunOptions::from_iter([(
+                "opt.wake-guards".to_owned(),
+                "off".into()
+            )]))
         );
     }
 
