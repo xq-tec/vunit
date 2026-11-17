@@ -33,8 +33,10 @@ use std::io::Read as _;
 use std::io::Seek as _;
 use std::io::Write;
 use std::process;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -42,6 +44,7 @@ use std::time::SystemTime;
 
 use camino::Utf8Path;
 use camino::Utf8PathBuf;
+use same_file::Handle;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -52,18 +55,62 @@ use crate::simulator::SimulatorIdentity;
 pub use crate::sources::OUTPUT_DIR;
 use crate::sync::lock_unpoisoned;
 
-/// The paths inside `risim-out/`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The paths inside `risim-out/`, and whether the state files may be written there.
+///
+/// Clones share whether the layout is [detached](Self::detach).
+/// Layouts are equal if their paths are.
+#[derive(Debug, Clone)]
 pub struct OutputLayout {
     root: Utf8PathBuf,
+    detached: Arc<AtomicBool>,
 }
+
+impl PartialEq for OutputLayout {
+    fn eq(&self, other: &Self) -> bool {
+        self.root == other.root
+    }
+}
+
+impl Eq for OutputLayout {}
 
 impl OutputLayout {
     /// The layout of `<workspace_root>/risim-out`.
     pub fn new(workspace_root: &Utf8Path) -> Self {
         Self {
             root: workspace_root.join(OUTPUT_DIR),
+            detached: Arc::default(),
         }
+    }
+
+    /// Stops the saving of the state files, for a `risim-out/` that the workspace lost.
+    ///
+    /// Operations that end after the directory was deleted or replaced would write their state
+    /// into a directory that is being deleted, that they recreate, or that another process
+    /// owns.
+    /// [`CompileState::save`], the saves of [`ResultStore`] and of the parse cache then do
+    /// nothing (see [`is_writable`](Self::is_writable)).
+    pub fn detach(&self) {
+        self.detached.store(true, Ordering::Release);
+    }
+
+    /// Lets the state be saved again, once `risim-out/` is locked again.
+    pub fn attach(&self) {
+        self.detached.store(false, Ordering::Release);
+    }
+
+    /// Whether the layout is [detached](Self::detach).
+    pub fn is_detached(&self) -> bool {
+        self.detached.load(Ordering::Acquire)
+    }
+
+    /// Whether the state files may be written: the layout isn't detached, and `risim-out/`
+    /// exists.
+    ///
+    /// Only [`OutputLock::acquire`] creates `risim-out/`.
+    /// A missing one was deleted while the workspace was open, maybe with the whole workspace,
+    /// and writing would create it again before the workspace noticed.
+    pub fn is_writable(&self) -> bool {
+        !self.is_detached() && self.root.is_dir()
     }
 
     /// `risim-out/` itself.
@@ -285,14 +332,16 @@ pub fn write_json<T: Serialize>(path: &Utf8Path, version: u32, value: &T) -> io:
 /// Distinguishes the temporary files of concurrent writes in this process.
 static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Writes `contents` to `path` atomically, creating the parent directory.
+/// Writes `contents` to `path` atomically.
+///
+/// The parent directory must exist: a write never creates `risim-out/` again after it was
+/// deleted (see [`OutputLayout::is_writable`]).
 ///
 /// # Errors
 ///
-/// Fails if the file can't be written.
+/// Fails if the file can't be written, also if the parent directory is missing.
 pub fn write_atomic(path: &Utf8Path, contents: &[u8]) -> io::Result<()> {
     let parent = path.parent().unwrap_or_else(|| Utf8Path::new("."));
-    fs::create_dir_all(parent)?;
     let file_name = path.file_name().unwrap_or("file");
     let temp = parent.join(format!(
         ".{file_name}.tmp-{}-{}",
@@ -388,6 +437,8 @@ pub enum LockError {
 /// [`release`](Self::release). Dropping the lock without releasing it leaves the PID behind, so
 /// the next owner knows that the previous one crashed. The file is never deleted: deleting it
 /// would let a process lock the deleted file while another locks a new one.
+/// Someone else may still delete it, or `risim-out/` with it; [`is_current`](Self::is_current)
+/// tells, and [`abandon`](Self::abandon) unlocks such a lock without touching the files.
 ///
 /// The owner also writes its record, an opaque text from [`RuntimeOptions::lock_owner`], to
 /// `owner.json` after locking, and removes it on release; a process that finds the lock held
@@ -415,6 +466,9 @@ pub enum PreviousOwner {
     /// The previous owner crashed while compiling (see [`CompileState::compiling`]): the
     /// compile state and the libraries have been deleted.
     CrashedWhileCompiling,
+    /// The lock file was missing, but the compile state wasn't: it was written without the
+    /// lock, after the lock file was deleted, and has been deleted with the libraries.
+    Unlocked,
 }
 
 impl OutputLock {
@@ -424,6 +478,10 @@ impl OutputLock {
     /// libraries are deleted, so everything is recompiled. Otherwise the compile state was
     /// saved after the last compile and matches the libraries. The parse cache and the test
     /// results are always kept: the cache entries are validated against the files.
+    ///
+    /// Owners never delete the lock file.
+    /// A compile state without a lock file was written by an owner that had lost the lock to a
+    /// deletion, and is deleted with the libraries too.
     ///
     /// # Errors
     ///
@@ -435,6 +493,11 @@ impl OutputLock {
             source,
         };
         fs::create_dir_all(layout.root()).map_err(io_error)?;
+        let unlocked = match fs::symlink_metadata(&path) {
+            Ok(_) => false,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => layout.state_file().exists(),
+            Err(error) => return Err(io_error(error)),
+        };
         let mut file = File::options()
             .read(true)
             .write(true)
@@ -462,7 +525,16 @@ impl OutputLock {
         let _length = file.read_to_end(&mut previous_owner).map_err(io_error)?;
         let pid = String::from_utf8_lossy(&previous_owner);
         let pid = pid.trim();
-        let previous = if previous_owner.is_empty() {
+        let previous = if unlocked {
+            tracing::warn!(
+                %path,
+                "a compile state without a lock file; discarding the compile state"
+            );
+            for stale in [layout.state_file(), layout.libraries_dir()] {
+                remove_path(&stale).map_err(io_error)?;
+            }
+            PreviousOwner::Unlocked
+        } else if previous_owner.is_empty() {
             PreviousOwner::Released
         } else if CompileState::load(layout).compiling {
             tracing::warn!(
@@ -517,6 +589,51 @@ impl OutputLock {
         }
         if let Err(error) = file.unlock() {
             tracing::warn!(%path, %error, "failed to unlock");
+        }
+    }
+
+    /// Whether the lock file at its path is still the locked file.
+    ///
+    /// It isn't once the lock file, or `risim-out/` with it, was deleted, renamed or replaced:
+    /// then the lock keeps nobody out, and the files it guarded may be gone.
+    ///
+    /// An error other than a missing or inaccessible file, such as too many open files, counts
+    /// as current: the next check tries again.
+    pub fn is_current(&self) -> bool {
+        // A duplicate handle shares the lock; closing it doesn't release the lock.
+        let locked = match self.file.try_clone().and_then(Handle::from_file) {
+            Ok(locked) => locked,
+            Err(error) => {
+                tracing::debug!(path = %self.path, %error, "failed to check the lock");
+                return true;
+            },
+        };
+        match Handle::from_path(&self.path) {
+            Ok(at_path) => at_path == locked,
+            // Windows denies opening a file that is deleted while a handle is open.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound
+                        | io::ErrorKind::NotADirectory
+                        | io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                false
+            },
+            Err(error) => {
+                tracing::debug!(path = %self.path, %error, "failed to check the lock");
+                true
+            },
+        }
+    }
+
+    /// Unlocks a lock that is no longer [current](Self::is_current), leaving the files alone.
+    ///
+    /// The lock file and the owner record at the paths, if any, may be another owner's.
+    pub fn abandon(self) {
+        if let Err(error) = self.file.unlock() {
+            tracing::debug!(path = %self.path, %error, "failed to unlock the abandoned lock");
         }
     }
 }
@@ -625,12 +742,15 @@ impl CompileState {
         read_json(&layout.state_file(), STATE_VERSION).unwrap_or_default()
     }
 
-    /// Writes `state.json`.
+    /// Writes `state.json`, if `layout` [is writable](OutputLayout::is_writable).
     ///
     /// # Errors
     ///
     /// Fails if the file can't be written.
     pub fn save(&self, layout: &OutputLayout) -> io::Result<()> {
+        if !layout.is_writable() {
+            return Ok(());
+        }
         write_json(&layout.state_file(), STATE_VERSION, self)
     }
 
@@ -763,12 +883,15 @@ impl TestResults {
         read_json(&layout.results_file(), RESULTS_VERSION).unwrap_or_default()
     }
 
-    /// Writes `results.json`.
+    /// Writes `results.json`, if `layout` [is writable](OutputLayout::is_writable).
     ///
     /// # Errors
     ///
     /// Fails if the file can't be written.
     pub fn save(&self, layout: &OutputLayout) -> io::Result<()> {
+        if !layout.is_writable() {
+            return Ok(());
+        }
         write_json(&layout.results_file(), RESULTS_VERSION, self)
     }
 }
@@ -861,6 +984,12 @@ mod tests {
         let temp = TempRoot::new();
         let path = temp.root.join("sub/data.json");
         let data = Data { items: vec![1, 2] };
+        // The directory must exist.
+        assert_eq!(
+            write_json(&path, 3, &data).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        fs::create_dir_all(temp.root.join("sub")).unwrap();
         write_json(&path, 3, &data).unwrap();
         let text = fs::read_to_string(&path).unwrap();
         assert_eq!(text, r#"{"version":3,"items":[1,2]}"#);
@@ -957,6 +1086,7 @@ mod tests {
     fn result_store_saves_every_change() {
         let temp = TempRoot::new();
         let layout = OutputLayout::new(&temp.root);
+        fs::create_dir_all(layout.root()).unwrap();
         let store = ResultStore::load(&layout);
         assert!(store.snapshot().is_empty());
         store
@@ -991,6 +1121,7 @@ mod tests {
     fn result_store_keeps_the_duration_of_the_last_completed_run() {
         let temp = TempRoot::new();
         let layout = OutputLayout::new(&temp.root);
+        fs::create_dir_all(layout.root()).unwrap();
         let store = ResultStore::load(&layout);
         store
             .record("lib.tb.a", result(TestOutcome::Cancelled))
@@ -1063,6 +1194,95 @@ mod tests {
     }
 
     #[test]
+    fn lock_tells_whether_its_file_is_still_there() {
+        let temp = TempRoot::new();
+        let layout = OutputLayout::new(&temp.root);
+        let (lock, _) = OutputLock::acquire(&layout, OWNER).unwrap();
+        assert!(lock.is_current());
+
+        // Deleted with `risim-out/`: the lock keeps nobody out.
+        fs::remove_dir_all(layout.root()).unwrap();
+        assert!(!lock.is_current());
+        let (other, _) = OutputLock::acquire(&layout, "other").unwrap();
+        assert!(!lock.is_current());
+        assert!(other.is_current());
+        // Abandoning leaves the files of the new owner alone.
+        lock.abandon();
+        assert_eq!(fs::read_to_string(layout.owner_file()).unwrap(), "other");
+        assert!(matches!(
+            OutputLock::acquire(&layout, OWNER),
+            Err(LockError::Locked { .. })
+        ));
+        other.release();
+
+        // Replaced by another file.
+        let (replaced, _) = OutputLock::acquire(&layout, OWNER).unwrap();
+        let replacement = layout.root().join("replacement");
+        fs::write(&replacement, "").unwrap();
+        fs::rename(&replacement, layout.lock_file()).unwrap();
+        assert!(!replaced.is_current());
+        replaced.abandon();
+    }
+
+    #[test]
+    fn lock_discards_a_compile_state_written_without_it() {
+        let temp = TempRoot::new();
+        let layout = OutputLayout::new(&temp.root);
+        fs::create_dir_all(layout.root()).unwrap();
+        CompileState::default().save(&layout).unwrap();
+        let archive = temp.write("risim-out/libraries/lib/lib.hlib", "");
+        let results = temp.write("risim-out/results.json", "{}");
+
+        let (unlocked, previous) = OutputLock::acquire(&layout, OWNER).unwrap();
+        assert_eq!(previous, PreviousOwner::Unlocked);
+        assert!(!layout.state_file().exists());
+        assert!(!archive.exists());
+        assert!(results.exists());
+        unlocked.release();
+        // A released lock file stays, so the state that the owner saved is kept.
+        CompileState::default().save(&layout).unwrap();
+        let (released, after_release) = OutputLock::acquire(&layout, OWNER).unwrap();
+        assert_eq!(after_release, PreviousOwner::Released);
+        assert!(layout.state_file().exists());
+        released.release();
+    }
+
+    #[test]
+    fn state_files_are_written_only_into_a_held_directory() {
+        let temp = TempRoot::new();
+        let layout = OutputLayout::new(&temp.root);
+        let results = ResultStore::load(&layout);
+        let result = TestResult {
+            outcome: TestOutcome::Passed,
+            started_at: Timestamp(1),
+            finished_at: Timestamp(2),
+            output_path: "output.txt".into(),
+            duration_ms: Some(1),
+        };
+
+        // `risim-out/` is missing: nothing creates it.
+        assert!(!layout.is_writable());
+        CompileState::default().save(&layout).unwrap();
+        results.record("lib.tb.test", result.clone()).unwrap();
+        assert!(!layout.root().exists());
+        assert_eq!(results.snapshot().len(), 1);
+
+        // Detached: nothing is written into the existing directory either.
+        fs::create_dir_all(layout.root()).unwrap();
+        let clone = layout.clone();
+        clone.detach();
+        assert!(layout.is_detached() && !layout.is_writable());
+        CompileState::default().save(&layout).unwrap();
+        results.record("lib.tb.other", result).unwrap();
+        assert_eq!(fs::read_dir(layout.root()).unwrap().count(), 0);
+
+        layout.attach();
+        assert!(clone.is_writable());
+        CompileState::default().save(&layout).unwrap();
+        assert!(layout.state_file().is_file());
+    }
+
+    #[test]
     fn lock_excludes_and_detects_crashes() {
         let temp = TempRoot::new();
         let layout = OutputLayout::new(&temp.root);
@@ -1115,6 +1335,7 @@ mod tests {
     fn compile_state_round_trip() {
         let temp = TempRoot::new();
         let layout = OutputLayout::new(&temp.root);
+        fs::create_dir_all(layout.root()).unwrap();
         let mut state = CompileState {
             simulator: Some(simulator_identity("1")),
             ..CompileState::default()

@@ -106,6 +106,7 @@ while let Some(event) = receiver.recv().await {
 
 Everything a workspace generates goes to `<root>/risim-out/`: the extracted VUnit and OSVVM sources, compiled libraries, compile and test output, and the JSON state files.
 A lock file keeps other processes from using the same directory at the same time, and `owner.json` names the process that holds it (`RuntimeOptions::lock_owner`).
+A workspace whose `risim-out/` is deleted or replaced while it is open cancels its running operations and writes nothing more to it; its next operation locks the directory again and compiles everything (the `workspace` module documents the details).
 
 Simulations share a budget of threads (`RuntimeOptions::threads`, resizable), and a simulate request can cap its own threads.
 Each simulation takes a share of the free threads, up to the threads that it can use (`RuntimeOptions::max_threads_per_test`), and asks the `LeaseProvider` of the runtime for a lease of them, whose run options go over the run options of the configuration and the defaults, but not over the keys that every simulation sets; a test waiting for threads reports it as `TestThreads`.

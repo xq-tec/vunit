@@ -210,19 +210,33 @@ fn file(rel_path: &str) -> Option<&'static BuiltinFile> {
     BUILTIN_FILES.iter().find(|file| file.rel_path == rel_path)
 }
 
-/// Writes the builtin files to `builtins_root/<hash>/` unless that directory exists, and
-/// deletes other entries of `builtins_root`.
+/// Whether `dir` has every builtin file.
+///
+/// Extracting never leaves an incomplete directory, but a deletion that was interrupted can.
+pub fn is_complete(dir: &Utf8Path) -> bool {
+    BUILTIN_FILES
+        .iter()
+        .all(|file| dir.join(file.rel_path).is_file())
+}
+
+/// Writes the builtin files to `builtins_root/<hash>/` unless that directory is
+/// [complete](is_complete), and deletes other entries of `builtins_root`.
 ///
 /// Returns the directory with the files.
 ///
 /// The files are written to a temporary directory first and then renamed, so a crash never
 /// leaves an incomplete directory behind.
+/// An incomplete directory is deleted first.
 ///
 /// # Errors
 ///
 /// Fails if the files can't be written. Failures to delete old directories are only logged.
 pub fn extract(builtins_root: &Utf8Path) -> io::Result<Utf8PathBuf> {
     let target = builtins_root.join(BUILTINS_HASH);
+    if target.is_dir() && !is_complete(&target) {
+        tracing::warn!(path = %target, "the builtins are incomplete; extracting them again");
+        fs::remove_dir_all(&target)?;
+    }
     if !target.is_dir() {
         let temp = builtins_root.join(format!(".tmp-{BUILTINS_HASH}-{}", process::id()));
         if temp.exists() {
@@ -412,5 +426,12 @@ mod tests {
         assert_eq!(extract(&root).unwrap(), target);
         assert_eq!(fs::read_to_string(&check).unwrap(), "changed");
         assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+
+        // An incomplete one, left by an interrupted deletion, is extracted again.
+        fs::remove_dir_all(target.join("vhdl/check")).unwrap();
+        assert!(!is_complete(&target));
+        assert_eq!(extract(&root).unwrap(), target);
+        assert!(is_complete(&target));
+        assert_ne!(fs::read_to_string(&check).unwrap(), "changed");
     }
 }

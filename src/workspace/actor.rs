@@ -14,6 +14,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
+use std::io;
 use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 
 use camino::Utf8Path;
+use camino::Utf8PathBuf;
 use rustc_hash::FxHashMap;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
@@ -29,7 +31,9 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use super::OpenError;
 use super::Opened;
+use super::Reopened;
 use super::RequestTag;
 use super::Snapshot;
 use super::WorkspaceEvent;
@@ -38,6 +42,8 @@ use super::loader::Loaded;
 use super::loader::Loader;
 use super::loader::Model;
 use super::operation::Operation;
+use super::reopen_output;
+use crate::builtins;
 use crate::compile;
 use crate::compile::CompileContext;
 use crate::compile::CompileEvent;
@@ -47,6 +53,7 @@ use crate::compile::FileStatus;
 use crate::compile::PlanInput;
 use crate::diagnostics::Diagnostic;
 use crate::diagnostics::DiagnosticSource;
+use crate::diagnostics::error_chain;
 use crate::discovery::Testcase;
 use crate::runner;
 use crate::runner::SimulationContext;
@@ -70,7 +77,10 @@ use crate::threads::ThreadBudget;
 use crate::watch::Change;
 use crate::watch::Debouncer;
 use crate::watch::DirectoryWatcher;
+use crate::watch::OUTPUT_QUIET;
 use crate::watch::classify;
+use crate::watch::may_remove_output;
+use crate::watch::removes_from_output;
 
 /// A request from a [`Workspace`](super::Workspace) handle.
 #[derive(Debug)]
@@ -136,6 +146,22 @@ struct Closing {
     replies: Vec<oneshot::Sender<()>>,
 }
 
+/// How [`Actor::reopen_output`] ended.
+#[derive(Debug)]
+enum Reopen {
+    /// `risim-out/` is open again.
+    Done,
+    /// It couldn't be set up; an output diagnostic says why.
+    Failed,
+    /// Another process holds its lock.
+    Taken {
+        /// The lock file.
+        lock: Utf8PathBuf,
+        /// The owner record of that process, if it wrote one.
+        owner: Option<String>,
+    },
+}
+
 pub(super) struct Actor {
     root: Arc<Utf8Path>,
     layout: OutputLayout,
@@ -147,7 +173,19 @@ pub(super) struct Actor {
     internal_sender: mpsc::UnboundedSender<Internal>,
     internal: mpsc::UnboundedReceiver<Internal>,
 
+    /// `None` if `risim-out/` couldn't be locked again after it was lost.
     lock: Option<OutputLock>,
+    /// `risim-out/` was deleted or replaced; the next operation opens it again.
+    output_lost: bool,
+    /// Running operations were cancelled because `risim-out/` was lost.
+    output_cancelled: bool,
+    /// The builtins are missing from `risim-out/`; the next operation extracts them.
+    builtins_missing: bool,
+    /// When `risim-out/` will have been quiet for [`OUTPUT_QUIET`] after an event that may have
+    /// removed it; no operation repairs it before.
+    output_quiet_at: Option<Instant>,
+    /// The first queued operation waits to repair `risim-out/` (see [`Self::start`]).
+    deferred: bool,
     loader: Arc<Mutex<Loader>>,
     model: Option<Arc<Model>>,
     testcases: Vec<Testcase>,
@@ -178,6 +216,9 @@ pub(super) struct Actor {
     /// The planning errors and warnings of the last compile; part of the project set.
     plan_diagnostics: Vec<Diagnostic>,
     watcher_diagnostics: Vec<Diagnostic>,
+    /// Why `risim-out/` can't be opened again, or the builtins can't be extracted; part of the
+    /// project set.
+    output_diagnostics: Vec<Diagnostic>,
     compile_diagnostics: BTreeMap<FileKey, Vec<Diagnostic>>,
     /// Per testcase; `None` holds the problems with the patterns of the last simulation.
     simulation_diagnostics: BTreeMap<Option<String>, Vec<Diagnostic>>,
@@ -237,6 +278,11 @@ impl Actor {
             internal_sender,
             internal,
             lock: Some(lock),
+            output_lost: false,
+            output_cancelled: false,
+            builtins_missing: false,
+            output_quiet_at: None,
+            deferred: false,
             loader: Arc::new(Mutex::new(loader)),
             model: None,
             testcases: Vec::new(),
@@ -258,6 +304,7 @@ impl Actor {
             project_diagnostics: Vec::new(),
             plan_diagnostics: Vec::new(),
             watcher_diagnostics,
+            output_diagnostics: Vec::new(),
             compile_diagnostics,
             simulation_diagnostics: BTreeMap::new(),
             dirty: DiagnosticSource::ALL.into_iter().collect(),
@@ -312,7 +359,14 @@ impl Actor {
                         self.reload(change).await;
                     }
                 },
+                () = tokio::time::sleep_until(self.output_quiet_at.unwrap_or_else(Instant::now)),
+                    if self.output_quiet_at.is_some() =>
+                {
+                    self.output_quiet_at = None;
+                    self.check_output();
+                },
             }
+            self.resume_deferred().await;
             self.publish();
         }
         self.finish_close();
@@ -467,22 +521,46 @@ impl Actor {
     // ---------------------------------------------------------------------------------------------
 
     /// Starts the compile of `operation`; no compile may be running.
+    ///
+    /// First it repairs `risim-out/`, if it was lost or misses its builtins.
+    /// While events show that it may still be being deleted, or the simulations that its loss
+    /// cancelled still run, the operation waits at the front of the queue instead, and
+    /// [`resume_deferred`](Self::resume_deferred) starts it again.
     async fn start(&mut self, operation: Operation) {
+        // The watcher may not have reported a deleted `risim-out/` yet, or it failed.
+        self.check_output();
+        let reopen = self.output_lost || self.lock.is_none();
+        if (reopen || self.builtins_missing)
+            && (self.output_quiet_at.is_some() || (reopen && !self.simulations.is_empty()))
+        {
+            self.deferred = true;
+            self.queued.push_front(operation);
+            return;
+        }
+        if reopen {
+            match self.reopen_output().await {
+                Reopen::Done => {},
+                Reopen::Failed => {
+                    // The output diagnostics explain why.
+                    self.fail(&operation);
+                    return;
+                },
+                Reopen::Taken { lock, owner } => {
+                    self.fail(&operation);
+                    self.close_taken(lock, owner);
+                    return;
+                },
+            }
+        } else if self.builtins_missing {
+            self.extract_builtins().await;
+        }
         // The watcher may not have reported a file saved right before the request yet. Loading
         // the project again only reads changed files, so every operation does it.
         self.debouncer.take();
         self.reload(Change::Config).await;
         let Some(model) = self.model.clone() else {
             // The configuration never had a valid specification; its diagnostics explain why.
-            self.emit(WorkspaceEventKind::CompileStarted {
-                tags: operation.tags().to_vec(),
-                total: 0,
-            });
-            self.emit(WorkspaceEventKind::CompileFinished {
-                tags: operation.tags().to_vec(),
-                success: false,
-                simulation_patterns: operation.simulation_patterns(),
-            });
+            self.fail(&operation);
             return;
         };
         let mut state = self.compile_state.take().unwrap_or_else(|| {
@@ -539,6 +617,19 @@ impl Actor {
             model: compiled_model,
             operation_semaphore,
             cancel,
+        });
+    }
+
+    /// Ends `operation` without compiling.
+    fn fail(&mut self, operation: &Operation) {
+        self.emit(WorkspaceEventKind::CompileStarted {
+            tags: operation.tags().to_vec(),
+            total: 0,
+        });
+        self.emit(WorkspaceEventKind::CompileFinished {
+            tags: operation.tags().to_vec(),
+            success: false,
+            simulation_patterns: operation.simulation_patterns(),
         });
     }
 
@@ -635,8 +726,15 @@ impl Actor {
                 threads,
             );
         }
-        // An operation that can't compile ends right away, without starting a compile.
+        self.start_queued().await;
+    }
+
+    /// Starts the queued operations until one compiles or waits to repair `risim-out/`.
+    ///
+    /// An operation that can't compile ends right away, without starting a compile.
+    async fn start_queued(&mut self) {
         while self.running_compile.is_none()
+            && !self.deferred
             && let Some(queued) = self.queued.pop_front()
         {
             self.start(queued).await;
@@ -832,6 +930,17 @@ impl Actor {
     fn handle_watch_event(&mut self, event: notify::Result<notify::Event>) {
         match event {
             Ok(event) => {
+                let output = self.layout.root();
+                let removes_output = may_remove_output(&event, output);
+                if removes_output
+                    || (self.output_quiet_at.is_some() && removes_from_output(&event, output))
+                {
+                    self.output_quiet_at = Some(Instant::now() + OUTPUT_QUIET);
+                }
+                if removes_output {
+                    // Cancels the operations right away; the repair waits for quiet.
+                    self.check_output();
+                }
                 if let Some(watcher) = &mut self.watcher {
                     if event.need_rescan() {
                         watcher.forget_all();
@@ -918,6 +1027,173 @@ impl Actor {
     }
 
     // ---------------------------------------------------------------------------------------------
+    // Output directory
+    // ---------------------------------------------------------------------------------------------
+
+    /// Checks that `risim-out/` is still the locked one, with its builtins.
+    ///
+    /// Without a lock, there is nothing to check: the next operation tries to lock it again.
+    fn check_output(&mut self) {
+        let Some(lock) = &self.lock else {
+            return;
+        };
+        if !lock.is_current() {
+            self.lose_output();
+        } else if !builtins::is_complete(self.loader().builtins_dir()) {
+            self.builtins_missing = true;
+        }
+    }
+
+    /// Marks `risim-out/` as lost, and cancels the running compile and simulations.
+    ///
+    /// They work with files that are gone.
+    /// The layout is [detached](OutputLayout::detach), so that they don't write their state into
+    /// a directory that is being deleted, that they would create again, or that another process
+    /// may own.
+    /// Nothing else is written until an operation opens the directory again: the whole
+    /// workspace may have been deleted.
+    /// That operation waits until the directory is quiet, also if it found the loss itself.
+    fn lose_output(&mut self) {
+        if self.output_lost {
+            return;
+        }
+        tracing::warn!(
+            path = %self.layout.root(),
+            "the output directory was deleted or replaced; the next operation opens it again"
+        );
+        self.output_lost = true;
+        self.layout.detach();
+        // Found by an operation, the deletion may still run: the operation waits for quiet.
+        self.output_quiet_at
+            .get_or_insert_with(|| Instant::now() + OUTPUT_QUIET);
+        if self.running_compile.is_some() || !self.simulations.is_empty() {
+            self.output_cancelled = true;
+            self.operations_cancel.cancel();
+            self.operations_cancel = self.cancel.child_token();
+        }
+    }
+
+    /// Starts the queued operations again if the first one waits to repair `risim-out/`, once
+    /// the directory is quiet.
+    ///
+    /// The operation waits again while the simulations that the loss cancelled still run.
+    async fn resume_deferred(&mut self) {
+        if self.deferred && self.output_quiet_at.is_none() && self.running_compile.is_none() {
+            self.deferred = false;
+            self.start_queued().await;
+        }
+    }
+
+    /// Opens `risim-out/` again (see [`reopen_output`]), and loads the project with the
+    /// extracted builtins; no compile may be running.
+    ///
+    /// The workspace starts over like a newly opened one: the next compile compiles everything,
+    /// the results are those that the directory has, and the compile and simulation diagnostics
+    /// are dropped.
+    /// If the directory can't be set up, an output diagnostic says why, and
+    /// [`lock`](Self::lock) stays `None`.
+    async fn reopen_output(&mut self) -> Reopen {
+        self.output_lost = false;
+        self.builtins_missing = false;
+        if let Some(lock) = self.lock.take() {
+            lock.abandon();
+        }
+        let path = self.layout.root().to_owned();
+        let layout = self.layout.clone();
+        let lock_owner = self.runtime.lock_owner().to_owned();
+        let result = tokio::task::spawn_blocking(move || reopen_output(&layout, &lock_owner))
+            .await
+            .unwrap_or_else(|error| {
+                Err(OpenError::Io {
+                    path: path.clone(),
+                    source: io::Error::other(error),
+                })
+            });
+        let cancelled = std::mem::take(&mut self.output_cancelled);
+        self.dirty.extend([
+            DiagnosticSource::Project,
+            DiagnosticSource::Compile,
+            DiagnosticSource::Simulation,
+        ]);
+        let Reopened { lock, results } = match result {
+            Ok(reopened) => reopened,
+            Err(OpenError::Locked { path: lock, owner }) => {
+                tracing::warn!(%lock, "another process locked the output directory");
+                return Reopen::Taken { lock, owner };
+            },
+            Err(error) => {
+                let error = error_chain(&error);
+                tracing::warn!(%path, %error, "failed to open the output directory again");
+                self.output_diagnostics = vec![Diagnostic::error(format!(
+                    "{path} was deleted or replaced, and opening it again failed: {error}"
+                ))];
+                return Reopen::Failed;
+            },
+        };
+        tracing::info!(%path, "opened the output directory again");
+        self.lock = Some(lock);
+        self.output_diagnostics.clear();
+        self.compile_state = Some(CompileState::default());
+        self.compile_diagnostics.clear();
+        self.simulation_diagnostics.clear();
+        self.plan_diagnostics = if cancelled {
+            vec![Diagnostic::warning(format!(
+                "{path} was deleted or replaced, which cancelled the running compile and \
+                 simulations"
+            ))]
+        } else {
+            Vec::new()
+        };
+        let names = self.testcases.iter().map(|testcase| testcase.name.as_str());
+        if let Err(error) = results.retain_testcases(names) {
+            tracing::warn!(%error, "failed to save the test results");
+        }
+        self.results = Arc::new(results);
+        self.results_dirty = true;
+        if let Some(watcher) = &mut self.watcher {
+            // Its watch ended with the directory, even if no event said so.
+            watcher.forget(&path);
+        }
+        self.reload(Change::Sources).await;
+        Reopen::Done
+    }
+
+    /// Closes the workspace, whose `risim-out/` another process locked after it was lost.
+    ///
+    /// Its requests end, and [`WorkspaceEventKind::OutputTaken`] is its last event, so that
+    /// the embedder can open the workspace again, or ask the owner to release it.
+    fn close_taken(&mut self, lock: Utf8PathBuf, owner: Option<String>) {
+        self.cancel.cancel();
+        self.drop_queued();
+        self.emit(WorkspaceEventKind::OutputTaken { lock, owner });
+        self.closing.get_or_insert_default();
+    }
+
+    /// Extracts the builtins again, and loads the project with them.
+    async fn extract_builtins(&mut self) {
+        self.builtins_missing = false;
+        let builtins_root = self.layout.builtins_root();
+        let result = tokio::task::spawn_blocking({
+            let builtins_root = builtins_root.clone();
+            move || builtins::extract(&builtins_root)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result.map_err(|error| error.to_string()));
+        self.dirty.insert(DiagnosticSource::Project);
+        if let Err(error) = result {
+            tracing::warn!(path = %builtins_root, %error, "failed to extract the builtins");
+            self.output_diagnostics = vec![Diagnostic::error(format!(
+                "failed to extract the VUnit and OSVVM sources to {builtins_root}: {error}"
+            ))];
+            return;
+        }
+        tracing::info!(path = %builtins_root, "extracted the missing builtins");
+        self.output_diagnostics.clear();
+        self.reload(Change::Sources).await;
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // Publishing
     // ---------------------------------------------------------------------------------------------
 
@@ -929,6 +1205,7 @@ impl Actor {
                 .iter()
                 .chain(&self.plan_diagnostics)
                 .chain(&self.watcher_diagnostics)
+                .chain(&self.output_diagnostics)
                 .cloned()
                 .collect(),
             DiagnosticSource::Compile => self
@@ -1010,14 +1287,29 @@ impl Actor {
     fn finish_close(mut self) {
         self.publish();
         self.watcher = None;
-        if let Some(state) = &self.compile_state
-            && let Err(error) = state.save(&self.layout)
-        {
-            tracing::warn!(%error, "failed to save the compile state");
-        }
-        self.loader().save_cache();
-        if let Some(lock) = self.lock.take() {
-            lock.release();
+        match self.lock.take() {
+            // A detached layout saved nothing since the loss: the state may be that of a
+            // cancelled compile.
+            Some(lock) if lock.is_current() && !self.layout.is_detached() => {
+                if let Some(state) = &self.compile_state
+                    && let Err(error) = state.save(&self.layout)
+                {
+                    tracing::warn!(%error, "failed to save the compile state");
+                }
+                self.loader().save_cache();
+                lock.release();
+            },
+            Some(lock) => {
+                // The directory and its files may be another owner's by now. An abandoned lock
+                // keeps its PID, so that the next owner of the same directory checks the state
+                // like after a crash.
+                tracing::warn!(
+                    path = %self.layout.root(),
+                    "the output directory was deleted or replaced; saving nothing"
+                );
+                lock.abandon();
+            },
+            None => {},
         }
         tracing::debug!(root = %self.root, "workspace closed");
         if let Some(closing) = self.closing.take() {

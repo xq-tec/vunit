@@ -22,6 +22,24 @@
 //! - **Cancel:** [`Workspace::cancel_all`] cancels the running compile, the queued operations,
 //!   and all running and waiting tests. [`Workspace::cancel`] cancels only what one request asked
 //!   for: an operation that serves other requests too keeps running for them.
+//! - **Output directory:** `risim-out/` may be deleted or replaced while the workspace is open.
+//!   The watcher reports it, and every operation checks first that the lock file is still the
+//!   locked one.
+//!   The running compile and simulations are cancelled then, since their files are gone, and
+//!   the layout is detached, so that nothing writes to the directory any more
+//!   ([`OutputLayout::detach`]); a state file is never written into a missing `risim-out/`.
+//!   The next operation waits until the directory has been quiet for [`OUTPUT_QUIET`] and the
+//!   cancelled simulations ended.
+//!   Then it locks the directory again and starts over like a newly opened workspace: it
+//!   compiles everything, with the builtins extracted again, and the results are those that
+//!   the directory has.
+//!   Missing builtins alone are extracted again, and a missing workspace root isn't created.
+//!   If the directory can't be set up, a project error says why, and the next operation tries
+//!   again; if another process locked it, the workspace closes with
+//!   [`WorkspaceEventKind::OutputTaken`].
+//!   A workspace closed without its directory saves nothing.
+//!
+//! [`OUTPUT_QUIET`]: crate::watch::OUTPUT_QUIET
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -57,6 +75,7 @@ use crate::runtime::Runtime;
 use crate::sources;
 use crate::sources::SourceCache;
 use crate::spec::ProjectSpec;
+use crate::store;
 use crate::store::CompileState;
 use crate::store::LockError;
 use crate::store::OutputLayout;
@@ -260,6 +279,17 @@ pub enum WorkspaceEventKind {
         /// The number of testcases per outcome.
         counts: TestCounts,
     },
+    /// Another process locked `risim-out/` after it was deleted or replaced, so the workspace
+    /// closed; this is its last event.
+    ///
+    /// The fields are those of [`OpenError::Locked`], which opening the workspace again would
+    /// return.
+    OutputTaken {
+        /// The lock file.
+        lock: Utf8PathBuf,
+        /// The owner record of the process that holds the lock, if it wrote one.
+        owner: Option<String>,
+    },
 }
 
 /// A handle to an open workspace; cheap to clone.
@@ -337,6 +367,8 @@ impl Workspace {
 
     /// Cancels everything, waits for the processes to end, saves the state and releases the
     /// lock. Other handles of the workspace stop working.
+    ///
+    /// A workspace that lost `risim-out/` saves nothing, and only unlocks its lock.
     pub async fn close(self) {
         let (reply, done) = oneshot::channel();
         self.send(Command::Close(reply));
@@ -451,4 +483,103 @@ fn prepare(
         compile_state,
         results,
     })
+}
+
+/// `risim-out/`, opened again after it was deleted or replaced while the workspace was open.
+struct Reopened {
+    lock: OutputLock,
+    results: ResultStore,
+}
+
+/// Locks `risim-out/` again for `owner`, starts its compile state over, extracts the builtins
+/// and [attaches](OutputLayout::attach) `layout`.
+///
+/// What is left of the directory, or what the operations that ran without the lock wrote to a
+/// new one, doesn't match the compile state.
+/// The state file and the libraries are deleted, so that the next compile compiles everything.
+/// The test results are read from the directory, as on open.
+/// A workspace root that is gone isn't created again.
+fn reopen_output(layout: &OutputLayout, owner: &str) -> Result<Reopened, OpenError> {
+    if let Some(workspace_root) = layout.root().parent()
+        && !workspace_root.is_dir()
+    {
+        return Err(OpenError::Io {
+            path: workspace_root.to_owned(),
+            source: io::Error::new(io::ErrorKind::NotFound, "the workspace root is gone"),
+        });
+    }
+    let (lock, _previous) = OutputLock::acquire(layout, owner)?;
+    let set_up = || {
+        for stale in [layout.state_file(), layout.libraries_dir()] {
+            store::remove_path(&stale).map_err(|source| OpenError::Io {
+                path: stale.clone(),
+                source,
+            })?;
+        }
+        let builtins_root = layout.builtins_root();
+        builtins::extract(&builtins_root).map_err(|source| OpenError::Io {
+            path: builtins_root,
+            source,
+        })
+    };
+    if let Err(error) = set_up() {
+        lock.release();
+        return Err(error);
+    }
+    layout.attach();
+    Ok(Reopened {
+        lock,
+        results: ResultStore::load(layout),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+    use crate::test_support::TempRoot;
+
+    #[test]
+    fn reopening_starts_the_output_over() {
+        let temp = TempRoot::new();
+        let layout = OutputLayout::new(&temp.root);
+        let (lost, _) = OutputLock::acquire(&layout, "first").unwrap();
+        // What the operations without the lock wrote to a recreated directory.
+        fs::remove_dir_all(layout.root()).unwrap();
+        fs::create_dir_all(layout.root()).unwrap();
+        CompileState::default().save(&layout).unwrap();
+        let archive = temp.write("risim-out/libraries/lib/lib.hlib", "");
+        let output = temp.write("risim-out/compile_output/lib/a.txt", "");
+        layout.detach();
+
+        let Reopened { lock, results } = reopen_output(&layout, "second").unwrap();
+        lost.abandon();
+        assert!(lock.is_current());
+        assert!(layout.is_writable());
+        assert_eq!(fs::read_to_string(layout.owner_file()).unwrap(), "second");
+        assert!(!layout.state_file().exists());
+        assert!(!archive.exists());
+        assert!(output.exists());
+        assert!(layout.builtins_root().join(builtins::hash()).is_dir());
+        assert!(results.snapshot().is_empty());
+
+        // Locked by another process in the meantime.
+        let error = reopen_output(&layout, "third").err();
+        assert!(
+            matches!(&error, Some(OpenError::Locked { owner: Some(owner), .. }) if owner == "second"),
+            "{error:?}"
+        );
+        lock.release();
+
+        // The whole workspace was deleted: it isn't created again.
+        let gone = TempRoot::new();
+        let gone_layout = OutputLayout::new(&gone.root.join("workspace"));
+        let gone_error = reopen_output(&gone_layout, "fourth").err();
+        assert!(
+            matches!(&gone_error, Some(OpenError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound),
+            "{gone_error:?}"
+        );
+        assert!(!gone.root.join("workspace").exists());
+    }
 }

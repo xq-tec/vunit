@@ -642,6 +642,7 @@ dependencies = [
  "rayon",
  "regex",
  "rustc-hash",
+ "same-file",
  "serde",
  "serde_ignored",
  "serde_json",

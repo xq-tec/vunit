@@ -139,6 +139,11 @@ impl Loader {
         }
     }
 
+    /// The directory with the extracted builtins.
+    pub(super) fn builtins_dir(&self) -> &Utf8Path {
+        &self.builtins_dir
+    }
+
     /// The configuration file, if the project comes from one.
     pub(super) fn config_file(&self) -> Option<&Utf8Path> {
         self.config.config_file.as_deref()
@@ -187,8 +192,11 @@ impl Loader {
         }
     }
 
-    /// Writes the parse cache.
+    /// Writes the parse cache, if the layout [is writable](OutputLayout::is_writable).
     pub(super) fn save_cache(&self) {
+        if !self.layout.is_writable() {
+            return;
+        }
         let path = self.layout.parse_cache_file();
         if let Err(error) = self.cache.save(&path) {
             tracing::warn!(%path, %error, "failed to save the parse cache");

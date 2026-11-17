@@ -466,6 +466,9 @@ impl SourceCache {
     /// Loads `paths` in parallel, reusing cached results where possible.
     ///
     /// The cache keeps only the given paths afterwards.
+    /// A file that can't be read keeps its entry, so that its parse result is reused if it comes
+    /// back with the same contents, like the builtins extracted again into a recreated
+    /// `risim-out/`.
     pub fn load(
         &mut self,
         paths: &[Utf8PathBuf],
@@ -486,6 +489,9 @@ impl SourceCache {
                     entries.insert(path, entry);
                 },
                 Err(error) => {
+                    if let Some(previous) = previous.get(&path) {
+                        entries.insert(path.clone(), previous.clone());
+                    }
                     loaded.insert(path, Err(error));
                 },
             }
@@ -938,6 +944,30 @@ mod tests {
         let path = Utf8PathBuf::from("/nonexistent/a.vhd");
         let loaded = cache.load(std::slice::from_ref(&path));
         loaded[&path].as_ref().unwrap_err();
+    }
+
+    #[test]
+    fn cache_keeps_the_parse_result_of_a_file_that_comes_back() {
+        let workspace = Workspace::new();
+        let path = workspace.write("a.vhd", "entity a is end;");
+        let mut cache = SourceCache::new();
+        let first = cache.load(std::slice::from_ref(&path));
+        let first = Arc::clone(first[&path].as_ref().unwrap());
+
+        fs::remove_file(&path).unwrap();
+        cache.load(std::slice::from_ref(&path))[&path]
+            .as_ref()
+            .unwrap_err();
+        // Written again with the same contents, but another modification time.
+        workspace.write("a.vhd", "entity a is end;");
+        let file = fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(SystemTime::UNIX_EPOCH).unwrap();
+        let again = cache.load(std::slice::from_ref(&path));
+        assert!(Arc::ptr_eq(&first, again[&path].as_ref().unwrap()));
+
+        // A path that isn't loaded any more is dropped.
+        cache.load(&[]);
+        assert!(cache.entries.is_empty());
     }
 
     #[test]

@@ -16,10 +16,14 @@
 //!   by a branch switch) is only reported by a parent that stays in place. Without it, a
 //!   directory recreated while the project is reloaded would never be watched again.
 //!
-//! Directories inside a recursively watched one aren't watched separately. `risim-out/` and
-//! `.git/` are never watched: a recursively watched directory that contains `risim-out/` is
-//! replaced by a non-recursive watch of itself and recursive watches of its other
-//! subdirectories. Events are debounced by [`Debouncer`] and classified by [`classify`].
+//! Directories inside a recursively watched one aren't watched separately.
+//! `.git/` is never watched, and `risim-out/` never recursively: a recursively watched directory
+//! that contains `risim-out/` is replaced by a non-recursive watch of itself and recursive
+//! watches of its other subdirectories.
+//! `risim-out/` and its parent are watched non-recursively, so that [`may_remove_output`] sees
+//! the output directory, its lock file or its builtins go.
+//! Events are debounced by [`Debouncer`] and classified by [`classify`]; changes in
+//! `risim-out/` are never project changes.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -48,6 +52,16 @@ pub const DEBOUNCE: Duration = Duration::from_millis(200);
 
 /// The longest a change is delayed by events that keep arriving.
 pub const MAX_DELAY: Duration = Duration::from_secs(2);
+
+/// How long `risim-out/` must be free of events before an operation of a workspace that lost it
+/// opens it again.
+///
+/// A deletion like `rm -rf risim-out` may remove the lock file long before the directory; a
+/// workspace opening it again in between would put new files into a directory that is still
+/// being deleted.
+/// Only removals in `risim-out/` itself count (see [`removes_from_output`]), so a deletion that
+/// spends longer in one subdirectory can still overlap with the next operation.
+pub const OUTPUT_QUIET: Duration = Duration::from_secs(1);
 
 /// What a file system event changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -103,6 +117,13 @@ pub fn watch_targets(
             .iter()
             .any(|ancestor| ancestor != dir && dir.starts_with(ancestor))
     });
+    // No recursive watch contains `excluded` (see `add`). Some platforms report the removal of
+    // a watched directory only to a watch of its parent.
+    for dir in [Some(excluded), excluded.parent()].into_iter().flatten() {
+        if dir.is_dir() {
+            targets.entry(dir.to_owned()).or_insert(false);
+        }
+    }
     targets
 }
 
@@ -189,6 +210,51 @@ pub fn classify(
         }
     }
     change
+}
+
+/// The entries of `risim-out/` whose loss [`may_remove_output`] reports.
+const OUTPUT_ENTRIES: [&str; 2] = [".lock", "builtins"];
+
+/// Whether `event` may have deleted, renamed or replaced `output` (`risim-out/`), its lock file
+/// or its builtins.
+///
+/// A hint only: the caller checks what is actually there.
+/// Kinds that a backend doesn't specify count, and so do lost events.
+pub fn may_remove_output(event: &notify::Event, output: &Utf8Path) -> bool {
+    if event.need_rescan() {
+        return true;
+    }
+    if !matches!(
+        event.kind,
+        EventKind::Remove(_)
+            | EventKind::Modify(ModifyKind::Name(_) | ModifyKind::Any)
+            | EventKind::Any
+            | EventKind::Other
+    ) {
+        return false;
+    }
+    event.paths.iter().any(|path| {
+        let Some(path) = Utf8Path::from_path(path) else {
+            return false;
+        };
+        path == output
+            || (path.parent() == Some(output)
+                && path
+                    .file_name()
+                    .is_some_and(|name| OUTPUT_ENTRIES.contains(&name)))
+    })
+}
+
+/// Whether `event` removes `output` (`risim-out/`) or one of its entries.
+///
+/// Removals show that a deletion still runs.
+/// The workspace's own saves create and rename files there, and don't count.
+pub fn removes_from_output(event: &notify::Event, output: &Utf8Path) -> bool {
+    matches!(event.kind, EventKind::Remove(_))
+        && event.paths.iter().any(|path| {
+            Utf8Path::from_path(path)
+                .is_some_and(|path| path == output || path.parent() == Some(output))
+        })
 }
 
 /// Collects changes until no event has arrived for [`DEBOUNCE`], or for at most
@@ -283,20 +349,25 @@ impl DirectoryWatcher {
             return;
         }
         for path in &event.paths {
-            let Some(path) = Utf8Path::from_path(path) else {
-                continue;
-            };
-            let removed: Vec<Utf8PathBuf> = self
-                .watched
-                .keys()
-                .filter(|dir| dir.starts_with(path))
-                .cloned()
-                .collect();
-            for dir in removed {
-                self.watched.remove(&dir);
-                if let Err(error) = self.watcher.unwatch(dir.as_std_path()) {
-                    tracing::debug!(%dir, %error, "failed to unwatch");
-                }
+            if let Some(path) = Utf8Path::from_path(path) {
+                self.forget(path);
+            }
+        }
+    }
+
+    /// Forgets the watch of `path` and those below it, so that the next
+    /// [`update`](Self::update) watches them again if they exist.
+    pub fn forget(&mut self, path: &Utf8Path) {
+        let removed: Vec<Utf8PathBuf> = self
+            .watched
+            .keys()
+            .filter(|dir| dir.starts_with(path))
+            .cloned()
+            .collect();
+        for dir in removed {
+            self.watched.remove(&dir);
+            if let Err(error) = self.watcher.unwatch(dir.as_std_path()) {
+                tracing::debug!(%dir, %error, "failed to unwatch");
             }
         }
     }
@@ -356,6 +427,9 @@ pub struct WatchUpdate {
 mod tests {
     use notify::event::AccessKind;
     use notify::event::CreateKind;
+    use notify::event::DataChange;
+    use notify::event::RemoveKind;
+    use notify::event::RenameMode;
 
     use super::*;
     use crate::test_support::TempRoot as Temp;
@@ -445,13 +519,19 @@ mod tests {
         mkdir(&temp, ".git/objects");
         mkdir(&temp, "src/deep");
         mkdir(&temp, "tb");
+        // `risim-out/` itself is watched non-recursively, for its removal.
         assert_eq!(
             targets(&temp, &["**/*.vhd"]),
-            owned(&[("", false), ("src", true), ("tb", true)])
+            owned(&[
+                ("", false),
+                ("risim-out", false),
+                ("src", true),
+                ("tb", true)
+            ])
         );
         assert_eq!(
             targets(&temp, &["risim-out/**/*.vhd"]),
-            owned(&[("", false)])
+            owned(&[("", false), ("risim-out", false)])
         );
     }
 
@@ -502,6 +582,57 @@ mod tests {
             ),
             Some(Change::Sources)
         );
+    }
+
+    #[test]
+    fn spots_events_that_may_remove_the_output() {
+        let temp = Temp::new();
+        let output = temp.root.join("risim-out");
+        let lock = output.join(".lock");
+        let builtins = output.join("builtins");
+        let state = output.join("state.json");
+        let source = temp.root.join("src/a.vhd");
+        let removes = |kind, paths: &[&Utf8Path]| may_remove_output(&event(kind, paths), &output);
+        let remove = EventKind::Remove(RemoveKind::Any);
+        let rename = EventKind::Modify(ModifyKind::Name(RenameMode::Both));
+
+        assert!(removes(remove, &[&output]));
+        assert!(removes(remove, &[&lock]));
+        assert!(removes(remove, &[&builtins]));
+        assert!(removes(rename, &[&output, &temp.root.join("old")]));
+        assert!(removes(rename, &[&temp.root.join("new"), &output]));
+        assert!(removes(EventKind::Any, &[&lock]));
+        assert!(!removes(EventKind::Other, &[]));
+        assert!(may_remove_output(
+            &notify::Event::new(EventKind::Other).set_flag(notify::event::Flag::Rescan),
+            &output
+        ));
+
+        assert!(!removes(remove, &[&state]));
+        assert!(!removes(remove, &[&builtins.join("0123")]));
+        assert!(!removes(remove, &[&source]));
+        assert!(!removes(EventKind::Create(CreateKind::File), &[&lock]));
+        assert!(!removes(
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            &[&lock]
+        ));
+
+        let removes_from =
+            |kind, paths: &[&Utf8Path]| removes_from_output(&event(kind, paths), &output);
+        assert!(removes_from(remove, &[&output]));
+        assert!(removes_from(remove, &[&state]));
+        assert!(!removes_from(remove, &[&builtins.join("0123")]));
+        assert!(!removes_from(remove, &[&source]));
+        // The workspace's own saves.
+        assert!(!removes_from(EventKind::Create(CreateKind::File), &[&lock]));
+        assert!(!removes_from(
+            rename,
+            &[&output.join(".state.json.tmp-1-2"), &state]
+        ));
+        assert!(!removes_from(
+            EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            &[&state]
+        ));
     }
 
     #[test]

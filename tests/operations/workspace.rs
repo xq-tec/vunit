@@ -8,12 +8,14 @@
 //! AI NOTICE: Generated, minimally reviewed.
 
 use std::fs;
+use std::io;
 use std::num::NonZeroU32;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
+use camino::Utf8Path;
 use camino::Utf8PathBuf;
 use libtest_mimic::Trial;
 use risim_vunit_frontend::DiagnosticSource;
@@ -28,12 +30,15 @@ use risim_vunit_frontend::TestOutcome;
 use risim_vunit_frontend::Workspace as Handle;
 use risim_vunit_frontend::WorkspaceEvent;
 use risim_vunit_frontend::WorkspaceEventKind;
+use risim_vunit_frontend::builtins;
 use risim_vunit_frontend::diagnostics::Severity;
 use risim_vunit_frontend::simulator::CheckRunOptions;
 use risim_vunit_frontend::simulator::RunOptions;
 use risim_vunit_frontend::store::CompileState;
+use risim_vunit_frontend::store::OutputLock;
 use risim_vunit_frontend::threads::NoLeases;
 use risim_vunit_frontend::threads::ThreadBudget;
+use risim_vunit_frontend::watch::OUTPUT_QUIET;
 use tokio::sync::mpsc;
 
 use crate::Workspace;
@@ -42,6 +47,7 @@ use crate::simulation_project;
 use crate::testbench;
 use crate::trial::trial;
 
+#[expect(clippy::too_many_lines, reason = "one entry per trial")]
 pub fn trials() -> Vec<Trial> {
     vec![
         trial(
@@ -93,6 +99,34 @@ pub fn trials() -> Vec<Trial> {
         trial(
             "workspace_recovers_from_a_crash",
             workspace_recovers_from_a_crash,
+        ),
+        trial(
+            "workspace_reopens_a_deleted_output_directory",
+            workspace_reopens_a_deleted_output_directory,
+        ),
+        trial(
+            "workspace_cancels_a_compile_when_the_output_directory_goes",
+            workspace_cancels_a_compile_when_the_output_directory_goes,
+        ),
+        trial(
+            "workspace_runs_queued_requests_after_the_output_directory_goes",
+            workspace_runs_queued_requests_after_the_output_directory_goes,
+        ),
+        trial(
+            "workspace_cancels_simulations_when_the_output_directory_goes",
+            workspace_cancels_simulations_when_the_output_directory_goes,
+        ),
+        trial(
+            "workspace_extracts_deleted_builtins",
+            workspace_extracts_deleted_builtins,
+        ),
+        trial(
+            "workspace_leaves_a_deleted_root_alone",
+            workspace_leaves_a_deleted_root_alone,
+        ),
+        trial(
+            "workspace_closes_when_another_process_takes_the_output",
+            workspace_closes_when_another_process_takes_the_output,
         ),
         trial(
             "workspace_reports_config_errors",
@@ -310,6 +344,9 @@ fn summary(events: &[WorkspaceEventKind]) -> Vec<String> {
                 "simulation_finished {} {passed}/{failed}/{cancelled}",
                 tags_text(tags)
             )),
+            WorkspaceEventKind::OutputTaken { owner, .. } => {
+                Some(format!("output_taken {}", owner.as_deref().unwrap_or("-")))
+            },
         })
         .collect()
 }
@@ -351,6 +388,25 @@ fn max_running(log: &[String], start: &str, end: &str) -> usize {
 
 fn lock_contents(fixture: &Workspace) -> String {
     fs::read_to_string(fixture.layout.lock_file()).expect("read the lock file")
+}
+
+/// Whether the workspace holds `risim-out/` with its builtins.
+fn output_is_open(fixture: &Workspace) -> bool {
+    let builtins = fixture.layout.builtins_root().join(builtins::hash());
+    fs::read_to_string(fixture.layout.owner_file()).is_ok_and(|owner| owner == LOCK_OWNER)
+        && fs::read_to_string(fixture.layout.lock_file())
+            .is_ok_and(|pid| pid.trim() == std::process::id().to_string())
+        && builtins::is_complete(&builtins)
+}
+
+/// The summary of compiling both files of the simulation project, tagged `name`.
+fn full_compile(name: &str) -> Vec<String> {
+    vec![
+        format!("compile_started {name} 2"),
+        "compiling tb_implicit.vhd".to_owned(),
+        "compiling tb_tests.vhd".to_owned(),
+        format!("compile_finished {name} true None"),
+    ]
 }
 
 /// Waits until `line` appears in the fake simulator log.
@@ -1086,6 +1142,346 @@ async fn workspace_recovers_from_a_crash() {
     state.save(&fixture.layout).expect("save the compile state");
     fs::write(fixture.layout.lock_file(), "12345\n").expect("write the lock file");
     assert_eq!(compiled_files("d").await, 2);
+}
+
+/// Deletes the directory `path` like `rm -rf`, and again while that fails because files were
+/// created in it meanwhile.
+///
+/// A save that started before the workspace noticed the deletion, such as that of the parse
+/// cache after a compile, still writes its file.
+async fn delete(path: &Utf8Path) {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        match fs::remove_dir_all(path) {
+            Err(error) if error.kind() == io::ErrorKind::DirectoryNotEmpty => {
+                assert!(
+                    Instant::now() < deadline,
+                    "failed to delete {path}: {error}"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            },
+            result => {
+                assert!(result.is_ok(), "failed to delete {path}: {result:?}");
+                return;
+            },
+        }
+    }
+}
+
+/// Waits until a workspace that lost `risim-out/` would have repaired it in the background, if
+/// it did that.
+async fn wait_past_the_quiet_period() {
+    tokio::time::sleep(OUTPUT_QUIET + Duration::from_millis(500)).await;
+}
+
+/// A deleted `risim-out/` is locked again, with its builtins, by the next operation, which
+/// compiles everything again.
+async fn workspace_reopens_a_deleted_output_directory() {
+    let mut fixture = Workspace::new().await;
+    simulation_project(&mut fixture);
+    let runtime = runtime().await;
+    let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
+    session
+        .handle
+        .simulate(requests(&["lib.tb_tests.pass"]), tag("a"), None, None);
+    session.operation("a").await;
+    assert_eq!(session.handle.snapshot().results.len(), 1);
+
+    // Deleted while the workspace is idle: nothing is written until the next operation.
+    delete(fixture.layout.root()).await;
+    wait_past_the_quiet_period().await;
+    assert!(!fixture.layout.root().exists());
+    session.handle.compile(tag("b"), None);
+    assert_eq!(summary(&session.operation("b").await), full_compile("b"));
+    assert!(output_is_open(&fixture));
+    // The results went with the directory.
+    assert!(session.handle.snapshot().results.is_empty());
+
+    // Deleted right before a request, as with `rm -rf risim-out && risim compile`: the request
+    // waits until the directory is quiet, and opens it again.
+    delete(fixture.layout.root()).await;
+    session.handle.compile(tag("c"), None);
+    assert_eq!(summary(&session.operation("c").await), full_compile("c"));
+    assert!(output_is_open(&fixture));
+
+    // Only the lock file is deleted.
+    fs::remove_file(fixture.layout.lock_file()).expect("delete the lock file");
+    session.handle.compile(tag("d"), None);
+    assert_eq!(summary(&session.operation("d").await), full_compile("d"));
+
+    session.handle.close().await;
+    assert_eq!(lock_contents(&fixture), "");
+    assert!(!fixture.layout.owner_file().exists());
+    // The state saved on close matches the libraries.
+    let mut reopened = open(&runtime, &fixture, spec_source(&fixture)).await;
+    reopened.handle.compile(tag("e"), None);
+    assert_eq!(
+        summary(&reopened.operation("e").await),
+        ["compile_started e 0", "compile_finished e true None"]
+    );
+    reopened.handle.close().await;
+}
+
+/// Deletes `risim-out/` and creates an empty one, as another process may.
+async fn replace_output(fixture: &Workspace) {
+    delete(fixture.layout.root()).await;
+    fs::create_dir_all(fixture.layout.root()).expect("create risim-out");
+}
+
+/// The files in the directory `path`.
+fn entries(path: &Utf8Path) -> Vec<String> {
+    fs::read_dir(path)
+        .expect("read the directory")
+        .map(|entry| {
+            entry
+                .expect("read an entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
+/// A compile running when `risim-out/` is replaced is cancelled, and writes nothing into the
+/// new directory; the queued request runs once the directory is open again.
+async fn workspace_cancels_a_compile_when_the_output_directory_goes() {
+    let mut fixture = Workspace::new().await;
+    simulation_project(&mut fixture);
+    fixture.write(
+        "tb/tb_implicit.vhd",
+        &format!("-- fake: hang\n{}", testbench("tb_implicit", "")),
+    );
+    let runtime = runtime().await;
+    let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
+    session.handle.compile(tag("a"), None);
+    session
+        .until(|event| matches!(event, WorkspaceEventKind::FileCompiling { .. }))
+        .await;
+    wait_for_log_line(&fixture, "hang").await;
+    fixture.write("tb/tb_implicit.vhd", &testbench("tb_implicit", ""));
+
+    replace_output(&fixture).await;
+    let cancelled = session.operation("a").await;
+    assert_eq!(summary(&cancelled), ["compile_finished a false None"]);
+    // The cancelled compile saved neither its state nor the parse cache.
+    wait_past_the_quiet_period().await;
+    assert_eq!(entries(fixture.layout.root()), Vec::<String>::new());
+
+    session.handle.compile(tag("b"), None);
+    let events = session.operation("b").await;
+    assert_eq!(summary(&events), full_compile("b"));
+    let explained = events.iter().any(|event| {
+        matches!(
+            event,
+            WorkspaceEventKind::DiagnosticsChanged { source: DiagnosticSource::Project, diagnostics }
+                if diagnostics.iter().any(|diagnostic| {
+                    diagnostic.severity == Severity::Warning
+                        && diagnostic.message.contains("cancelled the running compile")
+                })
+        )
+    });
+    assert!(explained, "{events:#?}");
+    // The warning goes with the next compile.
+    session.handle.compile(tag("c"), None);
+    session.operation("c").await;
+    assert!(
+        session
+            .handle
+            .snapshot()
+            .diagnostics
+            .get(DiagnosticSource::Project)
+            .is_empty()
+    );
+    assert!(output_is_open(&fixture));
+    session.handle.close().await;
+}
+
+/// A request queued behind a compile that the deletion of `risim-out/` cancels runs once the
+/// directory is open again.
+async fn workspace_runs_queued_requests_after_the_output_directory_goes() {
+    let mut fixture = Workspace::new().await;
+    simulation_project(&mut fixture);
+    fixture.write(
+        "tb/tb_implicit.vhd",
+        &format!("-- fake: hang\n{}", testbench("tb_implicit", "")),
+    );
+    let runtime = runtime().await;
+    let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
+    session.handle.compile(tag("a"), None);
+    session
+        .until(|event| matches!(event, WorkspaceEventKind::FileCompiling { .. }))
+        .await;
+    wait_for_log_line(&fixture, "hang").await;
+    session.handle.compile(tag("b"), None);
+    fixture.write("tb/tb_implicit.vhd", &testbench("tb_implicit", ""));
+
+    delete(fixture.layout.root()).await;
+    let mut expected = vec!["compile_finished a false None".to_owned()];
+    expected.extend(full_compile("b"));
+    assert_eq!(summary(&session.operation("b").await), expected);
+    assert!(output_is_open(&fixture));
+    session.handle.close().await;
+}
+
+/// The simulations running when `risim-out/` is replaced are cancelled, and don't save their
+/// results.
+async fn workspace_cancels_simulations_when_the_output_directory_goes() {
+    let mut fixture = Workspace::new().await;
+    simulation_project(&mut fixture);
+    fixture.sim_directive("lib.tb_tests.slow", "hang");
+    let runtime = runtime().await;
+    let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
+    session
+        .handle
+        .simulate(requests(&["lib.tb_tests.slow"]), tag("a"), None, None);
+    session
+        .until(|event| matches!(event, WorkspaceEventKind::TestStarted { .. }))
+        .await;
+    wait_for_log_line(&fixture, "hang").await;
+    // The save of the parse cache after the compile, which nothing stops once it runs.
+    let parse_cache = fixture.layout.parse_cache_file();
+    let deadline = Instant::now() + TIMEOUT;
+    while !parse_cache.is_file() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the parse cache"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    replace_output(&fixture).await;
+    assert_eq!(
+        summary(&session.operation("a").await),
+        [
+            "test_finished lib.tb_tests.slow Cancelled",
+            "simulation_finished a 0/0/1",
+        ]
+    );
+    wait_past_the_quiet_period().await;
+    assert_eq!(entries(fixture.layout.root()), Vec::<String>::new());
+    session.handle.compile(tag("b"), None);
+    assert_eq!(summary(&session.operation("b").await), full_compile("b"));
+    assert!(session.handle.snapshot().results.is_empty());
+    session.handle.close().await;
+}
+
+/// Deleted builtins are extracted again by the next operation, which compiles nothing again.
+async fn workspace_extracts_deleted_builtins() {
+    let mut fixture = Workspace::new().await;
+    simulation_project(&mut fixture);
+    let runtime = runtime().await;
+    let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
+    session.handle.compile(tag("a"), None);
+    assert_eq!(summary(&session.operation("a").await), full_compile("a"));
+
+    let builtins_root = fixture.layout.builtins_root();
+    delete(&builtins_root).await;
+    wait_past_the_quiet_period().await;
+    assert!(!builtins_root.exists());
+    session.handle.compile(tag("b"), None);
+    assert_eq!(
+        summary(&session.operation("b").await),
+        ["compile_started b 0", "compile_finished b true None"]
+    );
+    assert!(output_is_open(&fixture));
+
+    // Right before a request.
+    delete(&builtins_root).await;
+    session.handle.compile(tag("c"), None);
+    assert_eq!(
+        summary(&session.operation("c").await),
+        ["compile_started c 0", "compile_finished c true None"]
+    );
+    assert!(output_is_open(&fixture));
+
+    // Partly deleted, as by an interrupted deletion.
+    let builtins = builtins_root.join(builtins::hash());
+    delete(&builtins.join("vhdl/check")).await;
+    session.handle.compile(tag("d"), None);
+    assert_eq!(
+        summary(&session.operation("d").await),
+        ["compile_started d 0", "compile_finished d true None"]
+    );
+    assert!(builtins::is_complete(&builtins));
+    session.handle.close().await;
+}
+
+/// A deleted workspace isn't created again; its operations fail and say why.
+async fn workspace_leaves_a_deleted_root_alone() {
+    let mut fixture = Workspace::new().await;
+    simulation_project(&mut fixture);
+    let runtime = runtime().await;
+    let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
+    session.handle.compile(tag("a"), None);
+    session.operation("a").await;
+
+    delete(&fixture.root).await;
+    wait_past_the_quiet_period().await;
+    assert!(
+        !fixture.root.exists(),
+        "{:?}",
+        walkdir::WalkDir::new(&fixture.root)
+            .into_iter()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().to_owned())
+            .collect::<Vec<_>>()
+    );
+    session.handle.compile(tag("b"), None);
+    let events = session.operation("b").await;
+    assert_eq!(
+        summary(&events),
+        ["compile_started b 0", "compile_finished b false None"]
+    );
+    let project = session.handle.snapshot();
+    let project = project.diagnostics.get(DiagnosticSource::Project);
+    assert!(
+        project.iter().any(|diagnostic| {
+            diagnostic.severity == Severity::Error
+                && diagnostic.message.contains("the workspace root is gone")
+        }),
+        "{project:#?}"
+    );
+    session.handle.close().await;
+    assert!(!fixture.root.exists());
+}
+
+/// A workspace whose `risim-out/` another process locked after it was deleted closes, and its
+/// last event says who holds the lock.
+async fn workspace_closes_when_another_process_takes_the_output() {
+    let mut fixture = Workspace::new().await;
+    simulation_project(&mut fixture);
+    let runtime = runtime().await;
+    let mut session = open(&runtime, &fixture, spec_source(&fixture)).await;
+    session.handle.compile(tag("a"), None);
+    session.operation("a").await;
+
+    delete(fixture.layout.root()).await;
+    let (other, _) = OutputLock::acquire(&fixture.layout, "other").expect("take the lock");
+    session.handle.compile(tag("b"), None);
+    let mut events = Vec::new();
+    while let Some(event) = tokio::time::timeout(TIMEOUT, session.events.recv())
+        .await
+        .expect("timed out waiting for the workspace to close")
+    {
+        events.push(event.kind);
+    }
+    assert_eq!(
+        summary(&events),
+        [
+            "compile_started b 0",
+            "compile_finished b false None",
+            "output_taken other"
+        ]
+    );
+    // The other owner's files are untouched.
+    assert_eq!(
+        fs::read_to_string(fixture.layout.owner_file()).expect("read the owner record"),
+        "other"
+    );
+    other.release();
+    // Opening it again works once the other process released it.
+    let reopened = open(&runtime, &fixture, spec_source(&fixture)).await;
+    reopened.handle.close().await;
 }
 
 async fn workspace_reports_config_errors() {
