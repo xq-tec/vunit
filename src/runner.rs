@@ -11,15 +11,22 @@
 //!   testcases and prepares a [`PlannedTest`] per match, with the run options of the first
 //!   request that matches it.
 //! - **Run:** each test first takes its testcase lock, so the same testcase never runs twice at
-//!   once, then a permit of the simulation limit with its threads ([`crate::threads`]), and then
-//!   the lease of its threads. Tests whose lock is free get permits in name order; a test whose
-//!   lock is held by another simulation waits for it without holding up the others. Each test
-//!   with a lease recreates its output directory, gets a seed and its `runner_cfg` generic, and
-//!   runs the simulator (`risim-runner run`, with the lease's run options) with stdout and stderr
-//!   redirected to `output.txt`.
+//!   once, has the lease provider end a simulator of the testcase that it holds
+//!   ([`LeaseProvider::release_held`]), then takes a permit of the simulation limit with its
+//!   threads ([`crate::threads`]), and then the lease of its threads. Tests whose lock is free
+//!   get permits in name order; a test whose lock is held by another simulation waits for it
+//!   without holding up the others. Each test with a lease recreates its output directory, gets
+//!   a seed and its `runner_cfg` generic, and runs the simulator (`risim-runner run`, with the
+//!   lease's run options) with stdout and stderr redirected to `output.txt`.
 //! - **Outcome:** an explicit test passed if `vunit_results` records its start and the end of
 //!   the test suite; a testbench without explicit tests passed if the test suite ended. A
-//!   non-zero exit code fails a passed test from VHDL-2008 on (`has_valid_exit_code`).
+//!   non-zero exit code fails a passed test from VHDL-2008 on ([`outcome`]).
+//! - **Held end:** a simulation whose lease holds its simulator at the end
+//!   ([`Lease::with_ended`]) finishes when the lease reports the end, with the reported exit
+//!   status, while the simulator lives on; its results are complete by then. After
+//!   [`SimulationEvent::TestFinished`], the lease provider adopts the simulator, the lease's
+//!   guard and one thread of the budget ([`LeaseProvider::adopt`]); the operation's process
+//!   permit and thread cap are released, and so is the testcase lock.
 //! - **Results:** every finished test is recorded in the [`ResultStore`]. A test cancelled
 //!   before it started keeps its previous result, since its output directory is unchanged.
 //!   The recorded duration is that of the last run that completed (passed or failed), so it can
@@ -34,6 +41,7 @@
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
+use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs;
@@ -63,6 +71,8 @@ use crate::discovery::Discovery;
 use crate::pattern;
 use crate::pattern::Pattern;
 use crate::process;
+use crate::process::HeldOutcome;
+use crate::process::Process;
 use crate::project::Project;
 use crate::simulator::CommandError;
 use crate::simulator::RunOptions;
@@ -80,6 +90,7 @@ use crate::store::TestOutputPaths;
 use crate::store::TestResult;
 use crate::store::Timestamp;
 use crate::sync::lock_unpoisoned;
+use crate::threads::HeldRunner;
 use crate::threads::Lease;
 use crate::threads::LeaseEvents;
 use crate::threads::LeaseProvider;
@@ -624,7 +635,7 @@ pub struct SimulationContext {
     /// The run options of every simulation ([`RuntimeOptions::run_defaults`](crate::RuntimeOptions::run_defaults)).
     pub run_defaults: Arc<RunOptions>,
     /// Limits the concurrent simulations and their threads; a paused GUI simulation holds its
-    /// permit.
+    /// permit, and a held simulator one thread of the budget.
     pub limit: SimulationLimit,
     /// The most threads of the budget that one test takes, which caps its share.
     pub max_threads_per_test: NonZeroU32,
@@ -694,10 +705,15 @@ pub async fn simulate(plan: SimulationPlan, context: &SimulationContext) -> Simu
             reported: index < reported,
             behind: &names[(index + 1).max(reported)..],
         };
-        let (permit, waited) = acquire_permit(&test, &context, &waiting, queue).await;
-        if waited {
-            reported = names.len();
-        }
+        let permit = if release_held(&test, &context).await {
+            let (permit, waited) = acquire_permit(&test, &context, &waiting, queue).await;
+            if waited {
+                reported = names.len();
+            }
+            permit
+        } else {
+            None
+        };
         // Cancellation wins over a free permit, so no test starts after a cancel.
         let Some(permit) = permit else {
             drop(guard);
@@ -765,6 +781,10 @@ fn spawn_after_lock(
             waiting.fetch_sub(1, Ordering::Relaxed);
             return cancelled_before_start(&test, &context);
         };
+        if !release_held(&test, &context).await {
+            waiting.fetch_sub(1, Ordering::Relaxed);
+            return cancelled_before_start(&test, &context);
+        }
         let queue = Queue {
             reported,
             behind: &[],
@@ -776,6 +796,17 @@ fn spawn_after_lock(
         run_locked(&test, &context, guard, permit).await
     });
     handle.id()
+}
+
+/// Has the lease provider end its held simulator of the testcase of `test`, if any, so that
+/// preparing the output directory doesn't delete it from under the simulator; returns `false`
+/// if the simulation is cancelled first.
+async fn release_held(test: &PlannedTest, context: &SimulationContext) -> bool {
+    tokio::select! {
+        biased;
+        () = context.cancel.cancelled() => false,
+        () = context.leases.release_held(&context.workspace_root, &test.name) => true,
+    }
 }
 
 /// Where a test that waits for its permit is in the queue of its simulation.
@@ -831,16 +862,30 @@ async fn acquire_permit(
 }
 
 /// Runs a test that holds its testcase lock and a permit, and releases both afterwards.
+///
+/// A simulator held at the end passes to the lease provider, with one thread of the permit,
+/// before the lock is released.
 async fn run_locked(
     test: &PlannedTest,
     context: &SimulationContext,
     guard: OwnedMutexGuard<()>,
     permit: SimulationPermit,
 ) -> (TestOutcome, Vec<Diagnostic>) {
-    let result = run_test(test, context, permit.threads()).await;
-    drop(permit);
+    let (outcome, diagnostics, handover) = run_test(test, context, permit.threads()).await;
+    if let Some(handover) = handover {
+        tracing::debug!(name = %test.name, "handing over the held simulator");
+        context.leases.adopt(HeldRunner {
+            test: test.name.clone(),
+            workspace_root: Some(context.workspace_root.clone()),
+            process: handover.process,
+            guard: handover.guard,
+            threads: permit.into_budget_permit(),
+        });
+    } else {
+        drop(permit);
+    }
     drop(guard);
-    result
+    (outcome, diagnostics)
 }
 
 /// Reports a test that was cancelled before it started; its previous result is kept.
@@ -857,8 +902,8 @@ fn cancelled_before_start(
     (TestOutcome::Cancelled, Vec::new())
 }
 
-/// Runs one test that holds a simulation permit of `threads` threads; returns its outcome and
-/// the problems found.
+/// Runs one test that holds a simulation permit of `threads` threads; returns its outcome, the
+/// problems found, and its simulator if it ended held.
 ///
 /// The test first gets the lease of its threads; a cancel while it waits for the lease counts
 /// as a cancel before the start.
@@ -866,15 +911,17 @@ async fn run_test(
     test: &PlannedTest,
     context: &SimulationContext,
     threads: u32,
-) -> (TestOutcome, Vec<Diagnostic>) {
-    let events = LeaseEvents::new(test.name.clone(), context.events.clone());
+) -> (TestOutcome, Vec<Diagnostic>, Option<Handover>) {
+    let events = LeaseEvents::new(test.name.clone(), context.events.clone())
+        .with_workspace_root(context.workspace_root.clone());
     let lease = tokio::select! {
         biased;
         () = context.cancel.cancelled() => None,
         lease = context.leases.lease(&test.name, threads, &events) => Some(lease),
     };
     let Some(lease) = lease else {
-        return cancelled_before_start(test, context);
+        let (outcome, diagnostics) = cancelled_before_start(test, context);
+        return (outcome, diagnostics, None);
     };
     let started_at = Timestamp::now();
     context.emit(SimulationEvent::TestStarted {
@@ -885,7 +932,8 @@ async fn run_test(
     let started = Instant::now();
     let mut diagnostics = Vec::new();
     // Only a simulator that ran to an outcome measures the duration of the test.
-    let (outcome, completed) = match execute(test, context, lease).await {
+    let (executed, handover) = execute(test, context, lease).await;
+    let (outcome, completed) = match executed {
         Ok(outcome) => (outcome, outcome != TestOutcome::Cancelled),
         Err(message) => {
             append_to_output(&test.paths.output_file, &message);
@@ -926,26 +974,63 @@ async fn run_test(
         output_path: test.paths.output_file.clone(),
         duration,
     });
-    (outcome, diagnostics)
+    (outcome, diagnostics, handover)
 }
 
 /// Prepares the output directory, runs the simulator with the run options of `lease`, and reads
-/// the results.
+/// the results; returns the outcome, and the simulator if it ended held.
 ///
-/// The lease is kept until the simulator exits; a lease that wasn't granted fails the test.
+/// The lease is kept until the simulator exits or is handed over; a lease that wasn't granted
+/// fails the test.
 async fn execute(
     test: &PlannedTest,
     context: &SimulationContext,
     lease: Result<Lease, String>,
-) -> Result<TestOutcome, String> {
+) -> (Result<TestOutcome, String>, Option<Handover>) {
+    let (exit_success, handover) = match run_simulator(test, context, lease).await {
+        Ok(SimulatorEnd::Exited { success }) => (success, None),
+        Ok(SimulatorEnd::Held { success, handover }) => (success, Some(*handover)),
+        Ok(SimulatorEnd::Cancelled) => return (Ok(TestOutcome::Cancelled), None),
+        Err(message) => return (Err(message), None),
+    };
+    (read_outcome(test, exit_success), handover)
+}
+
+/// How the simulator of a test ended.
+enum SimulatorEnd {
+    /// It exited, successfully or not.
+    Exited { success: bool },
+    /// Its simulation ended while it was held, successfully or not; it lives on.
+    Held {
+        success: bool,
+        handover: Box<Handover>,
+    },
+    /// It was cancelled.
+    Cancelled,
+}
+
+/// The simulator of a test that ended held, with the guard of its lease.
+struct Handover {
+    process: Process,
+    guard: Box<dyn Any + Send>,
+}
+
+/// Prepares the output directory and runs the simulator with the run options of `lease`, until
+/// it exits, is cancelled, or ends held.
+async fn run_simulator(
+    test: &PlannedTest,
+    context: &SimulationContext,
+    lease: Result<Lease, String>,
+) -> Result<SimulatorEnd, String> {
     test.paths.prepare().map_err(|error| {
         format!(
             "failed to prepare the output directory {}: {error}",
             test.paths.dir
         )
     })?;
-    let lease =
+    let mut lease =
         lease.map_err(|error| format!("failed to lease the simulation threads: {error}"))?;
+    let ended = lease.take_ended();
     let seed = test.seed();
     let command = test
         .command_with(
@@ -957,20 +1042,34 @@ async fn execute(
         .map_err(|error| error.to_string())?;
     let header = format!("Seed for {}: {seed}\n", test.name);
     tracing::debug!(name = %test.name, ?command, "starting simulation");
-    let outcome = process::run_to_file(
+    let outcome = process::run_to_file_held(
         &command,
         &context.workspace_root,
         &test.paths.output_file,
         header.as_bytes(),
         &context.cancel,
+        ended,
     )
     .await
     .map_err(|error| format!("failed to run {}: {error}", context.simulator.path()))?;
-    drop(lease);
-    let status = match outcome {
-        process::Outcome::Exited(status) => status,
-        process::Outcome::Cancelled => return Ok(TestOutcome::Cancelled),
-    };
+    Ok(match outcome {
+        HeldOutcome::Ended(process::Outcome::Exited(status)) => SimulatorEnd::Exited {
+            success: status.success(),
+        },
+        HeldOutcome::Ended(process::Outcome::Cancelled) => SimulatorEnd::Cancelled,
+        HeldOutcome::Held { status, process } => SimulatorEnd::Held {
+            success: status == 0,
+            handover: Box::new(Handover {
+                process,
+                guard: lease.guard,
+            }),
+        },
+    })
+}
+
+/// The outcome of a simulation of `test` that ended, given whether its exit status was a
+/// success, from its `vunit_results`.
+fn read_outcome(test: &PlannedTest, exit_success: bool) -> Result<TestOutcome, String> {
     let results = match fs::read(&test.paths.results_file) {
         Ok(contents) => latin1(&contents),
         Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
@@ -981,7 +1080,7 @@ async fn execute(
             ));
         },
     };
-    Ok(test.outcome(&results, status.success()))
+    Ok(test.outcome(&results, exit_success))
 }
 
 /// Appends a message to the output file, so that clients showing the output see it.

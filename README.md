@@ -112,6 +112,10 @@ Simulations share a budget of threads (`RuntimeOptions::threads`, resizable), an
 Each simulation takes a share of the free threads, up to the threads that it can use (`RuntimeOptions::max_threads_per_test`), and asks the `LeaseProvider` of the runtime for a lease of them, whose run options go over the run options of the configuration and the defaults, but not over the keys that every simulation sets; a test waiting for threads reports it as `TestThreads`.
 The `threads` module documents the rules.
 
+A lease can hold its simulator at the end of the simulation (`Lease::with_ended`), so that riSim's hub can keep an ended simulation alive for its waveform viewer.
+The test then finishes with the exit status that the simulation reported, with its results complete, while the simulator lives on; the `LeaseProvider` adopts the simulator with the lease's guard and one thread of the budget (`LeaseProvider::adopt`, which by default terminates it), and the operation's other tests no longer wait for it.
+Before a test of the same testcase recreates its output directory, the provider ends that simulator (`LeaseProvider::release_held`), and `ThreadBudget::waiters` tells it when tests wait for threads, which held simulators may keep.
+
 A simulation runs `risim-runner run <options>`, with its options as one JSON object, whose keys are the long option names of `risim run` (riSim's `risim-run-options`).
 The object has the keys that every simulation sets (`simulator::SIMULATION_KEYS`: the libraries, the top-level unit, the generics, the assertion and GUI options, and the testcase name), the run options of the configuration (`SimOptions::run_options`, such as `relaxed` from the `options` of `risim-config.toml` and the keys of its `[run]`), and the defaults of the runtime that these don't set (`RuntimeOptions::run_defaults`, such as those that riSim's hub takes from its environment).
 The run options go over the defaults by the layer rule of riSim's `risim-run-options` (`simulator::overlay_run_options`), and those of a test configuration over the project's by the same rule: a later layer's `opt-level` drops the `opt.*` keys of the earlier ones, and its `opt.<name>` the keys `opt.<name>.*`.
@@ -120,7 +124,7 @@ Simulates whose requests have different run options don't merge, and a testcase 
 Run options that set a key of the simulation fail the test.
 The runner names the format of the object in `--version` (`run options format N`); a runner that reads another format than `simulator::RUN_OPTIONS_FORMAT`, or names none, can't be used, and `Runtime::new` fails.
 
-`Runtime::simulation_limit` returns the shared budget of threads as a `SimulationLimit`, so that a simulation that the application runs outside of a workspace, such as a standalone run of riSim's hub, waits for it like a testcase; `Runtime::leases` grants it its lease.
+`Runtime::simulation_limit` returns the shared budget of threads as a `SimulationLimit`, so that a simulation that the application runs outside of a workspace, such as a standalone run of riSim's hub, waits for it like a testcase; `Runtime::leases` grants it its lease, and `process::run_to_file_held` runs a simulator that its lease may hold.
 
 The consecutive files of one library that need compiling are analysed by one `risim analyze`, which prints its reports as JSON lines (`--message-format=json`); each report goes to the file of its location, and a file whose design units the call made obsolete is compiled again. The compiled libraries are kept as long as the paths of both executables and the `--version` output of `risim-runner` are the same, which names the archive format.
 

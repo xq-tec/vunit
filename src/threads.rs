@@ -23,6 +23,15 @@
 //!   simulator exits.
 //!   The provider may wait, and reports what the test waits for through [`LeaseEvents`].
 //!   [`NoLeases`] grants empty leases at once.
+//! - **Held runners:** a lease may ask to hold its simulator at the end of the simulation
+//!   ([`Lease::with_ended`]), for a waveform viewer.
+//!   When the simulation ends held, the test finishes with the reported status, and the provider
+//!   adopts the running simulator ([`LeaseProvider::adopt`]) with the lease's guard and one
+//!   thread of the budget; the operation's process permit and thread cap are released.
+//!   Before a test of the same testcase prepares its output directory, the provider ends the
+//!   held simulator ([`LeaseProvider::release_held`]).
+//!   [`ThreadBudget::waiters`] tells the provider when tests wait for the budget, so that it can
+//!   end held simulators to free their threads.
 //!
 //! Waits are reported as [`SimulationEvent::TestThreads`]: a test that doesn't get a thread of
 //! the budget at once reports [`WaitReason::Budget`], for itself and the tests of its simulation
@@ -38,10 +47,15 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use camino::Utf8Path;
+use camino::Utf8PathBuf;
 use tokio::sync::AcquireError;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
+use tokio::sync::oneshot;
+use tokio::sync::watch;
 
+use crate::process::Process;
 use crate::runner::SimulationEvent;
 use crate::runner::SimulationEvents;
 use crate::simulator::RunOptions;
@@ -100,6 +114,8 @@ pub struct ThreadBudget {
 struct BudgetInner {
     semaphore: Arc<Semaphore>,
     state: Mutex<BudgetState>,
+    /// The number of acquisitions waiting for a thread.
+    waiters: watch::Sender<u32>,
 }
 
 #[derive(Debug)]
@@ -118,6 +134,7 @@ impl ThreadBudget {
             inner: Arc::new(BudgetInner {
                 semaphore: Arc::new(Semaphore::new(to_usize(threads.get()))),
                 state: Mutex::new(BudgetState { threads, debt: 0 }),
+                waiters: watch::Sender::new(0),
             }),
         }
     }
@@ -130,6 +147,14 @@ impl ThreadBudget {
     /// The number of threads that are free now.
     pub fn available(&self) -> usize {
         self.inner.semaphore.available_permits()
+    }
+
+    /// The number of acquisitions that wait for a thread of this budget, as it changes.
+    ///
+    /// Only waits for this budget count, not those for the processes or the thread cap of an
+    /// operation.
+    pub fn waiters(&self) -> watch::Receiver<u32> {
+        self.inner.waiters.subscribe()
     }
 
     /// Changes the size of the budget to `threads`.
@@ -164,8 +189,12 @@ impl ThreadBudget {
         Ok(permit)
     }
 
-    /// Waits for one thread.
+    /// Waits for one thread, counting as a waiter while no thread is free.
     async fn acquire_one(&self) -> Result<ThreadPermit, AcquireError> {
+        if let Some(permit) = self.try_acquire_one() {
+            return Ok(permit);
+        }
+        let _waiter = Waiter::new(&self.inner.waiters);
         let permit = Arc::clone(&self.inner.semaphore).acquire_owned().await?;
         Ok(self.permit(permit))
     }
@@ -197,6 +226,23 @@ impl ThreadBudget {
             budget: Arc::clone(&self.inner),
             permit: Some(permit),
         }
+    }
+}
+
+/// Counts an acquisition as a waiter of a [`ThreadBudget`] until dropped, also when the
+/// acquisition is cancelled.
+struct Waiter<'a>(&'a watch::Sender<u32>);
+
+impl<'a> Waiter<'a> {
+    fn new(waiters: &'a watch::Sender<u32>) -> Self {
+        waiters.send_modify(|count| *count = count.saturating_add(1));
+        Self(waiters)
+    }
+}
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        self.0.send_modify(|count| *count = count.saturating_sub(1));
     }
 }
 
@@ -294,6 +340,16 @@ impl SimulationPermit {
     pub fn threads(&self) -> u32 {
         self.threads.threads()
     }
+
+    /// Releases the operation's process permit and thread cap, and all threads of the budget
+    /// but one, which it returns.
+    ///
+    /// A held simulator keeps one thread, but mustn't hold up the other tests of its operation.
+    pub fn into_budget_permit(self) -> ThreadPermit {
+        let mut threads = self.threads;
+        threads.shrink_to(1);
+        threads
+    }
 }
 
 impl SimulationLimit {
@@ -377,6 +433,9 @@ impl From<ThreadBudget> for SimulationLimit {
 /// The future of [`LeaseProvider::lease`].
 pub type LeaseFuture<'a> = Pin<Box<dyn Future<Output = Result<Lease, String>> + Send + 'a>>;
 
+/// The future of [`LeaseProvider::release_held`].
+pub type ReleaseFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
 /// Grants the simulations of a runtime the right to use their threads.
 pub trait LeaseProvider: Send + Sync + fmt::Debug {
     /// Grants the simulation of `test`, which holds `threads` threads of the budget, its lease.
@@ -385,10 +444,69 @@ pub trait LeaseProvider: Send + Sync + fmt::Debug {
     /// future.
     /// The lease's guard may keep a clone of `events`, to report the states of the running
     /// simulator until it is dropped, which is before the test's
-    /// [`SimulationEvent::TestFinished`].
+    /// [`SimulationEvent::TestFinished`], or until it is adopted with a held simulator
+    /// ([`adopt`](Self::adopt)), after which the test no longer listens.
     /// An error fails the test with its message.
     fn lease<'a>(&'a self, test: &'a str, threads: u32, events: &'a LeaseEvents)
     -> LeaseFuture<'a>;
+
+    /// Takes over the simulator of a test whose simulation ended while its lease held it
+    /// ([`Lease::with_ended`]).
+    ///
+    /// It is called after the test's [`SimulationEvent::TestFinished`] and before its testcase
+    /// lock is released, from within the runtime.
+    /// The provider keeps the guard and the thread until the process exits, and ends the
+    /// process when a test of the same testcase is about to start
+    /// ([`release_held`](Self::release_held)).
+    /// The default terminates the process, and then drops the guard and the thread.
+    fn adopt(&self, mut held: HeldRunner) {
+        tokio::spawn(async move {
+            if let Err(error) = held.process.terminate().await {
+                tracing::warn!(test = %held.test, %error, "failed to terminate a held simulator");
+            }
+        });
+    }
+
+    /// Ends the held simulator of the testcase `test` of the workspace `workspace_root`, if any,
+    /// and waits for its exit.
+    ///
+    /// A test calls it after taking its testcase lock and before preparing its output
+    /// directory, which the held simulator still writes to; a cancel drops the future.
+    /// The default returns at once.
+    #[expect(unused_variables, reason = "the default holds no simulators")]
+    fn release_held<'a>(
+        &'a self,
+        workspace_root: &'a Utf8Path,
+        test: &'a str,
+    ) -> ReleaseFuture<'a> {
+        Box::pin(std::future::ready(()))
+    }
+}
+
+/// The simulator of a test whose simulation ended while its lease held it, which the
+/// [`LeaseProvider`] adopts.
+pub struct HeldRunner {
+    /// The testcase name.
+    pub test: String,
+    /// The root of the test's workspace; `None` for a simulation outside of a workspace.
+    pub workspace_root: Option<Utf8PathBuf>,
+    /// The running simulator.
+    pub process: Process,
+    /// The guard of the test's lease ([`Lease::guard`]).
+    pub guard: Box<dyn Any + Send>,
+    /// The thread of the budget that the simulator keeps.
+    pub threads: ThreadPermit,
+}
+
+impl fmt::Debug for HeldRunner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HeldRunner")
+            .field("test", &self.test)
+            .field("workspace_root", &self.workspace_root)
+            .field("process", &self.process)
+            .field("threads", &self.threads)
+            .finish_non_exhaustive()
+    }
 }
 
 /// The lease of a simulation.
@@ -397,7 +515,8 @@ pub struct Lease {
     /// ([`SimulateArgs::lease_options`](crate::simulator::SimulateArgs::lease_options)).
     pub options: RunOptions,
     /// Kept until the simulator has exited, or, if the test ends without waiting for that (an
-    /// error while waiting, or a dropped task), until it is killed.
+    /// error while waiting, or a dropped task), until it is killed; passed on with a held
+    /// simulator ([`HeldRunner::guard`]).
     pub guard: Box<dyn Any + Send>,
 }
 
@@ -409,6 +528,48 @@ impl Lease {
             guard: Box::new(()),
         }
     }
+
+    /// Asks to hold the simulator when its simulation ends: `ended` yields the exit status that
+    /// the simulation reported, while the simulator lives on.
+    ///
+    /// The test then finishes with that status, and the provider adopts the simulator
+    /// ([`LeaseProvider::adopt`]).
+    /// A dropped sender lets the test wait for the simulator's exit as usual.
+    #[must_use]
+    pub fn with_ended(self, ended: oneshot::Receiver<i32>) -> Self {
+        Self {
+            options: self.options,
+            guard: Box::new(HoldingGuard {
+                ended,
+                guard: self.guard,
+            }),
+        }
+    }
+
+    /// Takes the receiver of [`with_ended`](Self::with_ended), if any, and restores the guard
+    /// that the lease was granted with.
+    pub(crate) fn take_ended(&mut self) -> Option<oneshot::Receiver<i32>> {
+        let guard = std::mem::replace(&mut self.guard, Box::new(()));
+        match guard.downcast::<HoldingGuard>() {
+            Ok(holding) => {
+                self.guard = holding.guard;
+                Some(holding.ended)
+            },
+            Err(guard) => {
+                self.guard = guard;
+                None
+            },
+        }
+    }
+}
+
+/// The guard of a lease that holds its simulator at the end ([`Lease::with_ended`]).
+///
+/// The receiver travels in the guard, so that providers can still build a [`Lease`] from its
+/// two fields.
+struct HoldingGuard {
+    ended: oneshot::Receiver<i32>,
+    guard: Box<dyn Any + Send>,
 }
 
 impl fmt::Debug for Lease {
@@ -439,12 +600,31 @@ impl LeaseProvider for NoLeases {
 pub struct LeaseEvents {
     name: String,
     events: SimulationEvents,
+    workspace_root: Option<Utf8PathBuf>,
 }
 
 impl LeaseEvents {
     /// The reporter of the test `name`, which sends to `events`.
     pub const fn new(name: String, events: SimulationEvents) -> Self {
-        Self { name, events }
+        Self {
+            name,
+            events,
+            workspace_root: None,
+        }
+    }
+
+    /// Sets the root of the test's workspace.
+    #[must_use]
+    pub fn with_workspace_root(self, workspace_root: Utf8PathBuf) -> Self {
+        Self {
+            workspace_root: Some(workspace_root),
+            ..self
+        }
+    }
+
+    /// The root of the test's workspace; `None` for a simulation outside of a workspace.
+    pub fn workspace_root(&self) -> Option<&Utf8Path> {
+        self.workspace_root.as_deref()
     }
 
     /// Reports `state` as [`SimulationEvent::TestThreads`].
@@ -526,6 +706,98 @@ mod tests {
         let gui = limit.acquire(1, NonZeroU32::MIN, |_| {}).await.unwrap();
         assert_eq!(gui.threads(), 1);
         assert_eq!(budget.available(), 7);
+    }
+
+    /// Waits until `waiters` counts `count`.
+    async fn wait_for_waiters(waiters: &mut watch::Receiver<u32>, count: u32) {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            waiters.wait_for(|&waiting| waiting == count),
+        )
+        .await
+        .expect("the waiters")
+        .expect("the budget");
+    }
+
+    #[tokio::test]
+    async fn waiters_count_budget_waits_only() {
+        let budget = ThreadBudget::new(threads(1));
+        let mut waiters = budget.waiters();
+        // An acquisition that gets a free thread doesn't wait.
+        let held = budget.acquire(threads(1)).await.unwrap();
+        assert_eq!(*waiters.borrow(), 0);
+
+        let waiting = tokio::spawn({
+            let budget = budget.clone();
+            async move {
+                budget
+                    .acquire(threads(1))
+                    .await
+                    .map(|permit| permit.threads())
+            }
+        });
+        wait_for_waiters(&mut waiters, 1).await;
+
+        // Waits for the processes or the thread cap of an operation don't count.
+        let processes = Arc::new(Semaphore::new(1));
+        let process = Arc::clone(&processes).acquire_owned().await.unwrap();
+        let cap = ThreadBudget::new(threads(1));
+        let capped = cap.acquire(threads(1)).await.unwrap();
+        let by_processes = SimulationLimit::new(budget.clone(), Some(processes), None);
+        let by_cap = SimulationLimit::new(budget.clone(), None, Some(cap.clone()));
+        let blocked = tokio::spawn(async move {
+            tokio::join!(
+                by_processes.acquire(1, NonZeroU32::MAX, |_| {}),
+                by_cap.acquire(1, NonZeroU32::MAX, |_| {}),
+            )
+        });
+        let mut cap_waiters = cap.waiters();
+        wait_for_waiters(&mut cap_waiters, 1).await;
+        assert_eq!(*waiters.borrow(), 1);
+        blocked.abort();
+        assert!(blocked.await.unwrap_err().is_cancelled());
+        wait_for_waiters(&mut cap_waiters, 0).await;
+        drop((process, capped));
+
+        // A cancelled wait stops counting.
+        let cancelled = tokio::spawn({
+            let budget = budget.clone();
+            async move {
+                budget
+                    .acquire(threads(1))
+                    .await
+                    .map(|permit| permit.threads())
+            }
+        });
+        wait_for_waiters(&mut waiters, 2).await;
+        cancelled.abort();
+        assert!(cancelled.await.unwrap_err().is_cancelled());
+        wait_for_waiters(&mut waiters, 1).await;
+
+        drop(held);
+        assert_eq!(waiting.await.unwrap().unwrap(), 1);
+        wait_for_waiters(&mut waiters, 0).await;
+    }
+
+    #[tokio::test]
+    async fn a_budget_permit_keeps_one_thread() {
+        let budget = ThreadBudget::new(threads(4));
+        let processes = Arc::new(Semaphore::new(1));
+        let cap = ThreadBudget::new(threads(3));
+        let limit = SimulationLimit::new(
+            budget.clone(),
+            Some(Arc::clone(&processes)),
+            Some(cap.clone()),
+        );
+        let permit = limit.acquire(1, NonZeroU32::MAX, |_| {}).await.unwrap();
+        assert_eq!(permit.threads(), 3);
+        let kept = permit.into_budget_permit();
+        assert_eq!(kept.threads(), 1);
+        assert_eq!(budget.available(), 3);
+        assert_eq!(processes.available_permits(), 1);
+        assert_eq!(cap.available(), 3);
+        drop(kept);
+        assert_eq!(budget.available(), 4);
     }
 
     #[tokio::test]

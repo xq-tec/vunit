@@ -53,7 +53,7 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 | `watch`                     | — (new)                                                             | `notify` watcher, debouncing, change classification                         |
 | `workspace`                 | — (new)                                                             | Per-workspace actor: state, request merging, operations, events             |
 | `runtime`                   | — (new)                                                             | Shared limits, risim-runner detection across workspaces                     |
-| `threads`                   | — (new)                                                             | Thread budget, shares, operation thread cap, leases of simulations          |
+| `threads`                   | — (new)                                                             | Thread budget, shares, operation thread cap, leases, held simulators        |
 | `verilog_parser` (deferred) | `parsing/verilog/*`                                                 | Deferred                                                                    |
 
 (\*) Only on the fork's `risim` branch, which held the Python risim-ghdl support.
@@ -63,6 +63,7 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - Every test runs in its own simulation (`run_all_in_same_sim` is ignored).
 - No test history; no seed "repeat"; no xUnit/JUnit reports; no elaborate-only mode; no `pre_config`/`post_check` hooks.
 - A test that never started counts as failed (VUnit: skipped).
+- A simulation whose lease holds its simulator at the end (riSim's hub, for a waveform viewer) finishes when the simulator reports the end of the simulation, not when it exits; the simulator passes to the lease provider.
 - `runner_cfg` has no `run script path`, so `run_script_path(runner_cfg)` is empty. Simulations start in testcase name order. A test cancelled before it started keeps its previous result.
 - The compile set includes the files declaring the VHDL configurations the test runs elaborate. VUnit's `--minimal` compiles only the testbench files and their dependencies, which misses them.
 - Recompilation uses compile keys instead of timestamps. Independent libraries compile in parallel and continue after unrelated failures.

@@ -32,6 +32,7 @@ use std::time::Instant;
 use camino::Utf8Path;
 use camino::Utf8PathBuf;
 use libtest_mimic::Arguments;
+use libtest_mimic::Trial;
 use risim_vunit_frontend::builtins;
 use risim_vunit_frontend::compile;
 use risim_vunit_frontend::compile::CompileContext;
@@ -64,11 +65,13 @@ use risim_vunit_frontend::store::TestCounts;
 use risim_vunit_frontend::store::TestOutcome;
 use risim_vunit_frontend::store::TestOutputPaths;
 use risim_vunit_frontend::store::TestResults;
+use risim_vunit_frontend::threads::HeldRunner;
 use risim_vunit_frontend::threads::Lease;
 use risim_vunit_frontend::threads::LeaseEvents;
 use risim_vunit_frontend::threads::LeaseFuture;
 use risim_vunit_frontend::threads::LeaseProvider;
 use risim_vunit_frontend::threads::NoLeases;
+use risim_vunit_frontend::threads::ReleaseFuture;
 use risim_vunit_frontend::threads::SimulationLimit;
 use risim_vunit_frontend::threads::ThreadBudget;
 use risim_vunit_frontend::threads::ThreadState;
@@ -76,6 +79,7 @@ use risim_vunit_frontend::threads::WaitReason;
 use serde_json::Value;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use self::trial::trial;
@@ -178,8 +182,38 @@ fn main() -> ExitCode {
             env::var_os("RISIM_RUNNER").is_none() || env::var_os("RISIM_ANALYZER").is_none(),
         ),
     ];
-    let trials = trials.into_iter().chain(workspace::trials()).collect();
+    let trials = trials
+        .into_iter()
+        .chain(held_trials())
+        .chain(workspace::trials())
+        .collect();
     libtest_mimic::run(&args, trials).exit_code()
+}
+
+/// The trials of simulators held at the end.
+fn held_trials() -> Vec<Trial> {
+    vec![
+        trial(
+            "a_held_end_hands_over_the_simulator",
+            a_held_end_hands_over_the_simulator,
+        ),
+        trial(
+            "a_held_simulator_frees_the_process_permit",
+            a_held_simulator_frees_the_process_permit,
+        ),
+        trial(
+            "release_held_comes_before_prepare",
+            release_held_comes_before_prepare,
+        ),
+        trial(
+            "a_cancel_interrupts_release_held",
+            a_cancel_interrupts_release_held,
+        ),
+        trial(
+            "a_provider_without_adoption_terminates_the_simulator",
+            a_provider_without_adoption_terminates_the_simulator,
+        ),
+    ]
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -209,6 +243,8 @@ struct Workspace {
     max_threads_per_test: NonZeroU32,
     /// Grants the simulations' leases.
     leases: Arc<dyn LeaseProvider>,
+    /// The number of processes of a simulation operation, if limited.
+    max_parallel: Option<usize>,
 }
 
 /// The result of a compile, with the events and when they arrived.
@@ -301,6 +337,7 @@ impl Workspace {
             threads: ThreadBudget::new(threads(4)),
             max_threads_per_test: NonZeroU32::MIN,
             leases: Arc::new(NoLeases),
+            max_parallel: None,
         }
     }
 
@@ -455,7 +492,12 @@ impl Workspace {
             workspace_root: self.root.clone(),
             simulator: self.simulator.clone(),
             run_defaults: Arc::default(),
-            limit: SimulationLimit::from(self.threads.clone()),
+            limit: SimulationLimit::new(
+                self.threads.clone(),
+                self.max_parallel
+                    .map(|processes| Arc::new(Semaphore::new(processes))),
+                None,
+            ),
             max_threads_per_test: self.max_threads_per_test,
             leases: Arc::clone(&self.leases),
             results: Arc::clone(results),
@@ -1228,10 +1270,20 @@ async fn semaphore_limits_simulations() {
 
 /// Grants leases with the run option `{"lease": <threads>}`, or fails them with `fail`,
 /// records the threads of every test, and reports them as running.
+///
+/// With `hold`, the leases hold their simulators at the end, which the fake simulator reports
+/// in its log (its directive `hold`); the provider adopts them.
+/// It records the calls of `lease` and `release_held`, and the tests whose lease guards were
+/// dropped.
 #[derive(Debug, Default)]
 struct RecordingLeases {
     granted: Mutex<Vec<(String, u32)>>,
     fail: Option<String>,
+    hold: bool,
+    /// `lease <test>` and `release <test> <whether the output directory has options.json>`.
+    calls: Mutex<Vec<String>>,
+    adopted: Mutex<Vec<HeldRunner>>,
+    dropped: Arc<Mutex<Vec<String>>>,
 }
 
 impl RecordingLeases {
@@ -1239,6 +1291,23 @@ impl RecordingLeases {
     fn threads(&self) -> Vec<u32> {
         let granted = self.granted.lock().expect("lock");
         granted.iter().map(|&(_, threads)| threads).collect()
+    }
+
+    /// The calls of `lease` and `release_held`, in order.
+    fn calls(&self) -> Vec<String> {
+        self.calls.lock().expect("lock").clone()
+    }
+
+    /// Takes the adopted simulators, sorted by test.
+    fn take_adopted(&self) -> Vec<HeldRunner> {
+        let mut adopted = std::mem::take(&mut *self.adopted.lock().expect("lock"));
+        adopted.sort_by(|left, right| left.test.cmp(&right.test));
+        adopted
+    }
+
+    /// The tests whose lease guards were dropped.
+    fn dropped(&self) -> Vec<String> {
+        self.dropped.lock().expect("lock").clone()
     }
 }
 
@@ -1253,16 +1322,134 @@ impl LeaseProvider for RecordingLeases {
             .lock()
             .expect("lock")
             .push((test.to_owned(), threads));
+        self.calls
+            .lock()
+            .expect("lock")
+            .push(format!("lease {test}"));
         events.report(ThreadState::Running { threads });
-        let lease = match &self.fail {
-            Some(message) => Err(message.clone()),
-            None => Ok(Lease {
+        let lease = if let Some(message) = &self.fail {
+            Err(message.clone())
+        } else {
+            let lease = Lease {
                 options: RunOptions::from_iter([("lease".to_owned(), threads.into())]),
-                guard: Box::new(()),
-            }),
+                guard: Box::new(LeaseGuard {
+                    test: test.to_owned(),
+                    dropped: Arc::clone(&self.dropped),
+                }),
+            };
+            if self.hold {
+                let log = events
+                    .workspace_root()
+                    .expect("the workspace root")
+                    .join(fake_risim::LOG);
+                let (sender, ended) = oneshot::channel();
+                tokio::spawn(report_held_end(log, test.to_owned(), sender));
+                Ok(lease.with_ended(ended))
+            } else {
+                Ok(lease)
+            }
         };
         Box::pin(std::future::ready(lease))
     }
+
+    fn adopt(&self, held: HeldRunner) {
+        self.adopted.lock().expect("lock").push(held);
+    }
+
+    fn release_held<'a>(
+        &'a self,
+        workspace_root: &'a Utf8Path,
+        test: &'a str,
+    ) -> ReleaseFuture<'a> {
+        let paths = TestOutputPaths::new(&OutputLayout::new(workspace_root), test);
+        let previous = paths.dir.join("options.json").exists();
+        self.calls
+            .lock()
+            .expect("lock")
+            .push(format!("release {test} {previous}"));
+        Box::pin(std::future::ready(()))
+    }
+}
+
+/// The guard of a lease of [`RecordingLeases`], which records its test when dropped.
+#[derive(Debug)]
+struct LeaseGuard {
+    test: String,
+    dropped: Arc<Mutex<Vec<String>>>,
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        self.dropped.lock().expect("lock").push(self.test.clone());
+    }
+}
+
+/// Sends the exit code of `test` once the fake simulator logs to `log` that it holds it.
+async fn report_held_end(log: Utf8PathBuf, test: String, sender: oneshot::Sender<i32>) {
+    let prefix = format!("held {test} ");
+    while !sender.is_closed() {
+        let contents = fs::read_to_string(&log).unwrap_or_default();
+        if let Some(code) = contents.lines().find_map(|line| line.strip_prefix(&prefix)) {
+            sender.send(code.parse().expect("the exit code")).ok();
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// A [`RecordingLeases`] without its own `adopt`, which leaves adoption to the default.
+#[derive(Debug)]
+struct WithoutAdoption(Arc<RecordingLeases>);
+
+impl LeaseProvider for WithoutAdoption {
+    fn lease<'a>(
+        &'a self,
+        test: &'a str,
+        threads: u32,
+        events: &'a LeaseEvents,
+    ) -> LeaseFuture<'a> {
+        self.0.lease(test, threads, events)
+    }
+}
+
+/// A [`RecordingLeases`] whose held simulators never end, so that `release_held` waits forever.
+#[derive(Debug)]
+struct NeverReleased(Arc<RecordingLeases>);
+
+impl LeaseProvider for NeverReleased {
+    fn lease<'a>(
+        &'a self,
+        test: &'a str,
+        threads: u32,
+        events: &'a LeaseEvents,
+    ) -> LeaseFuture<'a> {
+        self.0.lease(test, threads, events)
+    }
+
+    fn release_held<'a>(
+        &'a self,
+        _workspace_root: &'a Utf8Path,
+        _test: &'a str,
+    ) -> ReleaseFuture<'a> {
+        Box::pin(std::future::pending())
+    }
+}
+
+/// Awaits `future`, failing if it takes longer than 30 s.
+async fn within<T>(future: impl Future<Output = T>) -> T {
+    tokio::time::timeout(Duration::from_secs(30), future)
+        .await
+        .expect("in time")
+}
+
+/// Waits until `condition` holds, failing after 30 s.
+async fn eventually(mut condition: impl FnMut() -> bool) {
+    within(async {
+        while !condition() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
 }
 
 /// `lib`: a testbench `tb_many` with the tests `t0`, `t1`, …, `count` in all.
@@ -1463,6 +1650,189 @@ fn positions(log: &[String], prefix: &str) -> Vec<usize> {
         .filter(|(_, line)| line.starts_with(prefix))
         .map(|(index, _)| index)
         .collect()
+}
+
+/// A simulation that ends held finishes its test with the reported status and its results, and
+/// hands over its simulator, the lease's guard and one thread of the budget.
+async fn a_held_end_hands_over_the_simulator() {
+    let mut workspace = Workspace::new().await;
+    workspace.threads = ThreadBudget::new(threads(4));
+    workspace.max_threads_per_test = threads(4);
+    let leases = Arc::new(RecordingLeases {
+        hold: true,
+        ..RecordingLeases::default()
+    });
+    workspace.leases = Arc::clone(&leases) as Arc<dyn LeaseProvider>;
+    simulation_project(&mut workspace);
+    workspace.sim_directive("lib.tb_tests.pass", "hold");
+    workspace.sim_directive("lib.tb_tests.slow", "exit 3");
+    workspace.sim_directive("lib.tb_tests.slow", "hold");
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    let run = within(workspace.simulate(
+        &[("lib.tb_tests.pass", false), ("lib.tb_tests.slow", false)],
+        &results,
+    ))
+    .await;
+    // The results pass both; the status fails the second.
+    let expected = [
+        ("lib.tb_tests.pass", TestOutcome::Passed),
+        ("lib.tb_tests.slow", TestOutcome::Failed),
+    ];
+    assert_eq!(run.outcomes(), expected);
+    assert_eq!(run.report.diagnostics, []);
+    let recorded = results.snapshot();
+    for (name, outcome) in expected {
+        assert_eq!(recorded[name].outcome, outcome, "{name}");
+    }
+    let log = workspace.take_log();
+    assert!(
+        log.iter().any(|line| line == "held lib.tb_tests.pass 0")
+            && log.iter().any(|line| line == "held lib.tb_tests.slow 3")
+            && !log.iter().any(|line| line.starts_with("simend")),
+        "{log:#?}"
+    );
+
+    // Each test had more than one thread; its simulator keeps one.
+    assert!(
+        leases.threads().iter().all(|&threads| threads > 1),
+        "{:?}",
+        leases.threads()
+    );
+    let mut adopted = leases.take_adopted();
+    let tests: Vec<&str> = adopted.iter().map(|held| held.test.as_str()).collect();
+    assert_eq!(tests, ["lib.tb_tests.pass", "lib.tb_tests.slow"]);
+    assert_eq!(workspace.threads.available(), 2);
+    assert_eq!(leases.dropped(), Vec::<String>::new());
+    for held in &mut adopted {
+        assert_eq!(held.threads.threads(), 1);
+        assert_eq!(
+            held.workspace_root.as_deref(),
+            Some(workspace.root.as_path())
+        );
+        let guard = held
+            .guard
+            .downcast_ref::<LeaseGuard>()
+            .expect("the lease's guard");
+        assert_eq!(guard.test, held.test);
+        // The simulator lives on.
+        tokio::time::timeout(Duration::from_millis(100), held.process.wait())
+            .await
+            .expect_err("the simulator lives on");
+    }
+
+    for mut held in adopted {
+        held.process.terminate().await.expect("terminate");
+    }
+    assert_eq!(workspace.threads.available(), 4);
+    assert_eq!(leases.dropped().len(), 2);
+}
+
+/// A held simulator doesn't keep the process permit of its operation, so that the operation's
+/// other tests run.
+async fn a_held_simulator_frees_the_process_permit() {
+    let mut workspace = Workspace::new().await;
+    workspace.max_parallel = Some(1);
+    let leases = Arc::new(RecordingLeases {
+        hold: true,
+        ..RecordingLeases::default()
+    });
+    workspace.leases = Arc::clone(&leases) as Arc<dyn LeaseProvider>;
+    simulation_project(&mut workspace);
+    workspace.sim_directive("lib.tb_tests.pass", "hold");
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    let run = within(workspace.simulate(
+        &[("lib.tb_tests.pass", false), ("lib.tb_tests.slow", false)],
+        &results,
+    ))
+    .await;
+    assert_eq!(
+        run.outcomes(),
+        [
+            ("lib.tb_tests.pass", TestOutcome::Passed),
+            ("lib.tb_tests.slow", TestOutcome::Passed),
+        ]
+    );
+    let adopted = leases.take_adopted();
+    let tests: Vec<&str> = adopted.iter().map(|held| held.test.as_str()).collect();
+    assert_eq!(tests, ["lib.tb_tests.pass"]);
+    for mut held in adopted {
+        held.process.terminate().await.expect("terminate");
+    }
+}
+
+/// A test has its testcase's held simulator ended before it prepares its output directory, and
+/// before it asks for its lease.
+async fn release_held_comes_before_prepare() {
+    let mut workspace = Workspace::new().await;
+    let leases = Arc::new(RecordingLeases::default());
+    workspace.leases = Arc::clone(&leases) as Arc<dyn LeaseProvider>;
+    simulation_project(&mut workspace);
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    for _ in 0..2 {
+        let run = workspace
+            .simulate(&[("lib.tb_tests.pass", false)], &results)
+            .await;
+        assert_eq!(run.outcomes(), [("lib.tb_tests.pass", TestOutcome::Passed)]);
+    }
+    // At the second release, the output of the first run is still there.
+    assert_eq!(
+        leases.calls(),
+        [
+            "release lib.tb_tests.pass false",
+            "lease lib.tb_tests.pass",
+            "release lib.tb_tests.pass true",
+            "lease lib.tb_tests.pass",
+        ]
+    );
+}
+
+/// A cancel interrupts a test that waits for the end of its testcase's held simulator, which
+/// then doesn't start.
+async fn a_cancel_interrupts_release_held() {
+    let mut workspace = Workspace::new().await;
+    let leases = Arc::new(RecordingLeases::default());
+    workspace.leases = Arc::new(NeverReleased(Arc::clone(&leases)));
+    simulation_project(&mut workspace);
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    let run = within(workspace.simulate_until(
+        &[("lib.tb_tests.pass", false)],
+        &results,
+        |event| matches!(event, SimulationEvent::Started { .. }),
+    ))
+    .await;
+    assert_eq!(
+        run.outcomes(),
+        [("lib.tb_tests.pass", TestOutcome::Cancelled)]
+    );
+    assert_eq!(leases.calls(), Vec::<String>::new());
+    assert!(workspace.take_log().is_empty());
+}
+
+/// A provider that doesn't adopt held simulators has them terminated, and then drops their
+/// lease guards and threads.
+async fn a_provider_without_adoption_terminates_the_simulator() {
+    let mut workspace = Workspace::new().await;
+    let leases = Arc::new(RecordingLeases {
+        hold: true,
+        ..RecordingLeases::default()
+    });
+    workspace.leases = Arc::new(WithoutAdoption(Arc::clone(&leases)));
+    simulation_project(&mut workspace);
+    workspace.sim_directive("lib.tb_tests.pass", "hold");
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    let run = within(workspace.simulate(&[("lib.tb_tests.pass", false)], &results)).await;
+    assert_eq!(run.outcomes(), [("lib.tb_tests.pass", TestOutcome::Passed)]);
+    eventually(|| leases.dropped() == ["lib.tb_tests.pass"]).await;
+    assert_eq!(workspace.threads.available(), 4);
+    let log = workspace.take_log();
+    assert!(
+        log.iter().any(|line| line == "held lib.tb_tests.pass 0"),
+        "{log:#?}"
+    );
+    assert!(
+        !log.iter().any(|line| line.starts_with("simend")),
+        "{log:#?}"
+    );
 }
 
 /// A lease that isn't granted fails the test with the provider's message.
