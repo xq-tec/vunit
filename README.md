@@ -33,17 +33,16 @@ The crate provides:
 
 ## Usage
 
-A workspace is opened from a `risim-config.toml`. The `options` list is passed both to analysis (`risim analyze`) and to elaboration (`risim-runner run`). It accepts `--relaxed`, its alias `-frelaxed`, and `-fsynopsys`, which has no effect; any other option is a configuration error:
+A workspace is opened from a `risim-config.toml`:
 
 ```toml
-# Options of analysis and elaboration.
-options = ["-frelaxed"]
-
-# Options of the simulations: the optimization preset, and rows or groups over it.
-[run]
+# The options of the project: relaxed analysis and elaboration, the optimization preset, and rows
+# or groups of optimizations over it. Only tables follow the header.
+[options]
+relaxed = true
 opt-level = "full"
 
-[run.opt]
+[options.opt]
 wake-guards = "off"
 "mir.cse" = "off"
 
@@ -60,15 +59,25 @@ files = ["src/**/*.vhd", "tb/*.vhd"]
 version = "1.4"
 ```
 
-`[toolchain] version` is read by the riSim launcher, which selects the toolchain by it (riSim's `doc/installation.md`); this crate accepts it without a warning and otherwise ignores it.
-Unknown keys, including other keys in `[toolchain]` and `[run]`, are warnings.
+`[options]` holds the options of the project, which the `config` module turns into `ProjectSpec::options` for analysis and into run options of every simulation (riSim's `risim-run-options`):
 
-`[run]` sets run options of every simulation: `opt-level` the run option `opt-level`, and each key `NAME` of `[run.opt]` the run option `opt.NAME` (riSim's `risim-run-options`).
-The values are strings.
-A dotted name is quoted (`"mir.cse" = "off"`); a table in `[run.opt]`, such as `mir.cse = "off"` or `[run.opt.mir]`, is an error that names the quoted form.
-`RuntimeOptions::check_run_options` checks each of these keys when the file is read, as riSim's hub does with `risim_run_options::validate_partial`; a key that it rejects is a configuration error and is left out.
+- `relaxed = true` is `--relaxed` for analysis (`Options::analyze_args`) and the run option `relaxed` for elaboration; `relaxed = false` is the same as no key.
+- `opt-level` is the run option `opt-level`, a preset name or its number.
+- Each key `NAME` of `[options.opt]` (or `opt = { … }`) is the run option `opt.NAME`, with a string mode.
+  A dotted name is quoted (`"mir.cse" = "off"`); a table in `[options.opt]`, such as `mir.cse = "off"` or `[options.opt.mir]`, is an error that names the quoted form.
+
+The table can also be written inline, `options = { relaxed = true }`, which avoids the TOML pitfall that bare and dotted keys after the `[options]` header belong to it.
+`[libraries.NAME.options]` holds a library's own options, over the project's (`Options::for_library`); it has no valid keys yet, and the keys of `[options]` are project level only.
+The builtin libraries take the project's `relaxed` (`Options::for_builtins`).
+
+Unknown keys and wrong types in the options tables are configuration errors at their keys or values; the rest of the file still loads.
+The former list `options = ["-frelaxed"]` and the former `[run]` table are errors that give the new spelling, and nothing of them is applied.
+`RuntimeOptions::check_run_options` checks each run key of `[options]` when the file is read, as riSim's hub does with `risim_run_options::validate_partial`; a key that it rejects is a configuration error and is left out, and a rejected `relaxed` doesn't make the analysis relaxed either.
+`[toolchain] version` is read by the riSim launcher, which selects the toolchain by it (riSim's `doc/installation.md`); this crate accepts it without a warning and otherwise ignores it.
+Unknown keys outside the options tables, including other keys in `[toolchain]`, are warnings.
 
 A `ProjectSpec` built in code describes the same project, and can also set external libraries, a VHDL standard per library, and configurations, generics and simulation options per testbench or test. Pass it as `ProjectSource::Spec` instead of `ProjectSource::ConfigFile`.
+Such a spec sets the run option `relaxed` next to `Options::relaxed` for relaxed elaboration, as reading `relaxed = true` does.
 
 ```rust
 use std::num::NonZeroU32;
@@ -113,7 +122,7 @@ Each simulation takes a share of the free threads, up to the threads that it can
 The `threads` module documents the rules.
 
 A simulation runs `risim-runner run <options>`, with its options as one JSON object, whose keys are the long option names of `risim run` (riSim's `risim-run-options`).
-The object has the keys that every simulation sets (`simulator::SIMULATION_KEYS`: the libraries, the top-level unit, the generics, the assertion and GUI options, and the testcase name), the run options of the configuration (`SimOptions::run_options`, such as `relaxed` from the `options` of `risim-config.toml` and the keys of its `[run]`), and the defaults of the runtime that these don't set (`RuntimeOptions::run_defaults`, such as those that riSim's hub takes from its environment).
+The object has the keys that every simulation sets (`simulator::SIMULATION_KEYS`: the libraries, the top-level unit, the generics, the assertion and GUI options, and the testcase name), the run options of the configuration (`SimOptions::run_options`, such as the run keys `relaxed`, `opt-level`, and `opt` of the `[options]` of `risim-config.toml`), and the defaults of the runtime that these don't set (`RuntimeOptions::run_defaults`, such as those that riSim's hub takes from its environment).
 The run options go over the defaults by the layer rule of riSim's `risim-run-options` (`simulator::overlay_run_options`), and those of a test configuration over the project's by the same rule: a later layer's `opt-level` drops the `opt.*` keys of the earlier ones, and its `opt.<name>` the keys `opt.<name>.*`.
 The run options of a `SimulationRequest` (`options`, such as the optimizations that riSim's GUI chooses) go over those of the configuration by the same rule.
 Simulates whose requests have different run options don't merge, and a testcase that several requests with different run options match runs once, with those of the first, and a warning.

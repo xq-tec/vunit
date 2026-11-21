@@ -38,6 +38,7 @@ use crate::project::LibraryNames;
 use crate::project::Project;
 use crate::spec::FilePattern;
 use crate::spec::LibrarySpec;
+use crate::spec::Options;
 use crate::spec::ProjectSpec;
 use crate::store;
 use crate::store::FileTime;
@@ -103,6 +104,10 @@ pub struct CollectedLibrary {
     pub external_path: Option<Utf8PathBuf>,
     /// The VHDL files, without duplicates.
     pub files: Vec<Utf8PathBuf>,
+    /// The effective options of the library's files: [`Options::for_builtins`] of the project's
+    /// for the builtin libraries (also for files added to `vunit_lib`),
+    /// [`Options::for_library`] for user libraries, and the default for precompiled ones.
+    pub options: Options,
 }
 
 /// The libraries of a project with their files.
@@ -126,6 +131,7 @@ pub fn collect(root: &Utf8Path, spec: &ProjectSpec, builtins_dir: &Utf8Path) -> 
 
     let selection = builtins::select(spec.vhdl_standard, &spec.features, include_osvvm);
     collected.config_diagnostics.extend(selection.diagnostics);
+    let builtin_options = spec.options.for_builtins();
     for library in selection.libraries {
         collected.libraries.push(CollectedLibrary {
             name: library.name.to_owned(),
@@ -136,6 +142,7 @@ pub fn collect(root: &Utf8Path, spec: &ProjectSpec, builtins_dir: &Utf8Path) -> 
                 .iter()
                 .map(|file| builtins_dir.join(file.rel_path))
                 .collect(),
+            options: builtin_options.clone(),
         });
     }
 
@@ -145,6 +152,7 @@ pub fn collect(root: &Utf8Path, spec: &ProjectSpec, builtins_dir: &Utf8Path) -> 
                 name,
                 files,
                 vhdl_standard,
+                options,
             } => {
                 let mut library_files = Vec::new();
                 let mut seen = FxHashSet::default();
@@ -188,6 +196,7 @@ pub fn collect(root: &Utf8Path, spec: &ProjectSpec, builtins_dir: &Utf8Path) -> 
                     vhdl_standard: vhdl_standard.unwrap_or(spec.vhdl_standard),
                     external_path: None,
                     files: library_files,
+                    options: spec.options.for_library(options),
                 });
             },
             LibrarySpec::External { name, path } => {
@@ -203,6 +212,7 @@ pub fn collect(root: &Utf8Path, spec: &ProjectSpec, builtins_dir: &Utf8Path) -> 
                     vhdl_standard: spec.vhdl_standard,
                     external_path: Some(path),
                     files: Vec::new(),
+                    options: Options::default(),
                 });
             },
         }
@@ -629,6 +639,7 @@ pub fn build_project(
                 continue;
             },
         };
+        project.set_library_options(library_id, library.options.clone());
         for path in &library.files {
             let Some(result) = loaded.get(path) else {
                 continue;
@@ -840,6 +851,30 @@ mod tests {
             .collect();
         assert_eq!(names, ["vunit_lib", "osvvm"]);
         assert_eq!(collected.libraries[0].files.last(), Some(&tb));
+    }
+
+    #[test]
+    fn collect_gives_the_projects_relaxed_to_every_library() {
+        let workspace = Workspace::new();
+        let mut spec = ProjectSpec::new();
+        spec.add_library("lib", Vec::<String>::new())
+            .add_external_library("ext", ".");
+        spec.options.relaxed = true;
+        let collected = collect(&workspace.root, &spec, Utf8Path::new("/builtins"));
+        let relaxed: Vec<_> = collected
+            .libraries
+            .iter()
+            .map(|library| (library.name.as_str(), library.options.relaxed))
+            .collect();
+        assert_eq!(
+            relaxed,
+            [
+                ("vunit_lib", true),
+                ("osvvm", true),
+                ("lib", true),
+                ("ext", false)
+            ]
+        );
     }
 
     #[test]

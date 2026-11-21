@@ -34,8 +34,8 @@ pub struct ProjectSpec {
     pub features: BTreeSet<Feature>,
     /// User libraries, in the order they are added to the project.
     pub libraries: Vec<LibrarySpec>,
-    /// Options for analysis.
-    pub compile_options: CompileOptions,
+    /// The options of the project (`[options]`), over which each library's own options go.
+    pub options: Options,
     /// Options for elaboration and simulation.
     pub sim_options: SimOptions,
     /// Configurations of testbenches and tests.
@@ -58,6 +58,7 @@ impl ProjectSpec {
             name: name.into(),
             files: patterns.into_iter().map(FilePattern::new).collect(),
             vhdl_standard: None,
+            options: Options::default(),
         });
         self
     }
@@ -141,6 +142,9 @@ pub enum LibrarySpec {
         files: Vec<FilePattern>,
         /// The standard of the library's files, if it differs from the project's.
         vhdl_standard: Option<VhdlStandard>,
+        /// The library's own options (`[libraries.NAME.options]`), unmerged; those of the
+        /// library's files are [`Options::for_library`] of the project's with them.
+        options: Options,
     },
     /// A precompiled library. It is never compiled, only passed to the simulator with `-L`.
     External {
@@ -191,11 +195,49 @@ pub struct PatternLocation {
     pub range: Range,
 }
 
-/// Options for analysis (`risim analyze`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct CompileOptions {
-    /// Extra options of `risim analyze`.
-    pub a_flags: Vec<String>,
+/// The options of the project (`[options]`) or of a library (`[libraries.NAME.options]`).
+///
+/// They hold what analysis needs; the run options of the same table, such as `opt-level`, are
+/// in [`SimOptions::run_options`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Relaxed analysis (`--relaxed`); project level only.
+    ///
+    /// Elaboration takes the run option `relaxed` instead: a [`ProjectSpec`] built in code sets
+    /// that too for relaxed elaboration, as reading `relaxed = true` from `[options]` does.
+    pub relaxed: bool,
+}
+
+impl Options {
+    /// The arguments of `risim analyze` for these options, in their single-argument long forms,
+    /// without those of the defaults.
+    pub fn analyze_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if self.relaxed {
+            args.push("--relaxed".to_owned());
+        }
+        args
+    }
+
+    /// The options of a library whose own options are `library`, with these as the project's.
+    ///
+    /// `relaxed` is the project's, since a library can't set it.
+    #[must_use]
+    pub const fn for_library(&self, library: &Self) -> Self {
+        let Self { relaxed: _ } = library;
+        Self {
+            relaxed: self.relaxed,
+        }
+    }
+
+    /// The options of the builtin libraries (VUnit's and OSVVM) with these as the project's:
+    /// `relaxed` only.
+    #[must_use]
+    pub const fn for_builtins(&self) -> Self {
+        Self {
+            relaxed: self.relaxed,
+        }
+    }
 }
 
 /// Options for elaboration and simulation (`risim-runner run`).
@@ -371,6 +413,24 @@ mod tests {
                 .overridden_by(&configuration)
                 .run_options,
             configuration.run_options
+        );
+    }
+
+    #[test]
+    fn options_become_analyze_args() {
+        assert_eq!(Options::default().analyze_args(), Vec::<String>::new());
+        let relaxed = Options { relaxed: true };
+        assert_eq!(relaxed.analyze_args(), ["--relaxed"]);
+    }
+
+    #[test]
+    fn libraries_and_builtins_keep_relaxed() {
+        let relaxed = Options { relaxed: true };
+        assert_eq!(relaxed.for_builtins(), relaxed);
+        assert_eq!(relaxed.for_library(&Options::default()), relaxed);
+        assert_eq!(
+            Options::default().for_library(&Options::default()),
+            Options::default()
         );
     }
 

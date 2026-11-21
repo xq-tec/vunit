@@ -5,16 +5,14 @@
 //! Reading `risim-config.toml` into a [`ProjectSpec`].
 //!
 //! ```toml
-//! # Options of `risim analyze` and of the simulations: `--relaxed`, or its alias `-frelaxed`, and
-//! # `-fsynopsys`, which has no effect.
-//! options = ["-frelaxed"]
-//!
-//! # Options of the simulations: the optimization preset, and rows or groups of optimizations
-//! # over it, where dotted names are quoted.
-//! [run]
+//! # The options of the project: relaxed analysis and elaboration, the optimization preset, and
+//! # rows or groups of optimizations over it, where dotted names are quoted.
+//! # Only tables follow, since bare keys after the header would belong to `[options]`.
+//! [options]
+//! relaxed = true
 //! opt-level = "full"
 //!
-//! [run.opt]
+//! [options.opt]
 //! wake-guards = "off"
 //! "mir.cse" = "off"
 //!
@@ -31,13 +29,23 @@
 //! version = "1.4"
 //! ```
 //!
-//! `[run]` becomes the run options `opt-level` and `opt.<name>` of every simulation
-//! ([`SimOptions::run_options`]), next to `relaxed` from `options`; the run options of a
+//! `[options]` can also be written inline, `options = { relaxed = true }`, which stays correct
+//! anywhere above the tables.
+//! It becomes [`ProjectSpec::options`] for analysis, and the run options `relaxed`, `opt-level`,
+//! and `opt.<name>` of every simulation ([`SimOptions::run_options`]); the run options of a
 //! configuration go over them ([`SimOptions::overridden_by`]).
-//! A table in `[run.opt]`, such as `[run.opt.mir]`, is an error that names the quoted form.
+//! `relaxed = false` is the same as no key.
+//! `[libraries.NAME.options]` has no valid keys yet; the project's options are project level
+//! only.
+//!
+//! Unknown keys and wrong types in the options tables are errors at their spans, also a table
+//! in `[options.opt]`, which names the quoted form.
+//! The former list `options = ["-frelaxed"]` and the former `[run]` table are errors that give
+//! the new spelling, and nothing of them is applied.
+//! Unknown keys elsewhere are warnings.
 //!
 //! Problems become diagnostics with ranges in the file. Only syntax and type errors prevent a
-//! [`ProjectSpec`]; invalid libraries, features and options are left out of it, also the run
+//! [`ProjectSpec`]; invalid libraries, features, and options are left out of it, also the run
 //! options that the check of [`load`] rejects.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
@@ -61,10 +69,10 @@ use crate::diagnostics::Severity;
 use crate::project::LibraryNames;
 use crate::simulator::CheckRunOptions;
 use crate::simulator::RunOptions;
-use crate::spec::CompileOptions;
 use crate::spec::Feature;
 use crate::spec::FilePattern;
 use crate::spec::LibrarySpec;
+use crate::spec::Options;
 use crate::spec::PatternLocation;
 use crate::spec::ProjectSpec;
 use crate::spec::SimOptions;
@@ -89,8 +97,11 @@ pub struct ReadError {
     pub source: io::Error,
 }
 
-/// Reads and parses the configuration file at `path`, and checks the run options of its `[run]`
-/// table with `check_run_options`, one key at a time.
+/// Reads and parses the configuration file at `path`.
+///
+/// `check_run_options` checks the run options of its `[options]` table (`relaxed`,
+/// `opt-level`, and `opt`), one key at a time; a key that it rejects is an error and isn't
+/// applied.
 ///
 /// # Errors
 ///
@@ -136,25 +147,24 @@ pub fn parse(path: &Utf8Path, content: &str, check_run_options: Option<CheckRunO
     }
 }
 
-/// The options of analysis and simulation.
-///
-/// `risim analyze` takes them as they are; a simulation gets the run option `relaxed` from
-/// `--relaxed` and `-frelaxed`, and nothing from `-fsynopsys`.
-const OPTIONS: [&str; 3] = ["--relaxed", "-frelaxed", "-fsynopsys"];
+/// The keys of `[options]`, all of them project level only.
+const OPTION_KEYS: [&str; 3] = ["relaxed", "opt-level", "opt"];
 
-/// The options of `OPTIONS` that make the simulations relaxed.
-const RELAXED: [&str; 2] = ["--relaxed", "-frelaxed"];
+/// The elements of the former list `options` that make the project relaxed.
+const LEGACY_RELAXED: [&str; 3] = ["--relaxed", "-frelaxed", "-frelaxed-rules"];
 
+/// The fields of the options tables and of the former `[run]` take any value, so that a wrong
+/// type is a diagnostic of ours and not a serde error that drops the spec.
 #[derive(Deserialize)]
 struct RawConfig {
-    #[serde(default)]
-    options: Vec<Spanned<String>>,
+    /// `[options]`.
+    options: Option<Spanned<toml::Value>>,
     #[serde(default)]
     vunit: RawVunit,
     #[serde(default)]
     libraries: BTreeMap<String, RawLibrary>,
-    #[serde(default)]
-    run: RawRun,
+    /// The former `[run]` table, which is an error.
+    run: Option<Spanned<toml::Value>>,
     /// Read by the riSim launcher, which selects the toolchain by it; accepted here so that it
     /// isn't an unknown key.
     #[serde(default)]
@@ -176,22 +186,11 @@ struct RawVunit {
     features: Vec<Spanned<String>>,
 }
 
-/// The `[run]` table.
-#[derive(Default, Deserialize)]
-struct RawRun {
-    /// The optimization preset, the run option `opt-level`: a name, or the number of one; any
-    /// value, so that another type is an error at the value.
-    #[serde(rename = "opt-level")]
-    opt_level: Option<Spanned<toml::Value>>,
-    /// The modes of rows and groups, the run options `opt.<name>`; any value, so that a table
-    /// gets the error that names the quoted form.
-    #[serde(default)]
-    opt: BTreeMap<String, Spanned<toml::Value>>,
-}
-
 #[derive(Deserialize)]
 struct RawLibrary {
     files: Vec<Spanned<String>>,
+    /// `[libraries.NAME.options]`.
+    options: Option<Spanned<toml::Value>>,
 }
 
 /// A step in the path of an ignored key.
@@ -317,35 +316,31 @@ impl Parser<'_> {
                     }
                 })
                 .collect();
+            let options = match library.options {
+                Some(options) => self.library_options(&name, options, table),
+                None => Options::default(),
+            };
             spec.libraries.push(LibrarySpec::Sources {
                 name,
                 files,
                 vhdl_standard: None,
+                options,
             });
         }
 
-        let mut options = Vec::new();
-        for option in raw.options {
-            if OPTIONS.contains(&option.get_ref().as_str()) {
-                options.push(option.into_inner());
-            } else {
-                let message = format!(
-                    "unsupported option '{}'; expected one of: {}",
-                    option.get_ref(),
-                    OPTIONS.join(", ")
-                );
-                self.diagnostic(Severity::Error, message, Some(option.span()));
-            }
-        }
         let mut run_options = RunOptions::new();
-        if options
-            .iter()
-            .any(|option| RELAXED.contains(&option.as_str()))
-        {
-            run_options.insert("relaxed".to_owned(), true.into());
+        if let Some(options) = raw.options {
+            spec.options = self.options(options, table, &mut run_options);
         }
-        self.run_options(raw.run, table, &mut run_options);
-        spec.compile_options = CompileOptions { a_flags: options };
+        if raw.run.is_some() {
+            self.diagnostic(
+                Severity::Error,
+                "[run] is part of [options] now: write opt-level there, and [options.opt] for \
+                 [run.opt]"
+                    .to_owned(),
+                key_span(table, &[PathSegment::Key("run".to_owned())]),
+            );
+        }
         spec.sim_options = SimOptions {
             run_options: Some(run_options),
             ..SimOptions::default()
@@ -353,69 +348,143 @@ impl Parser<'_> {
         spec
     }
 
-    /// Adds the run options of the `[run]` table `run` to `run_options`, those that the check
-    /// accepts.
-    fn run_options(&mut self, run: RawRun, table: &DeTable<'_>, run_options: &mut RunOptions) {
-        let key_path = |keys: &[&str]| -> Vec<PathSegment> {
-            ["run", "opt"]
+    /// Reads `[options]` from `value`: its analysis options, and its run options into
+    /// `run_options`, those that the check accepts.
+    fn options(
+        &mut self,
+        value: Spanned<toml::Value>,
+        table: &DeTable<'_>,
+        run_options: &mut RunOptions,
+    ) -> Options {
+        let mut options = Options::default();
+        let span = value.span();
+        let keys = match value.into_inner() {
+            toml::Value::Table(keys) => keys,
+            toml::Value::Array(list) => {
+                self.legacy_options(&list, table);
+                return options;
+            },
+            _ => {
+                self.diagnostic(
+                    Severity::Error,
+                    "`options` is a table, such as options = { relaxed = true }".to_owned(),
+                    Some(span),
+                );
+                return options;
+            },
+        };
+        let path = |key: &str| -> Vec<PathSegment> {
+            vec![
+                PathSegment::Key("options".to_owned()),
+                PathSegment::Key(key.to_owned()),
+            ]
+        };
+        for (key, entry) in in_file_order(table, keys, path) {
+            let key_span = key_span(table, &path(&key));
+            let value_span = value_span(table, &path(&key));
+            match key.as_str() {
+                "relaxed" => match entry {
+                    toml::Value::Boolean(true) => {
+                        options.relaxed = self.run_option(
+                            "relaxed".to_owned(),
+                            serde_json::Value::Bool(true),
+                            "'relaxed' in [options]",
+                            value_span,
+                            run_options,
+                        );
+                    },
+                    // The same as no key, so that it can't mask a configuration's `relaxed`.
+                    toml::Value::Boolean(false) => {},
+                    other => {
+                        let message =
+                            format!("'relaxed' in [options] is true or false, not {other}");
+                        self.diagnostic(Severity::Error, message, value_span);
+                    },
+                },
+                "opt-level" => {
+                    let level = match entry {
+                        toml::Value::String(level) => Some(level),
+                        // `-O 2` is a preset too.
+                        toml::Value::Integer(level) => Some(level.to_string()),
+                        other => {
+                            let message = format!(
+                                "'opt-level' in [options] is a preset, such as \"full\" or 2, \
+                                 not {other}"
+                            );
+                            self.diagnostic(Severity::Error, message, value_span.clone());
+                            None
+                        },
+                    };
+                    if let Some(level) = level {
+                        self.run_option(
+                            "opt-level".to_owned(),
+                            level.into(),
+                            "'opt-level' in [options]",
+                            value_span,
+                            run_options,
+                        );
+                    }
+                },
+                "opt" => match entry {
+                    toml::Value::Table(modes) => self.opt_modes(modes, table, run_options),
+                    _ => self.diagnostic(
+                        Severity::Error,
+                        "'opt' in [options] is a table of modes, such as [options.opt] or opt = \
+                         { wake-guards = \"off\" }"
+                            .to_owned(),
+                        value_span,
+                    ),
+                },
+                _ => {
+                    let mut message = format!(
+                        "unknown option '{key}' in [options]; expected one of: {}",
+                        OPTION_KEYS.join(", ")
+                    );
+                    if ["libraries", "vunit", "toolchain"].contains(&key.as_str()) {
+                        message.push_str(
+                            "; keys after the [options] header belong to it, so put them above \
+                             the header, or write options = { … }",
+                        );
+                    }
+                    self.diagnostic(Severity::Error, message, key_span);
+                },
+            }
+        }
+        options
+    }
+
+    /// Adds the run options `opt.<name>` of the modes `modes` of `[options.opt]` to
+    /// `run_options`, those that the check accepts.
+    fn opt_modes(&mut self, modes: toml::Table, table: &DeTable<'_>, run_options: &mut RunOptions) {
+        let path = |keys: &[&str]| -> Vec<PathSegment> {
+            ["options", "opt"]
                 .iter()
                 .chain(keys)
                 .map(|key| PathSegment::Key((*key).to_owned()))
                 .collect()
         };
-        if let Some(level) = run.opt_level {
-            let span = level.span();
-            let level = match level.into_inner() {
-                toml::Value::String(level) => Some(level),
-                // `-O 2` is a preset too.
-                toml::Value::Integer(level) => Some(level.to_string()),
-                other => {
-                    let message = format!(
-                        "'opt-level' in [run] is a preset, such as \"full\" or 2, not {other}"
-                    );
-                    self.diagnostic(Severity::Error, message, Some(span.clone()));
-                    None
-                },
-            };
-            if let Some(level) = level {
-                self.run_option(
-                    "opt-level".to_owned(),
-                    level,
-                    "'opt-level' in [run]",
-                    Some(span),
-                    run_options,
-                );
-            }
-        }
-        // In file order; the map sorts them by name.
-        let mut settings: Vec<_> = run
-            .opt
-            .into_iter()
-            .map(|(name, value)| (key_span(table, &key_path(&[&name])), name, value))
-            .collect();
-        settings.sort_by_key(|(span, _, _)| span.as_ref().map(|span| span.start));
-        for (span, name, value) in settings {
-            let value_span = value.span();
-            match value.into_inner() {
+        for (name, value) in in_file_order(table, modes, |name| path(&[name])) {
+            let span = key_span(table, &path(&[&name]));
+            match value {
                 toml::Value::String(mode) => {
-                    let what = format!("'{name}' in [run.opt]");
-                    self.run_option(format!("opt.{name}"), mode, &what, span, run_options);
+                    let what = format!("'{name}' in [options.opt]");
+                    self.run_option(format!("opt.{name}"), mode.into(), &what, span, run_options);
                 },
                 nested @ toml::Value::Table(_) => {
                     let mut leaves = Vec::new();
                     nested_leaves(vec![name], &nested, &mut leaves);
                     for (keys, leaf) in leaves {
                         let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
-                        let leaf_span = key_span(table, &key_path(&keys));
+                        let leaf_span = key_span(table, &path(&keys));
                         let dotted = keys.join(".");
                         // An empty table has no leaf to quote.
                         let message = match leaf {
                             toml::Value::Table(_) => format!(
-                                "a dotted name in [run.opt] is quoted, such as \"{dotted}.NAME\" = \
-                                 \"off\""
+                                "a dotted name in [options.opt] is quoted, such as \
+                                 \"{dotted}.NAME\" = \"off\""
                             ),
                             _ => format!(
-                                "a dotted name in [run.opt] is quoted: \"{dotted}\" = {leaf}"
+                                "a dotted name in [options.opt] is quoted: \"{dotted}\" = {leaf}"
                             ),
                         };
                         self.diagnostic(Severity::Error, message, leaf_span);
@@ -423,33 +492,106 @@ impl Parser<'_> {
                 },
                 other => {
                     let message = format!(
-                        "the mode of '{name}' in [run.opt] is a string, such as \"on\" or \"off\", \
-                         not {other}"
+                        "the mode of '{name}' in [options.opt] is a string, such as \"on\" or \
+                         \"off\", not {other}"
                     );
-                    self.diagnostic(Severity::Error, message, Some(value_span));
+                    self.diagnostic(Severity::Error, message, value_span(table, &path(&[&name])));
                 },
             }
         }
     }
 
-    /// Adds the run option `key` with the text `value` to `run_options` if the check accepts it,
-    /// and reports it as `what` at `span` otherwise.
+    /// Reads `[libraries.NAME.options]` of the library `library` from `value`.
+    ///
+    /// It has no valid keys yet: the keys of `[options]` are project level only.
+    fn library_options(
+        &mut self,
+        library: &str,
+        value: Spanned<toml::Value>,
+        table: &DeTable<'_>,
+    ) -> Options {
+        let path = |key: &str| -> Vec<PathSegment> {
+            ["libraries", library, "options", key]
+                .iter()
+                .map(|key| PathSegment::Key((*key).to_owned()))
+                .collect()
+        };
+        let span = value.span();
+        let toml::Value::Table(keys) = value.into_inner() else {
+            self.diagnostic(
+                Severity::Error,
+                format!("`options` of library '{library}' is a table, such as options = {{}}"),
+                Some(span),
+            );
+            return Options::default();
+        };
+        for (key, _) in in_file_order(table, keys, |key| path(key)) {
+            let message = if OPTION_KEYS.contains(&key.as_str()) {
+                format!("'{key}' is a project option; set it in [options]")
+            } else {
+                format!("unknown option '{key}' in [libraries.{library}.options]")
+            };
+            self.diagnostic(Severity::Error, message, key_span(table, &path(&key)));
+        }
+        Options::default()
+    }
+
+    /// Reports the former list `options`, with the table that replaces it; nothing of it is
+    /// applied.
+    fn legacy_options(&mut self, list: &[toml::Value], table: &DeTable<'_>) {
+        let text = |element: &toml::Value| match element {
+            toml::Value::String(text) => text.clone(),
+            other => other.to_string(),
+        };
+        let relaxed = list
+            .iter()
+            .any(|element| LEGACY_RELAXED.contains(&text(element).as_str()));
+        let mut parts = vec![if relaxed {
+            "`options` is a table now: replace this list with options = { relaxed = true }"
+                .to_owned()
+        } else {
+            "`options` is a table now: delete this list".to_owned()
+        }];
+        let mut seen = Vec::new();
+        for element in list {
+            let element = text(element);
+            if LEGACY_RELAXED.contains(&element.as_str()) || seen.contains(&element) {
+                continue;
+            }
+            parts.push(if element == "-fsynopsys" {
+                "'-fsynopsys' isn't needed, since the Synopsys packages are always in IEEE"
+                    .to_owned()
+            } else {
+                format!("'{element}' has no equivalent")
+            });
+            seen.push(element);
+        }
+        self.diagnostic(
+            Severity::Error,
+            parts.join("; "),
+            key_span(table, &[PathSegment::Key("options".to_owned())]),
+        );
+    }
+
+    /// Adds the run option `key` with `value` to `run_options` if the check accepts it, and
+    /// reports it as `what` at `span` otherwise; returns whether it was added.
     fn run_option(
         &mut self,
         key: String,
-        value: String,
+        value: serde_json::Value,
         what: &str,
         span: Option<ops::Range<usize>>,
         run_options: &mut RunOptions,
-    ) {
-        let option = RunOptions::from_iter([(key, value.into())]);
+    ) -> bool {
+        let option = RunOptions::from_iter([(key, value)]);
         if let Some(check) = self.check_run_options
             && let Err(error) = check(&option)
         {
             self.diagnostic(Severity::Error, format!("invalid {what}: {error}"), span);
-            return;
+            return false;
         }
         run_options.extend(option);
+        true
     }
 }
 
@@ -495,29 +637,62 @@ fn path_segments(path: &serde_ignored::Path<'_>) -> Vec<PathSegment> {
     segments
 }
 
+/// Returns the entries of `keys`, a table at the key paths `path(key)` of `table`, in file order.
+///
+/// A table iterates its entries by name.
+fn in_file_order(
+    table: &DeTable<'_>,
+    keys: toml::Table,
+    path: impl Fn(&str) -> Vec<PathSegment>,
+) -> Vec<(String, toml::Value)> {
+    let mut entries: Vec<_> = keys
+        .into_iter()
+        .map(|(key, value)| (key_span(table, &path(&key)), key, value))
+        .collect();
+    entries.sort_by_key(|(span, _, _)| span.as_ref().map(|span| span.start));
+    entries
+        .into_iter()
+        .map(|(_, key, value)| (key, value))
+        .collect()
+}
+
 /// Finds the span of the last key in `path`, or of the array element if it ends with an index.
 fn key_span(table: &DeTable<'_>, path: &[PathSegment]) -> Option<ops::Range<usize>> {
+    spans(table, path).map(|(key, _)| key)
+}
+
+/// Finds the span of the value at `path`.
+fn value_span(table: &DeTable<'_>, path: &[PathSegment]) -> Option<ops::Range<usize>> {
+    spans(table, path).map(|(_, value)| value)
+}
+
+/// Finds the spans of the last key in `path` and of its value, or of the array element twice if
+/// it ends with an index.
+fn spans(
+    table: &DeTable<'_>,
+    path: &[PathSegment],
+) -> Option<(ops::Range<usize>, ops::Range<usize>)> {
     let mut value: Option<&DeValue<'_>> = None;
     let mut current_table = Some(table);
-    let mut span = None;
+    let mut spans = None;
     for segment in path {
         match segment {
             PathSegment::Key(key) => {
                 let (found_key, found_value) = current_table?
                     .iter()
                     .find(|(candidate, _)| candidate.get_ref().as_ref() == key.as_str())?;
-                span = Some(found_key.span());
+                spans = Some((found_key.span(), found_value.span()));
                 value = Some(found_value.get_ref());
             },
             PathSegment::Index(index) => {
                 let element = value?.as_array()?.get(*index)?;
-                span = Some(element.span());
+                spans = Some((element.span(), element.span()));
                 value = Some(element.get_ref());
             },
         }
         current_table = value.and_then(DeValue::as_table);
     }
-    span
+    spans
 }
 
 #[cfg(test)]
@@ -541,8 +716,6 @@ mod tests {
     fn parses_libraries_in_file_order() {
         let config = parse_str(
             r#"
-options = ["-fsynopsys"]
-
 [vunit]
 features = ["random"]
 
@@ -566,12 +739,12 @@ files = ["sim/model/*.vhd", "tb/*.vhd"]
             Some(PatternLocation {
                 file: PATH.into(),
                 range: Range {
-                    start: Position::new(11, 10),
-                    end: Position::new(11, 26),
+                    start: Position::new(9, 10),
+                    end: Position::new(9, 26),
                 },
             })
         );
-        assert_eq!(spec.compile_options.a_flags, ["-fsynopsys"]);
+        assert_eq!(spec.options, Options::default());
         assert_eq!(spec.sim_options.run_options, Some(RunOptions::new()));
         assert_eq!(
             spec.features.iter().copied().collect::<Vec<_>>(),
@@ -579,51 +752,291 @@ files = ["sim/model/*.vhd", "tb/*.vhd"]
         );
     }
 
+    /// The former list `options` is one error that gives the table, and nothing of it is
+    /// applied.
     #[test]
-    fn unsupported_options_are_errors() {
+    fn list_options_name_the_table() {
         let config = parse_str(
-            "options = [\"-frelaxed\", \"-Wno-hide\", \"--relaxed\", \"--no-vital-checks\"]\n",
+            "options = [\"-frelaxed\", \"-fsynopsys\", \"-Wno-hide\"]\n[libraries.lib]\nfiles = \
+             []\n",
         );
+        let spec = config.spec.clone().unwrap();
+        assert_eq!(library_names(&spec), ["lib"]);
+        assert_eq!(spec.options, Options::default());
+        assert_eq!(spec.sim_options.run_options, Some(RunOptions::new()));
+        assert_eq!(
+            messages(&config),
+            [(
+                Severity::Error,
+                "`options` is a table now: replace this list with options = { relaxed = true }; \
+                 '-fsynopsys' isn't needed, since the Synopsys packages are always in IEEE; \
+                 '-Wno-hide' has no equivalent",
+                Some(Position::new(1, 1)),
+            )]
+        );
+
+        let empty = parse_str("options = []\n");
+        assert_eq!(
+            messages(&empty),
+            [(
+                Severity::Error,
+                "`options` is a table now: delete this list",
+                Some(Position::new(1, 1)),
+            )]
+        );
+    }
+
+    #[test]
+    fn options_table_sets_options_and_run_options() {
+        let expected = RunOptions::from_iter([
+            ("relaxed".to_owned(), true.into()),
+            ("opt-level".to_owned(), "full".into()),
+            ("opt.wake-guards".to_owned(), "off".into()),
+            ("opt.mir.cse".to_owned(), "off".into()),
+        ]);
+        let config = parse_str(
+            r#"
+[options]
+relaxed = true
+opt-level = "full"
+
+[options.opt]
+wake-guards = "off"
+"mir.cse" = "off"
+"#,
+        );
+        assert_eq!(messages(&config), []);
         let spec = config.spec.unwrap();
-        assert_eq!(spec.compile_options.a_flags, ["-frelaxed", "--relaxed"]);
-        assert_eq!(
-            spec.sim_options.run_options,
-            Some(RunOptions::from_iter([("relaxed".to_owned(), true.into())]))
+        assert!(spec.options.relaxed);
+        assert_eq!(spec.sim_options.run_options, Some(expected));
+
+        // The inline form stays correct before dotted top-level keys.
+        let inline = parse_str(
+            r#"
+options = { relaxed = true, opt = { wake-guards = "off" } }
+libraries.lib.files = ["*.vhd"]
+"#,
         );
-        let errors: Vec<_> = config
-            .diagnostics
-            .iter()
-            .map(|diagnostic| {
-                (
-                    diagnostic.severity,
-                    diagnostic.message.as_str(),
-                    diagnostic.range.unwrap(),
-                )
-            })
-            .collect();
+        assert_eq!(messages(&inline), []);
+        let inline_spec = inline.spec.unwrap();
+        assert!(inline_spec.options.relaxed);
+        assert_eq!(library_names(&inline_spec), ["lib"]);
         assert_eq!(
-            errors,
+            inline_spec.sim_options.run_options,
+            Some(RunOptions::from_iter([
+                ("relaxed".to_owned(), true.into()),
+                ("opt.wake-guards".to_owned(), "off".into()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn relaxed_false_is_like_no_key() {
+        let config = parse_str("options = { relaxed = false }\n");
+        assert_eq!(messages(&config), []);
+        assert_eq!(config.spec, parse_str("").spec);
+    }
+
+    /// Each wrong key or value of `[options]` is an error at the key or value; the valid keys and
+    /// the libraries still load.
+    #[test]
+    fn options_errors_have_ranges() {
+        let config = parse_str(
+            r#"[options]
+colour = 1
+top = "tb"
+relaxed = "yes"
+opt-level = true
+[options.opt]
+wake-guards = 1
+"mir.cse" = "off"
+[libraries.lib]
+files = []
+"#,
+        );
+        assert_eq!(
+            messages(&config),
             [
                 (
                     Severity::Error,
-                    "unsupported option '-Wno-hide'; expected one of: --relaxed, -frelaxed, \
-                     -fsynopsys",
-                    Range {
-                        start: Position::new(1, 25),
-                        end: Position::new(1, 35),
-                    }
+                    "unknown option 'colour' in [options]; expected one of: relaxed, opt-level, \
+                     opt",
+                    Some(Position::new(2, 1))
                 ),
                 (
                     Severity::Error,
-                    "unsupported option '--no-vital-checks'; expected one of: --relaxed, \
-                     -frelaxed, -fsynopsys",
-                    Range {
-                        start: Position::new(1, 51),
-                        end: Position::new(1, 69),
-                    }
+                    "unknown option 'top' in [options]; expected one of: relaxed, opt-level, opt",
+                    Some(Position::new(3, 1))
+                ),
+                (
+                    Severity::Error,
+                    "'relaxed' in [options] is true or false, not \"yes\"",
+                    Some(Position::new(4, 11))
+                ),
+                (
+                    Severity::Error,
+                    "'opt-level' in [options] is a preset, such as \"full\" or 2, not true",
+                    Some(Position::new(5, 13))
+                ),
+                (
+                    Severity::Error,
+                    "the mode of 'wake-guards' in [options.opt] is a string, such as \"on\" or \
+                     \"off\", not 1",
+                    Some(Position::new(7, 15))
                 ),
             ]
         );
+        let spec = config.spec.unwrap();
+        assert_eq!(library_names(&spec), ["lib"]);
+        assert_eq!(
+            spec.sim_options.run_options,
+            Some(RunOptions::from_iter([(
+                "opt.mir.cse".to_owned(),
+                "off".into()
+            )]))
+        );
+    }
+
+    /// The errors of `[options]` in the inline and dotted forms, and of a scalar `options`, are at
+    /// their keys or values, and a key after the `[options]` header names the pitfall.
+    #[test]
+    fn options_errors_in_other_forms() {
+        let inline = parse_str("options = { relaxed = true, opt = \"off\" }\noptions2 = 1\n");
+        assert_eq!(
+            messages(&inline),
+            [
+                (
+                    Severity::Warning,
+                    "unknown key 'options2' is ignored",
+                    Some(Position::new(2, 1))
+                ),
+                (
+                    Severity::Error,
+                    "'opt' in [options] is a table of modes, such as [options.opt] or opt = { \
+                     wake-guards = \"off\" }",
+                    Some(Position::new(1, 35))
+                ),
+            ]
+        );
+        assert!(inline.spec.unwrap().options.relaxed);
+
+        let dotted = parse_str("options.relaxed = 2\noptions.opt.mir.cse = \"off\"\n");
+        assert_eq!(
+            messages(&dotted),
+            [
+                (
+                    Severity::Error,
+                    "'relaxed' in [options] is true or false, not 2",
+                    Some(Position::new(1, 19))
+                ),
+                (
+                    Severity::Error,
+                    "a dotted name in [options.opt] is quoted: \"mir.cse\" = \"off\"",
+                    Some(Position::new(2, 17))
+                ),
+            ]
+        );
+
+        let scalar = parse_str("options = 1\n[libraries.lib]\nfiles = []\n");
+        assert_eq!(
+            messages(&scalar),
+            [(
+                Severity::Error,
+                "`options` is a table, such as options = { relaxed = true }",
+                Some(Position::new(1, 11))
+            )]
+        );
+        assert_eq!(library_names(&scalar.spec.unwrap()), ["lib"]);
+
+        // Keys after the header belong to the table.
+        let after_header = parse_str("[options]\nrelaxed = true\nlibraries.lib.files = []\n");
+        assert_eq!(
+            messages(&after_header),
+            [(
+                Severity::Error,
+                "unknown option 'libraries' in [options]; expected one of: relaxed, opt-level, \
+                 opt; keys after the [options] header belong to it, so put them above the \
+                 header, or write options = { … }",
+                Some(Position::new(3, 1))
+            )]
+        );
+    }
+
+    #[test]
+    fn run_table_is_an_error() {
+        let config = parse_str("[run]\nopt-level = \"off\"\n[run.opt]\nwake-guards = \"off\"\n");
+        assert_eq!(
+            messages(&config),
+            [(
+                Severity::Error,
+                "[run] is part of [options] now: write opt-level there, and [options.opt] for \
+                 [run.opt]",
+                Some(Position::new(1, 2))
+            )]
+        );
+        assert_eq!(
+            config.spec.unwrap().sim_options.run_options,
+            Some(RunOptions::new())
+        );
+        let opt_only = parse_str("[run.opt]\nwake-guards = \"off\"\n");
+        assert_eq!(opt_only.diagnostics.len(), 1);
+        assert_eq!(
+            opt_only.spec.unwrap().sim_options.run_options,
+            Some(RunOptions::new())
+        );
+    }
+
+    /// `[libraries.NAME.options]` has no valid keys; the library loads with the default options.
+    #[test]
+    fn library_options() {
+        let config = parse_str(
+            r#"
+[libraries.lib]
+files = []
+[libraries.lib.options]
+relaxed = true
+opt-level = "full"
+include = "inc"
+[libraries.other]
+files = []
+options = 1
+"#,
+        );
+        assert_eq!(
+            messages(&config),
+            [
+                (
+                    Severity::Error,
+                    "'relaxed' is a project option; set it in [options]",
+                    Some(Position::new(5, 1))
+                ),
+                (
+                    Severity::Error,
+                    "'opt-level' is a project option; set it in [options]",
+                    Some(Position::new(6, 1))
+                ),
+                (
+                    Severity::Error,
+                    "unknown option 'include' in [libraries.lib.options]",
+                    Some(Position::new(7, 1))
+                ),
+                (
+                    Severity::Error,
+                    "`options` of library 'other' is a table, such as options = {}",
+                    Some(Position::new(10, 11))
+                ),
+            ]
+        );
+        let spec = config.spec.unwrap();
+        assert_eq!(library_names(&spec), ["lib", "other"]);
+        for library in &spec.libraries {
+            let LibrarySpec::Sources { options, .. } = library else {
+                panic!("expected a source library");
+            };
+            assert_eq!(*options, Options::default());
+        }
+        assert!(!spec.options.relaxed);
+        assert_eq!(spec.sim_options.run_options, Some(RunOptions::new()));
     }
 
     #[test]
@@ -684,7 +1097,7 @@ files = []
     #[test]
     fn invalid_utf8_is_a_diagnostic() {
         let temp = TempRoot::new();
-        let path = temp.write("risim-config.toml", b"options = []\n# caf\xe9\n");
+        let path = temp.write("risim-config.toml", b"[options]\n# caf\xe9\n");
         let config = load(&path, None).unwrap();
         assert!(config.spec.is_none());
         assert_eq!(config.diagnostics.len(), 1);
@@ -801,13 +1214,13 @@ files = []
     }
 
     #[test]
-    fn run_table_becomes_run_options() {
+    fn options_table_becomes_run_options() {
         let config = parse_str(
             r#"
-options = ["-frelaxed"]
-[run]
+[options]
+relaxed = true
 opt-level = "full"
-[run.opt]
+[options.opt]
 wake-guards = "off"
 "mir.cse" = "on"
 "#,
@@ -827,8 +1240,8 @@ wake-guards = "off"
     /// An integer `opt-level` is the preset of that number, as with `-O 2`; another type is an
     /// error at the value, and the other keys still count.
     #[test]
-    fn run_table_takes_an_integer_level() {
-        let integer = parse_str("[run]\nopt-level = 2\n");
+    fn options_table_takes_an_integer_level() {
+        let integer = parse_str("[options]\nopt-level = 2\n");
         assert_eq!(messages(&integer), []);
         assert_eq!(
             integer.spec.unwrap().sim_options.run_options,
@@ -837,12 +1250,13 @@ wake-guards = "off"
                 "2".into()
             )]))
         );
-        let boolean = parse_str("[run]\nopt-level = true\n[run.opt]\nwake-guards = \"off\"\n");
+        let boolean =
+            parse_str("[options]\nopt-level = true\n[options.opt]\nwake-guards = \"off\"\n");
         assert_eq!(
             messages(&boolean),
             [(
                 Severity::Error,
-                "'opt-level' in [run] is a preset, such as \"full\" or 2, not true",
+                "'opt-level' in [options] is a preset, such as \"full\" or 2, not true",
                 Some(Position::new(2, 13)),
             )]
         );
@@ -855,50 +1269,52 @@ wake-guards = "off"
         );
     }
 
-    /// A table in `[run.opt]` is an error that names the quoted form, also an empty one, and a
-    /// mode that isn't a string is an error at the mode; other keys of `[run]` are unknown.
+    /// A table in `[options.opt]` is an error that names the quoted form, also an empty one, and
+    /// a mode that isn't a string is an error at the mode; other keys of `[options]` are unknown,
+    /// also those of other run options.
     #[test]
-    fn run_table_errors() {
+    fn options_table_errors() {
         let config = parse_str(
             r#"
-[run]
+[options]
 finish-after = "1 ms"
-[run.opt]
+[options.opt]
 wake-guards = false
 mir.cse = "off"
-[run.opt.mir.licm]
+[options.opt.mir.licm]
 loops = "on"
-[run.opt.empty]
+[options.opt.empty]
 "#,
         );
         assert_eq!(
             messages(&config),
             [
                 (
-                    Severity::Warning,
-                    "unknown key 'run.finish-after' is ignored",
+                    Severity::Error,
+                    "unknown option 'finish-after' in [options]; expected one of: relaxed, \
+                     opt-level, opt",
                     Some(Position::new(3, 1))
                 ),
                 (
                     Severity::Error,
-                    "the mode of 'wake-guards' in [run.opt] is a string, such as \"on\" or \"off\", \
-                     not false",
+                    "the mode of 'wake-guards' in [options.opt] is a string, such as \"on\" or \
+                     \"off\", not false",
                     Some(Position::new(5, 15))
                 ),
                 (
                     Severity::Error,
-                    "a dotted name in [run.opt] is quoted: \"mir.cse\" = \"off\"",
+                    "a dotted name in [options.opt] is quoted: \"mir.cse\" = \"off\"",
                     Some(Position::new(6, 5))
                 ),
                 (
                     Severity::Error,
-                    "a dotted name in [run.opt] is quoted: \"mir.licm.loops\" = \"on\"",
+                    "a dotted name in [options.opt] is quoted: \"mir.licm.loops\" = \"on\"",
                     Some(Position::new(8, 1))
                 ),
                 (
                     Severity::Error,
-                    "a dotted name in [run.opt] is quoted, such as \"empty.NAME\" = \"off\"",
-                    Some(Position::new(9, 10))
+                    "a dotted name in [options.opt] is quoted, such as \"empty.NAME\" = \"off\"",
+                    Some(Position::new(9, 14))
                 ),
             ]
         );
@@ -925,7 +1341,7 @@ loops = "on"
     fn run_options_are_checked() {
         let config = parse(
             Utf8Path::new(PATH),
-            "[run]\nopt-level = \"o3\"\n[run.opt]\nbad = \"on\"\nmir = \"off\"\n",
+            "[options]\nopt-level = \"o3\"\n[options.opt]\nbad = \"on\"\nmir = \"off\"\n",
             Some(check),
         );
         assert_eq!(
@@ -933,12 +1349,12 @@ loops = "on"
             [
                 (
                     Severity::Error,
-                    "invalid 'opt-level' in [run]: unknown variant `o3`",
+                    "invalid 'opt-level' in [options]: unknown variant `o3`",
                     Some(Position::new(2, 13))
                 ),
                 (
                     Severity::Error,
-                    "invalid 'bad' in [run.opt]: unknown optimization `bad`",
+                    "invalid 'bad' in [options.opt]: unknown optimization `bad`",
                     Some(Position::new(4, 1))
                 ),
             ]
@@ -950,6 +1366,30 @@ loops = "on"
                 "off".into()
             )]))
         );
+
+        // A rejected `relaxed` makes neither the analysis nor the elaboration relaxed.
+        let reject_relaxed = |options: &RunOptions| -> Result<(), String> {
+            if options.contains_key("relaxed") {
+                return Err("not here".to_owned());
+            }
+            Ok(())
+        };
+        let rejected = parse(
+            Utf8Path::new(PATH),
+            "options = { relaxed = true }\n",
+            Some(reject_relaxed),
+        );
+        assert_eq!(
+            messages(&rejected),
+            [(
+                Severity::Error,
+                "invalid 'relaxed' in [options]: not here",
+                Some(Position::new(1, 23))
+            )]
+        );
+        let spec = rejected.spec.unwrap();
+        assert!(!spec.options.relaxed);
+        assert_eq!(spec.sim_options.run_options, Some(RunOptions::new()));
     }
 
     #[test]

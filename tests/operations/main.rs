@@ -393,7 +393,6 @@ impl Workspace {
             layout: &self.layout,
             project: &loaded.project,
             targets: &targets,
-            compile_options: &self.spec.compile_options,
             simulator: &self.simulator,
         };
         let report = compile::compile(&input, state, &context).await;
@@ -1637,7 +1636,7 @@ async fn real_risim_compiles_uart() {
             );
         }
     }
-    workspace.spec.compile_options.a_flags = vec!["-frelaxed".to_owned()];
+    workspace.spec.options.relaxed = true;
     workspace
         .spec
         .add_feature(Feature::VerificationComponents)

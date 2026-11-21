@@ -67,7 +67,6 @@ use crate::simulator::CompileArgs;
 use crate::simulator::Simulator;
 use crate::simulator::SimulatorIdentity;
 use crate::sources::ContentHash;
-use crate::spec::CompileOptions;
 use crate::store::CompileKey;
 use crate::store::CompileState;
 use crate::store::FileKey;
@@ -116,8 +115,6 @@ pub struct PlanInput<'a> {
     pub project: &'a Project,
     /// The files to compile, together with everything they need (see [`targets`]).
     pub targets: &'a [FileId],
-    /// The analysis options.
-    pub compile_options: &'a CompileOptions,
     /// The simulator.
     pub simulator: &'a Simulator,
 }
@@ -143,6 +140,8 @@ pub struct PlannedFile {
     /// The file receiving the compiler output.
     pub output_file: Utf8PathBuf,
     library_dir: Utf8PathBuf,
+    /// The `risim analyze` arguments of the library's options, shared by its files.
+    analyze_args: Arc<[String]>,
     /// Direct dependencies, as indices into [`CompilePlan::files`].
     dependencies: Vec<usize>,
 }
@@ -165,8 +164,6 @@ pub struct CompilePlan {
     simulator: Option<Simulator>,
     /// The directories of all libraries.
     library_dirs: Vec<Utf8PathBuf>,
-    /// The analysis options.
-    flags: Vec<String>,
     /// Errors that prevent compiling: dependency cycles, unsupported standards.
     pub errors: Vec<Diagnostic>,
     /// Problems with the dependencies that don't prevent compiling.
@@ -209,7 +206,7 @@ impl CompilePlan {
                 library_dir: &file.library_dir,
                 vhdl_standard: file.vhdl_standard,
                 library_dirs: &self.library_dirs,
-                flags: &self.flags,
+                analyze_args: &file.analyze_args,
                 files: &paths,
             })
             .unwrap_or_default()
@@ -280,8 +277,8 @@ impl CompilePlan {
         let project = input.project;
         self.simulator = Some(input.simulator.clone());
         self.library_dirs = library_dirs(project, input.layout);
-        self.flags.clone_from(&input.compile_options.a_flags);
         let simulator_hash = identity_hash(input.simulator.identity());
+        let mut analyze_args: FxHashMap<LibraryId, Arc<[String]>> = FxHashMap::default();
         let positions: FxHashMap<FileId, usize> = order
             .iter()
             .enumerate()
@@ -291,6 +288,10 @@ impl CompilePlan {
         for &id in order {
             let file = project.file(id);
             let library = &project.library(file.library).name;
+            let library_args =
+                Arc::clone(analyze_args.entry(file.library).or_insert_with(|| {
+                    project.library(file.library).options.analyze_args().into()
+                }));
             let dependencies: Vec<usize> = self
                 .graph
                 .direct_dependencies(id)
@@ -300,7 +301,7 @@ impl CompilePlan {
                 content_hash: file.content_hash,
                 library,
                 vhdl_standard: file.vhdl_standard,
-                flags: &input.compile_options.a_flags,
+                analyze_args: &library_args,
                 simulator_hash,
                 dependencies: dependencies
                     .iter()
@@ -329,6 +330,7 @@ impl CompilePlan {
                 vhdl_standard: file.vhdl_standard,
                 output_file: input.layout.compile_output_file(library, &file.path),
                 library_dir,
+                analyze_args: library_args,
                 dependencies,
             });
         }
@@ -455,7 +457,8 @@ struct CompileKeyInput<'a> {
     content_hash: ContentHash,
     library: &'a str,
     vhdl_standard: VhdlStandard,
-    flags: &'a [String],
+    /// The `risim analyze` arguments of the file's library.
+    analyze_args: &'a [String],
     simulator_hash: [u8; 32],
     dependencies: Vec<CompileKey>,
 }
@@ -471,9 +474,9 @@ fn compile_key(input: &CompileKeyInput<'_>) -> CompileKey {
     hasher.update(&input.content_hash.0);
     update_str(&mut hasher, &input.library.to_ascii_lowercase());
     update_str(&mut hasher, input.vhdl_standard.vunit_name());
-    hasher.update(&(input.flags.len() as u64).to_le_bytes());
-    for flag in input.flags {
-        update_str(&mut hasher, flag);
+    hasher.update(&(input.analyze_args.len() as u64).to_le_bytes());
+    for arg in input.analyze_args {
+        update_str(&mut hasher, arg);
     }
     hasher.update(&input.simulator_hash);
     let mut dependencies = input.dependencies.clone();

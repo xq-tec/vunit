@@ -321,7 +321,7 @@ impl Simulator {
             command.extend(["-L".to_owned(), dir.to_string()]);
         }
         command.push("--message-format=json".to_owned());
-        command.extend(args.flags.iter().cloned());
+        command.extend(args.analyze_args.iter().cloned());
         command.extend(args.files.iter().map(ToString::to_string));
         Ok(command)
     }
@@ -399,8 +399,10 @@ pub struct CompileArgs<'a> {
     pub vhdl_standard: VhdlStandard,
     /// The directories of all libraries, passed with `-L`.
     pub library_dirs: &'a [Utf8PathBuf],
-    /// Extra analysis options.
-    pub flags: &'a [String],
+    /// The arguments of the library's options, [`Options::analyze_args`].
+    ///
+    /// [`Options::analyze_args`]: crate::spec::Options::analyze_args
+    pub analyze_args: &'a [String],
     /// The files to compile, in compile order.
     pub files: &'a [&'a Utf8Path],
 }
@@ -517,7 +519,7 @@ mod tests {
             library_dir: Utf8Path::new("/out/libraries/lib"),
             vhdl_standard: VhdlStandard::Vhdl2008,
             library_dirs: &library_dirs,
-            flags: &["-frelaxed".to_owned()],
+            analyze_args: &["--relaxed".to_owned()],
             files: &[Utf8Path::new("/src/a.vhd"), Utf8Path::new("/src/b.vhd")],
         };
         assert_eq!(
@@ -532,7 +534,7 @@ mod tests {
                 "-L",
                 "/out/libraries/lib",
                 "--message-format=json",
-                "-frelaxed",
+                "--relaxed",
                 "/src/a.vhd",
                 "/src/b.vhd",
             ]

@@ -8,6 +8,7 @@
 //! AI NOTICE: Generated, minimally reviewed.
 
 use super::*;
+use crate::spec::Options;
 use crate::test_support::TempRoot;
 use crate::test_support::add_vhdl;
 use crate::test_support::simulator;
@@ -17,7 +18,6 @@ struct Fixture {
     layout: OutputLayout,
     project: Project,
     simulator: Simulator,
-    options: CompileOptions,
 }
 
 impl Fixture {
@@ -29,7 +29,6 @@ impl Fixture {
             layout,
             project: Project::new(),
             simulator: simulator(),
-            options: CompileOptions::default(),
         }
     }
 
@@ -53,7 +52,6 @@ impl Fixture {
                 layout: &self.layout,
                 project: &self.project,
                 targets,
-                compile_options: &self.options,
                 simulator: &self.simulator,
             },
             state,
@@ -186,20 +184,52 @@ fn compile_keys_change_with_dependencies() {
 #[test]
 fn compile_keys_depend_on_options_and_simulator() {
     let mut fixture = Fixture::new();
-    fixture.library("lib");
-    let pkg = fixture.add("lib", "pkg.vhd", PKG);
-    let plan = fixture.plan(&[pkg], &CompileState::default());
+    fixture.library("lib").library("user_lib").library("other");
+    fixture.add("lib", "pkg.vhd", PKG);
+    let user = fixture.add(
+        "user_lib",
+        "user.vhd",
+        "library lib;\nuse lib.pkg.all;\npackage user is end package;",
+    );
+    let other = fixture.add("other", "other.vhd", "package other is end package;");
+    let targets = [user, other];
+    let plan = fixture.plan(&targets, &CompileState::default());
     let state = compiled_state(&plan);
-    assert_eq!(fixture.plan(&[pkg], &state).compile_count(), 0);
+    assert_eq!(fixture.plan(&targets, &state).compile_count(), 0);
 
-    fixture.options.a_flags = vec!["-frelaxed".to_owned()];
-    assert_eq!(fixture.plan(&[pkg], &state).compile_count(), 1);
-    fixture.options.a_flags.clear();
+    // The options of a library change its files' keys and those of their dependents, and only
+    // the commands of its batches have their arguments.
+    let lib = fixture.project.find_library("lib").unwrap();
+    fixture
+        .project
+        .set_library_options(lib, Options { relaxed: true });
+    let relaxed_plan = fixture.plan(&targets, &state);
+    let compiled: Vec<_> = relaxed_plan
+        .files()
+        .iter()
+        .filter(|file| file.needs_compile)
+        .map(|file| file.path.file_name().unwrap())
+        .collect();
+    assert_eq!(compiled, ["pkg.vhd", "user.vhd"]);
+    let relaxed: Vec<_> = relaxed_plan
+        .files()
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            let command = relaxed_plan.compile_command(&[*index]);
+            assert!(!command.is_empty());
+            command.iter().any(|arg| arg == "--relaxed")
+        })
+        .map(|(_, file)| file.path.file_name().unwrap())
+        .collect();
+    assert_eq!(relaxed, ["pkg.vhd"]);
+    fixture.project.set_library_options(lib, Options::default());
+    assert_eq!(fixture.plan(&targets, &state).compile_count(), 0);
 
     let mut identity = fixture.simulator.identity().clone();
     identity.version_output = "risim-runner 0.1.0\nhydrolyze archive format 2\n".to_owned();
     fixture.simulator = Simulator::from_identity(identity).unwrap();
-    assert_eq!(fixture.plan(&[pkg], &state).compile_count(), 1);
+    assert_eq!(fixture.plan(&targets, &state).compile_count(), 3);
 }
 
 #[test]

@@ -30,6 +30,7 @@ use crate::dependency_graph::DependencyGraph;
 use crate::diagnostics::Diagnostic;
 use crate::diagnostics::Range;
 use crate::sources::ContentHash;
+use crate::spec::Options;
 use crate::vhdl_parser::ReferenceType;
 use crate::vhdl_parser::VhdlComponentInstantiation;
 use crate::vhdl_parser::VhdlDesignFile;
@@ -168,6 +169,9 @@ pub struct Library {
     pub vhdl_standard: VhdlStandard,
     /// For a precompiled library, its directory.
     pub external_path: Option<Utf8PathBuf>,
+    /// The effective options of the library's files, which give their `risim analyze`
+    /// arguments; the default unless [`Project::set_library_options`] sets them.
+    pub options: Options,
     files: FxHashMap<Utf8PathBuf, FileId>,
     primary_units: FxHashMap<String, PrimaryUnit>,
     /// Architectures per entity name, in the order they were added.
@@ -331,6 +335,7 @@ impl Project {
             name: name.to_owned(),
             vhdl_standard,
             external_path,
+            options: Options::default(),
             files: FxHashMap::default(),
             primary_units: FxHashMap::default(),
             architectures: FxHashMap::default(),
@@ -338,6 +343,11 @@ impl Project {
         });
         self.libraries_by_lowercase_name.insert(lowercase, id);
         Ok(id)
+    }
+
+    /// Sets the effective options of `library`'s files.
+    pub fn set_library_options(&mut self, library: LibraryId, options: Options) {
+        self.libraries[library.index()].options = options;
     }
 
     /// Adds a VHDL file to `library` and registers its design units.
