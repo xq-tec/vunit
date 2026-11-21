@@ -9,10 +9,12 @@
 //! # `-fsynopsys`, which has no effect.
 //! options = ["-frelaxed"]
 //!
-//! # Options of the simulations: the optimization preset, and rows or groups of optimizations
-//! # over it, where dotted names are quoted.
+//! # Options of the simulations: the optimization preset, the snapshots, and rows or groups of
+//! # optimizations over the preset, where dotted names are quoted.
 //! [run]
 //! opt-level = "full"
+//! snapshots = "on"
+//! snapshot-interval = 0.5
 //!
 //! [run.opt]
 //! wake-guards = "off"
@@ -31,7 +33,8 @@
 //! version = "1.4"
 //! ```
 //!
-//! `[run]` becomes the run options `opt-level` and `opt.<name>` of every simulation
+//! `[run]` becomes the run options `opt-level`, `snapshots`, `snapshot-interval`,
+//! `snapshot-keep`, `snapshot-memory` and `opt.<name>` of every simulation
 //! ([`SimOptions::run_options`]), next to `relaxed` from `options`; the run options of a
 //! configuration go over them ([`SimOptions::overridden_by`]).
 //! A table in `[run.opt]`, such as `[run.opt.mir]`, is an error that names the quoted form.
@@ -187,6 +190,53 @@ struct RawRun {
     /// gets the error that names the quoted form.
     #[serde(default)]
     opt: BTreeMap<String, Spanned<toml::Value>>,
+    /// When the simulations take snapshots, the run option `snapshots`.
+    snapshots: Option<Spanned<toml::Value>>,
+    /// The run time between two snapshots in seconds, the run option `snapshot-interval`.
+    #[serde(rename = "snapshot-interval")]
+    snapshot_interval: Option<Spanned<toml::Value>>,
+    /// The newest snapshots kept at full density, the run option `snapshot-keep`.
+    #[serde(rename = "snapshot-keep")]
+    snapshot_keep: Option<Spanned<toml::Value>>,
+    /// The budget of the snapshots in MiB, the run option `snapshot-memory`.
+    #[serde(rename = "snapshot-memory")]
+    snapshot_memory: Option<Spanned<toml::Value>>,
+}
+
+/// The type of the value of a snapshot key of `[run]`.
+#[derive(Clone, Copy)]
+enum SnapshotValue {
+    /// A string, such as `"on"`.
+    Text,
+    /// A number, integer or not, such as `10` or `0.5`.
+    Number,
+    /// An integer.
+    Integer,
+}
+
+impl SnapshotValue {
+    /// Returns the JSON value of `value` if it has this type.
+    fn json(self, value: &toml::Value) -> Option<serde_json::Value> {
+        match (self, value) {
+            (Self::Text, toml::Value::String(text)) => Some(text.clone().into()),
+            (Self::Number | Self::Integer, toml::Value::Integer(integer)) => {
+                Some((*integer).into())
+            },
+            (Self::Number, toml::Value::Float(float)) => {
+                serde_json::Number::from_f64(*float).map(Into::into)
+            },
+            _ => None,
+        }
+    }
+
+    /// Describes the type, for the error of a value of another one.
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Text => "a string, such as \"on\"",
+            Self::Number => "a number of seconds, such as 10 or 0.5",
+            Self::Integer => "an integer",
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -380,13 +430,30 @@ impl Parser<'_> {
             if let Some(level) = level {
                 self.run_option(
                     "opt-level".to_owned(),
-                    level,
+                    level.into(),
                     "'opt-level' in [run]",
                     Some(span),
                     run_options,
                 );
             }
         }
+        self.snapshot_options(
+            [
+                ("snapshots", run.snapshots, SnapshotValue::Text),
+                (
+                    "snapshot-interval",
+                    run.snapshot_interval,
+                    SnapshotValue::Number,
+                ),
+                ("snapshot-keep", run.snapshot_keep, SnapshotValue::Integer),
+                (
+                    "snapshot-memory",
+                    run.snapshot_memory,
+                    SnapshotValue::Integer,
+                ),
+            ],
+            run_options,
+        );
         // In file order; the map sorts them by name.
         let mut settings: Vec<_> = run
             .opt
@@ -399,7 +466,7 @@ impl Parser<'_> {
             match value.into_inner() {
                 toml::Value::String(mode) => {
                     let what = format!("'{name}' in [run.opt]");
-                    self.run_option(format!("opt.{name}"), mode, &what, span, run_options);
+                    self.run_option(format!("opt.{name}"), mode.into(), &what, span, run_options);
                 },
                 nested @ toml::Value::Table(_) => {
                     let mut leaves = Vec::new();
@@ -432,17 +499,42 @@ impl Parser<'_> {
         }
     }
 
-    /// Adds the run option `key` with the text `value` to `run_options` if the check accepts it,
-    /// and reports it as `what` at `span` otherwise.
+    /// Adds the snapshot keys `keys` of `[run]` that are set, with the types of their values, to
+    /// `run_options` as the run options of the same name, in file order, those that have their
+    /// type and that the check accepts.
+    fn snapshot_options(
+        &mut self,
+        keys: [(&str, Option<Spanned<toml::Value>>, SnapshotValue); 4],
+        run_options: &mut RunOptions,
+    ) {
+        let mut keys: Vec<_> = keys
+            .into_iter()
+            .filter_map(|(key, value, kind)| Some((key, value?, kind)))
+            .collect();
+        keys.sort_by_key(|(_, value, _)| value.span().start);
+        for (key, value, kind) in keys {
+            let span = value.span();
+            let what = format!("'{key}' in [run]");
+            if let Some(json) = kind.json(value.get_ref()) {
+                self.run_option(key.to_owned(), json, &what, Some(span), run_options);
+            } else {
+                let message = format!("{what} is {}, not {}", kind.description(), value.get_ref());
+                self.diagnostic(Severity::Error, message, Some(span));
+            }
+        }
+    }
+
+    /// Adds the run option `key` with `value` to `run_options` if the check accepts it, and
+    /// reports it as `what` at `span` otherwise.
     fn run_option(
         &mut self,
         key: String,
-        value: String,
+        value: serde_json::Value,
         what: &str,
         span: Option<ops::Range<usize>>,
         run_options: &mut RunOptions,
     ) {
-        let option = RunOptions::from_iter([(key, value.into())]);
+        let option = RunOptions::from_iter([(key, value)]);
         if let Some(check) = self.check_run_options
             && let Err(error) = check(&option)
         {
@@ -855,6 +947,73 @@ wake-guards = "off"
         );
     }
 
+    /// The snapshot keys of `[run]` become the run options of the same name, with their JSON
+    /// types: a string, a number of seconds, also an integer one, and integers.
+    #[test]
+    fn run_table_takes_the_snapshot_keys() {
+        let config = parse_str(
+            "[run]\nsnapshots = \"on\"\nsnapshot-interval = 0.5\nsnapshot-keep = 4\n\
+             snapshot-memory = 64\n",
+        );
+        assert_eq!(messages(&config), []);
+        assert_eq!(
+            config.spec.unwrap().sim_options.run_options,
+            Some(RunOptions::from_iter([
+                ("snapshots".to_owned(), "on".into()),
+                ("snapshot-interval".to_owned(), 0.5.into()),
+                ("snapshot-keep".to_owned(), 4.into()),
+                ("snapshot-memory".to_owned(), 64.into()),
+            ]))
+        );
+        let integer = parse_str("[run]\nsnapshot-interval = 10\n");
+        assert_eq!(
+            integer.spec.unwrap().sim_options.run_options,
+            Some(RunOptions::from_iter([(
+                "snapshot-interval".to_owned(),
+                10.into()
+            )]))
+        );
+    }
+
+    /// A snapshot key of another type is an error at the value, in file order, and is left out.
+    #[test]
+    fn run_table_snapshot_errors() {
+        let config = parse_str(
+            "[run]\nsnapshot-memory = \"1 GiB\"\nsnapshots = true\nsnapshot-interval = \"10\"\n\
+             snapshot-keep = 1.5\n",
+        );
+        assert_eq!(
+            messages(&config),
+            [
+                (
+                    Severity::Error,
+                    "'snapshot-memory' in [run] is an integer, not \"1 GiB\"",
+                    Some(Position::new(2, 19))
+                ),
+                (
+                    Severity::Error,
+                    "'snapshots' in [run] is a string, such as \"on\", not true",
+                    Some(Position::new(3, 13))
+                ),
+                (
+                    Severity::Error,
+                    "'snapshot-interval' in [run] is a number of seconds, such as 10 or 0.5, not \
+                     \"10\"",
+                    Some(Position::new(4, 21))
+                ),
+                (
+                    Severity::Error,
+                    "'snapshot-keep' in [run] is an integer, not 1.5",
+                    Some(Position::new(5, 17))
+                ),
+            ]
+        );
+        assert_eq!(
+            config.spec.unwrap().sim_options.run_options,
+            Some(RunOptions::new())
+        );
+    }
+
     /// A table in `[run.opt]` is an error that names the quoted form, also an empty one, and a
     /// mode that isn't a string is an error at the mode; other keys of `[run]` are unknown.
     #[test]
@@ -908,10 +1067,14 @@ loops = "on"
         );
     }
 
-    /// Rejects `opt-level` `o3` and the row `bad`, as riSim's hub rejects unknown values.
+    /// Rejects `opt-level` `o3`, the row `bad` and `snapshot-keep` 0, as riSim's hub rejects
+    /// them.
     fn check(options: &RunOptions) -> Result<(), String> {
         if options.get("opt-level").is_some_and(|level| level == "o3") {
             return Err("unknown variant `o3`".to_owned());
+        }
+        if options.get("snapshot-keep").is_some_and(|keep| keep == 0) {
+            return Err("`snapshot-keep` must be at least 1".to_owned());
         }
         if options.contains_key("opt.bad") {
             return Err("unknown optimization `bad`".to_owned());
@@ -925,7 +1088,8 @@ loops = "on"
     fn run_options_are_checked() {
         let config = parse(
             Utf8Path::new(PATH),
-            "[run]\nopt-level = \"o3\"\n[run.opt]\nbad = \"on\"\nmir = \"off\"\n",
+            "[run]\nopt-level = \"o3\"\nsnapshot-keep = 0\nsnapshots = \"on\"\n[run.opt]\n\
+             bad = \"on\"\nmir = \"off\"\n",
             Some(check),
         );
         assert_eq!(
@@ -938,17 +1102,22 @@ loops = "on"
                 ),
                 (
                     Severity::Error,
+                    "invalid 'snapshot-keep' in [run]: `snapshot-keep` must be at least 1",
+                    Some(Position::new(3, 17))
+                ),
+                (
+                    Severity::Error,
                     "invalid 'bad' in [run.opt]: unknown optimization `bad`",
-                    Some(Position::new(4, 1))
+                    Some(Position::new(6, 1))
                 ),
             ]
         );
         assert_eq!(
             config.spec.unwrap().sim_options.run_options,
-            Some(RunOptions::from_iter([(
-                "opt.mir".to_owned(),
-                "off".into()
-            )]))
+            Some(RunOptions::from_iter([
+                ("snapshots".to_owned(), "on".into()),
+                ("opt.mir".to_owned(), "off".into()),
+            ]))
         );
     }
 

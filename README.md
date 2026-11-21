@@ -39,9 +39,12 @@ A workspace is opened from a `risim-config.toml`. The `options` list is passed b
 # Options of analysis and elaboration.
 options = ["-frelaxed"]
 
-# Options of the simulations: the optimization preset, and rows or groups over it.
+# Options of the simulations: the optimization preset, the snapshots, and rows or groups over
+# the preset.
 [run]
 opt-level = "full"
+snapshots = "on"
+snapshot-interval = 0.5
 
 [run.opt]
 wake-guards = "off"
@@ -63,8 +66,8 @@ version = "1.4"
 `[toolchain] version` is read by the riSim launcher, which selects the toolchain by it (riSim's `doc/installation.md`); this crate accepts it without a warning and otherwise ignores it.
 Unknown keys, including other keys in `[toolchain]` and `[run]`, are warnings.
 
-`[run]` sets run options of every simulation: `opt-level` the run option `opt-level`, and each key `NAME` of `[run.opt]` the run option `opt.NAME` (riSim's `risim-run-options`).
-The values are strings.
+`[run]` sets run options of every simulation (riSim's `risim-run-options`): `opt-level`, `snapshots`, `snapshot-interval`, `snapshot-keep` and `snapshot-memory` the run options of the same name, and each key `NAME` of `[run.opt]` the run option `opt.NAME`.
+`opt-level` is the name or number of a preset, `snapshots` and the modes of `[run.opt]` are strings, `snapshot-interval` is a number of seconds, and `snapshot-keep` and `snapshot-memory` are integers.
 A dotted name is quoted (`"mir.cse" = "off"`); a table in `[run.opt]`, such as `mir.cse = "off"` or `[run.opt.mir]`, is an error that names the quoted form.
 `RuntimeOptions::check_run_options` checks each of these keys when the file is read, as riSim's hub does with `risim_run_options::validate_partial`; a key that it rejects is a configuration error and is left out.
 
