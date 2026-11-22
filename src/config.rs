@@ -6,11 +6,17 @@
 //!
 //! ```toml
 //! # The options of the project: relaxed analysis and elaboration, the optimization preset, and
-//! # rows or groups of optimizations over it, where dotted names are quoted.
+//! # rows or groups of optimizations over it, where dotted names are quoted; then the options of
+//! # SystemVerilog and Verilog files, and the encoding of all files.
 //! # Only tables follow, since bare keys after the header would belong to `[options]`.
 //! [options]
 //! relaxed = true
 //! opt-level = "full"
+//! include-dirs = ["inc"]
+//! defines = { WIDTH = "8", DEBUG = true, "MAX(a,b)" = "((a)>(b)?(a):(b))" }
+//! compilation-unit = "file"
+//! keywords = "1800-2017"
+//! encoding = "utf-8"
 //!
 //! [options.opt]
 //! wake-guards = "off"
@@ -20,9 +26,11 @@
 //! [vunit]
 //! features = ["random", "verification_components"]
 //!
-//! # One table per library, with source globs relative to the workspace root.
+//! # One table per library, with source globs relative to the workspace root, and the library's
+//! # own options over the project's.
 //! [libraries.my_lib]
 //! files = ["src/**/*.vhd", "tb/*.vhd"]
+//! options = { defines = { DEBUG = false }, keywords = "1364-2005" }
 //!
 //! # The riSim toolchain that the launcher runs for the workspace; ignored here.
 //! [toolchain]
@@ -35,8 +43,22 @@
 //! and `opt.<name>` of every simulation ([`SimOptions::run_options`]); the run options of a
 //! configuration go over them ([`SimOptions::overridden_by`]).
 //! `relaxed = false` is the same as no key.
-//! `[libraries.NAME.options]` has no valid keys yet; the project's options are project level
-//! only.
+//!
+//! `include-dirs`, `defines`, `compilation-unit`, `keywords`, and `encoding` can be set in
+//! `[libraries.NAME.options]` too, where they go over the project's ([`Options::for_library`]):
+//! - `include-dirs` is a list of directories relative to the workspace root;
+//! - `defines` is a table of macros by name, optionally with formal arguments (`"MAX(a,b)"`),
+//!   whose values are their texts, or `true` for an empty one; `false` in a library removes the
+//!   project's macro, and is an error in `[options]`;
+//! - `compilation-unit` is `"file"` or `"library"`, `keywords` one of [`KEYWORD_VERSIONS`], and
+//!   `encoding` `"utf-8"` or `"latin-1"`.
+//!
+//! `sv-libraries`, a list of the project's libraries, is library level only, and the other keys
+//! of `[options]` are project level only.
+//! `sv-libraries` can't name the library itself, and accepts `vunit_lib`, a library of every
+//! project.
+//! `[libraries.vunit_lib.options]` has no valid keys, since the files of `vunit_lib` take the
+//! options of VUnit's library.
 //!
 //! Unknown keys and wrong types in the options tables are errors at their spans, also a table
 //! in `[options.opt]`, which names the quoted form.
@@ -63,14 +85,20 @@ use toml::Spanned;
 use toml::de::DeTable;
 use toml::de::DeValue;
 
+use crate::builtins;
 use crate::diagnostics::Diagnostic;
 use crate::diagnostics::LineIndex;
 use crate::diagnostics::Severity;
 use crate::project::LibraryNames;
 use crate::simulator::CheckRunOptions;
 use crate::simulator::RunOptions;
+use crate::spec::CompilationUnit;
+use crate::spec::Define;
+use crate::spec::Encoding;
 use crate::spec::Feature;
 use crate::spec::FilePattern;
+use crate::spec::IncludeDir;
+use crate::spec::KEYWORD_VERSIONS;
 use crate::spec::LibrarySpec;
 use crate::spec::Options;
 use crate::spec::PatternLocation;
@@ -147,8 +175,46 @@ pub fn parse(path: &Utf8Path, content: &str, check_run_options: Option<CheckRunO
     }
 }
 
-/// The keys of `[options]`, all of them project level only.
-const OPTION_KEYS: [&str; 3] = ["relaxed", "opt-level", "opt"];
+/// The keys of `[options]` that are project level only.
+const PROJECT_KEYS: [&str; 3] = ["relaxed", "opt-level", "opt"];
+
+/// The keys of `[options]` that a library can set too.
+const SHARED_KEYS: [&str; 5] = [
+    "include-dirs",
+    "defines",
+    "compilation-unit",
+    "keywords",
+    "encoding",
+];
+
+/// The key of `[libraries.NAME.options]` that is library level only.
+const SV_LIBRARIES: &str = "sv-libraries";
+
+/// The directives of IEEE 1800 clause 22, which no macro may be named after (22.5.1).
+const SV_DIRECTIVES: [&str; 22] = [
+    "__FILE__",
+    "__LINE__",
+    "begin_keywords",
+    "celldefine",
+    "default_nettype",
+    "define",
+    "else",
+    "elsif",
+    "end_keywords",
+    "endcelldefine",
+    "endif",
+    "ifdef",
+    "ifndef",
+    "include",
+    "line",
+    "nounconnected_drive",
+    "pragma",
+    "resetall",
+    "timescale",
+    "unconnected_drive",
+    "undef",
+    "undefineall",
+];
 
 /// The elements of the former list `options` that make the project relaxed.
 const LEGACY_RELAXED: [&str; 3] = ["--relaxed", "-frelaxed", "-frelaxed-rules"];
@@ -192,6 +258,9 @@ struct RawLibrary {
     /// `[libraries.NAME.options]`.
     options: Option<Spanned<toml::Value>>,
 }
+
+/// A library of `sv-libraries`, with the span of its name.
+type ListedLibrary = (String, Option<ops::Range<usize>>);
 
 /// A step in the path of an ignored key.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,6 +365,9 @@ impl Parser<'_> {
             .collect();
         libraries.sort_by_key(|(span, _, _)| span.as_ref().map(|span| span.start));
         let mut names = LibraryNames::new();
+        // The libraries of `sv-libraries`, checked once every name is known: the index of the
+        // library in the spec, and each name with its span.
+        let mut sv_libraries = Vec::new();
         for (span, name, library) in libraries {
             if let Err(error) = names.insert(&name) {
                 self.diagnostic(Severity::Error, error.to_string(), span);
@@ -317,7 +389,13 @@ impl Parser<'_> {
                 })
                 .collect();
             let options = match library.options {
-                Some(options) => self.library_options(&name, options, table),
+                Some(options) => {
+                    let (options, listed) = self.library_options(&name, options, table);
+                    if let Some(listed) = listed {
+                        sv_libraries.push((spec.libraries.len(), listed));
+                    }
+                    options
+                },
                 None => Options::default(),
             };
             spec.libraries.push(LibrarySpec::Sources {
@@ -326,6 +404,14 @@ impl Parser<'_> {
                 vhdl_standard: None,
                 options,
             });
+        }
+
+        for (index, listed) in sv_libraries {
+            let LibrarySpec::Sources { name, options, .. } = &mut spec.libraries[index] else {
+                unreachable!("a configuration file has source libraries only");
+            };
+            let name = name.clone();
+            options.sv_libraries = Some(self.sv_libraries(&name, listed, &names));
         }
 
         let mut run_options = RunOptions::new();
@@ -435,19 +521,17 @@ impl Parser<'_> {
                         value_span,
                     ),
                 },
-                _ => {
-                    let mut message = format!(
-                        "unknown option '{key}' in [options]; expected one of: {}",
-                        OPTION_KEYS.join(", ")
-                    );
-                    if ["libraries", "vunit", "toolchain"].contains(&key.as_str()) {
-                        message.push_str(
-                            "; keys after the [options] header belong to it, so put them above \
-                             the header, or write options = { … }",
-                        );
-                    }
-                    self.diagnostic(Severity::Error, message, key_span);
+                _ if SHARED_KEYS.contains(&key.as_str()) => {
+                    self.shared_option(&key, entry, &["options"], table, &mut options);
                 },
+                SV_LIBRARIES => self.diagnostic(
+                    Severity::Error,
+                    format!(
+                        "'{SV_LIBRARIES}' is a library option; set it in [libraries.NAME.options]"
+                    ),
+                    key_span,
+                ),
+                _ => self.diagnostic(Severity::Error, unknown_project_option(&key), key_span),
             }
         }
         options
@@ -503,19 +587,20 @@ impl Parser<'_> {
 
     /// Reads `[libraries.NAME.options]` of the library `library` from `value`.
     ///
-    /// It has no valid keys yet: the keys of `[options]` are project level only.
+    /// Returns the options without `sv_libraries`, and the names of `sv-libraries` with their
+    /// spans, if the table has that key, for [`Parser::sv_libraries`].
+    /// The files of `vunit_lib` take the options of VUnit's library, so its table has no valid
+    /// keys.
     fn library_options(
         &mut self,
         library: &str,
         value: Spanned<toml::Value>,
         table: &DeTable<'_>,
-    ) -> Options {
-        let path = |key: &str| -> Vec<PathSegment> {
-            ["libraries", library, "options", key]
-                .iter()
-                .map(|key| PathSegment::Key((*key).to_owned()))
-                .collect()
-        };
+    ) -> (Options, Option<Vec<ListedLibrary>>) {
+        let mut options = Options::default();
+        let mut listed = None;
+        let base = ["libraries", library, "options"];
+        let path = |key: &str| key_path(&base, &[key]);
         let span = value.span();
         let toml::Value::Table(keys) = value.into_inner() else {
             self.diagnostic(
@@ -523,17 +608,256 @@ impl Parser<'_> {
                 format!("`options` of library '{library}' is a table, such as options = {{}}"),
                 Some(span),
             );
-            return Options::default();
+            return (options, listed);
         };
-        for (key, _) in in_file_order(table, keys, |key| path(key)) {
-            let message = if OPTION_KEYS.contains(&key.as_str()) {
-                format!("'{key}' is a project option; set it in [options]")
+        let is_vunit_lib = library.eq_ignore_ascii_case(builtins::VUNIT_LIB);
+        for (key, entry) in in_file_order(table, keys, path) {
+            let key_span = key_span(table, &path(&key));
+            let is_library_key = SHARED_KEYS.contains(&key.as_str()) || key == SV_LIBRARIES;
+            if PROJECT_KEYS.contains(&key.as_str()) {
+                self.diagnostic(
+                    Severity::Error,
+                    format!("'{key}' is a project option; set it in [options]"),
+                    key_span,
+                );
+            } else if is_library_key && is_vunit_lib {
+                self.diagnostic(
+                    Severity::Error,
+                    format!(
+                        "'{key}' can't be set for library '{library}', whose files take the \
+                         options of VUnit's builtin library"
+                    ),
+                    key_span,
+                );
+            } else if key == SV_LIBRARIES {
+                listed = self.library_list(library, entry, table);
+            } else if is_library_key {
+                self.shared_option(&key, entry, &base, table, &mut options);
             } else {
-                format!("unknown option '{key}' in [libraries.{library}.options]")
-            };
-            self.diagnostic(Severity::Error, message, key_span(table, &path(&key)));
+                let message = format!(
+                    "unknown option '{key}' in [libraries.{library}.options]; expected one of: {}",
+                    SHARED_KEYS
+                        .iter()
+                        .chain([&SV_LIBRARIES])
+                        .copied()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+                self.diagnostic(Severity::Error, message, key_span);
+            }
         }
-        Options::default()
+        (options, listed)
+    }
+
+    /// Reads the key `key` of [`SHARED_KEYS`] with the value `entry` of the options table at
+    /// the key path `base` into `options`; an invalid value is an error and isn't applied.
+    fn shared_option(
+        &mut self,
+        key: &str,
+        entry: toml::Value,
+        base: &[&str],
+        table: &DeTable<'_>,
+        options: &mut Options,
+    ) {
+        let what = format!("'{key}' in {}", table_name(base));
+        let value_span = value_span(table, &key_path(base, &[key]));
+        match key {
+            "include-dirs" => {
+                let toml::Value::Array(directories) = entry else {
+                    let message =
+                        format!("{what} is a list of directories, such as [\"inc\"], not {entry}");
+                    self.diagnostic(Severity::Error, message, value_span);
+                    return;
+                };
+                let mut include_dirs = Vec::new();
+                for (index, directory) in directories.into_iter().enumerate() {
+                    let mut path = key_path(base, &[key]);
+                    path.push(PathSegment::Index(index));
+                    let span = key_span(table, &path);
+                    match directory {
+                        toml::Value::String(directory) => include_dirs.push(IncludeDir {
+                            path: directory.into(),
+                            location: span.map(|span| PatternLocation {
+                                file: self.path.to_owned(),
+                                range: self.lines.range(span),
+                            }),
+                        }),
+                        other => {
+                            let message = format!("a directory of {what} is a string, not {other}");
+                            self.diagnostic(Severity::Error, message, span);
+                        },
+                    }
+                }
+                options.include_dirs = Some(include_dirs);
+            },
+            "defines" => {
+                let toml::Value::Table(defines) = entry else {
+                    let message = format!(
+                        "{what} is a table of macros, such as {{ WIDTH = \"8\", DEBUG = true }}, \
+                         not {entry}"
+                    );
+                    self.diagnostic(Severity::Error, message, value_span);
+                    return;
+                };
+                self.defines(defines, base, table, options);
+            },
+            "compilation-unit" => {
+                let mode = CompilationUnit::ALL
+                    .into_iter()
+                    .find(|mode| entry.as_str() == Some(mode.name()));
+                if mode.is_none() {
+                    let message = format!("{what} is \"file\" or \"library\", not {entry}");
+                    self.diagnostic(Severity::Error, message, value_span);
+                }
+                options.compilation_unit = mode.or(options.compilation_unit);
+            },
+            "keywords" => {
+                if let Some(Ok(version)) = entry.as_str().map(str::parse) {
+                    options.keywords = Some(version);
+                } else {
+                    let message = format!(
+                        "{what} is a version of IEEE 1800 22.14, one of: {}; not {entry}",
+                        KEYWORD_VERSIONS.join(", ")
+                    );
+                    self.diagnostic(Severity::Error, message, value_span);
+                }
+            },
+            "encoding" => {
+                let encoding = Encoding::ALL
+                    .into_iter()
+                    .find(|encoding| entry.as_str() == Some(encoding.name()));
+                if encoding.is_none() {
+                    let message = format!("{what} is \"utf-8\" or \"latin-1\", not {entry}");
+                    self.diagnostic(Severity::Error, message, value_span);
+                }
+                options.encoding = encoding.or(options.encoding);
+            },
+            _ => unreachable!("'{key}' isn't a shared option"),
+        }
+    }
+
+    /// Reads the macros `defines` of the options table at the key path `base` into `options`.
+    ///
+    /// `false` removes the project's macro of the name from a library, and is an error in
+    /// `[options]`; an integer is an error that names the string form.
+    fn defines(
+        &mut self,
+        defines: toml::Table,
+        base: &[&str],
+        table: &DeTable<'_>,
+        options: &mut Options,
+    ) {
+        let in_project = base == ["options"];
+        let what = format!("'defines' in {}", table_name(base));
+        let path = |name: &str| key_path(base, &["defines", name]);
+        for (written, value) in in_file_order(table, defines, path) {
+            let key_span = key_span(table, &path(&written));
+            let value_span = value_span(table, &path(&written));
+            let (name, formals) = match split_define(&written) {
+                Ok(split) => split,
+                Err(message) => {
+                    self.diagnostic(Severity::Error, format!("{message} in {what}"), key_span);
+                    continue;
+                },
+            };
+            if options.defines.contains_key(&name) {
+                let message = format!("macro '{name}' is defined twice in {what}");
+                self.diagnostic(Severity::Error, message, key_span);
+                continue;
+            }
+            let define = match value {
+                toml::Value::String(text) => Define::Defined { formals, text },
+                toml::Value::Boolean(true) => Define::Defined {
+                    formals,
+                    text: String::new(),
+                },
+                toml::Value::Boolean(false) if !in_project => Define::Removed,
+                toml::Value::Boolean(false) => {
+                    let message = format!(
+                        "macro '{name}' in {what} is false, which only a library's 'defines' \
+                         can be, to remove a macro of [options]; leave the macro out instead"
+                    );
+                    self.diagnostic(Severity::Error, message, value_span);
+                    continue;
+                },
+                toml::Value::Integer(number) => {
+                    let message = format!(
+                        "the text of macro '{name}' in {what} is a string: \"{written}\" = \
+                         \"{number}\""
+                    );
+                    self.diagnostic(Severity::Error, message, value_span);
+                    continue;
+                },
+                other => {
+                    let message = format!(
+                        "the text of macro '{name}' in {what} is a string, or true for an empty \
+                         one, not {other}"
+                    );
+                    self.diagnostic(Severity::Error, message, value_span);
+                    continue;
+                },
+            };
+            options.defines.insert(name, define);
+        }
+    }
+
+    /// Reads the list `sv-libraries` of the library `library` from `entry`: the names with their
+    /// spans, or `None` if it isn't a list.
+    fn library_list(
+        &mut self,
+        library: &str,
+        entry: toml::Value,
+        table: &DeTable<'_>,
+    ) -> Option<Vec<ListedLibrary>> {
+        let path = key_path(&["libraries", library, "options"], &[SV_LIBRARIES]);
+        let what = format!("'{SV_LIBRARIES}' in [libraries.{library}.options]");
+        let toml::Value::Array(names) = entry else {
+            let message = format!("{what} is a list of library names, not {entry}");
+            self.diagnostic(Severity::Error, message, value_span(table, &path));
+            return None;
+        };
+        let mut listed = Vec::new();
+        for (index, name) in names.into_iter().enumerate() {
+            let mut path = path.clone();
+            path.push(PathSegment::Index(index));
+            let span = key_span(table, &path);
+            match name {
+                toml::Value::String(name) => listed.push((name, span)),
+                other => {
+                    let message = format!("a library of {what} is a string, not {other}");
+                    self.diagnostic(Severity::Error, message, span);
+                },
+            }
+        }
+        Some(listed)
+    }
+
+    /// Checks the names of `sv-libraries` of the library `library` against the libraries of the
+    /// project, `names`, and returns the valid ones.
+    ///
+    /// `vunit_lib` is a library of every project, also when the configuration doesn't name it.
+    fn sv_libraries(
+        &mut self,
+        library: &str,
+        listed: Vec<ListedLibrary>,
+        names: &LibraryNames,
+    ) -> Vec<String> {
+        let what = format!("'{SV_LIBRARIES}' in [libraries.{library}.options]");
+        let mut valid: Vec<String> = Vec::new();
+        for (name, span) in listed {
+            let message = if name.eq_ignore_ascii_case(library) {
+                format!("library '{library}' itself in {what}, which it searches first anyway")
+            } else if !(names.contains(&name) || name.eq_ignore_ascii_case(builtins::VUNIT_LIB)) {
+                format!("unknown library '{name}' in {what}")
+            } else if valid.iter().any(|known| known.eq_ignore_ascii_case(&name)) {
+                format!("library '{name}' is listed twice in {what}")
+            } else {
+                valid.push(name);
+                continue;
+            };
+            self.diagnostic(Severity::Error, message, span);
+        }
+        valid
     }
 
     /// Reports the former list `options`, with the table that replaces it; nothing of it is
@@ -611,6 +935,91 @@ fn nested_leaves<'value>(
             }
         },
         _ => leaves.push((keys, value)),
+    }
+}
+
+/// Returns the message of the unknown key `key` of `[options]`.
+fn unknown_project_option(key: &str) -> String {
+    let mut message = format!(
+        "unknown option '{key}' in [options]; expected one of: {}",
+        PROJECT_KEYS
+            .iter()
+            .chain(&SHARED_KEYS)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if ["libraries", "vunit", "toolchain"].contains(&key) {
+        message.push_str(
+            "; keys after the [options] header belong to it, so put them above the header, or \
+             write options = { … }",
+        );
+    }
+    message
+}
+
+/// Returns the key path of `keys` in the table at the key path `base`.
+fn key_path(base: &[&str], keys: &[&str]) -> Vec<PathSegment> {
+    base.iter()
+        .chain(keys)
+        .map(|key| PathSegment::Key((*key).to_owned()))
+        .collect()
+}
+
+/// Returns the name of the options table at the key path `base` for messages, such as
+/// `[options]`.
+fn table_name(base: &[&str]) -> String {
+    format!("[{}]", base.join("."))
+}
+
+/// Splits the key `written` of `defines` into the macro name and its formal arguments in their
+/// parentheses, if it has them, such as `MAX` and `(a,b)` for `MAX(a,b)`.
+///
+/// # Errors
+///
+/// Fails with a message if the name isn't a simple identifier of IEEE 1800 5.6, names a
+/// directive, or anything but formal arguments in balanced parentheses follows it.
+fn split_define(written: &str) -> Result<(String, Option<String>), String> {
+    let name_end = written
+        .char_indices()
+        .find(|&(index, character)| {
+            !(character.is_ascii_alphabetic()
+                || character == '_'
+                || index > 0 && (character.is_ascii_digit() || character == '$'))
+        })
+        .map_or(written.len(), |(index, _)| index);
+    let (name, formals) = written.split_at(name_end);
+    let expected = "expected a name such as WIDTH, or MAX(a,b) with formal arguments";
+    if name.is_empty() {
+        return Err(format!("'{written}' is no macro name; {expected}"));
+    }
+    if SV_DIRECTIVES.contains(&name) {
+        return Err(format!(
+            "macro '{name}' is named like a directive, which a macro may not be"
+        ));
+    }
+    if formals.is_empty() {
+        return Ok((name.to_owned(), None));
+    }
+    // The formal arguments may have defaults in parentheses, such as `MAX(a=f(1),b)`.
+    let mut depth = 0_usize;
+    let mut close = None;
+    for (index, character) in formals.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' if depth > 0 => depth -= 1,
+            _ => {},
+        }
+        if depth == 0 {
+            close = Some(index);
+            break;
+        }
+    }
+    match close {
+        Some(close) if formals.starts_with('(') && close + 1 == formals.len() => {
+            Ok((name.to_owned(), Some(formals.to_owned())))
+        },
+        _ => Err(format!("'{written}' is no macro name; {expected}")),
     }
 }
 
@@ -860,12 +1269,13 @@ files = []
                 (
                     Severity::Error,
                     "unknown option 'colour' in [options]; expected one of: relaxed, opt-level, \
-                     opt",
+                     opt, include-dirs, defines, compilation-unit, keywords, encoding",
                     Some(Position::new(2, 1))
                 ),
                 (
                     Severity::Error,
-                    "unknown option 'top' in [options]; expected one of: relaxed, opt-level, opt",
+                    "unknown option 'top' in [options]; expected one of: relaxed, opt-level, \
+                     opt, include-dirs, defines, compilation-unit, keywords, encoding",
                     Some(Position::new(3, 1))
                 ),
                 (
@@ -955,7 +1365,7 @@ files = []
             [(
                 Severity::Error,
                 "unknown option 'libraries' in [options]; expected one of: relaxed, opt-level, \
-                 opt; keys after the [options] header belong to it, so put them above the \
+                 opt, include-dirs, defines, compilation-unit, keywords, encoding; keys after the [options] header belong to it, so put them above the \
                  header, or write options = { … }",
                 Some(Position::new(3, 1))
             )]
@@ -1017,7 +1427,8 @@ options = 1
                 ),
                 (
                     Severity::Error,
-                    "unknown option 'include' in [libraries.lib.options]",
+                    "unknown option 'include' in [libraries.lib.options]; expected one of: \
+                     include-dirs, defines, compilation-unit, keywords, encoding, sv-libraries",
                     Some(Position::new(7, 1))
                 ),
                 (
@@ -1037,6 +1448,430 @@ options = 1
         }
         assert!(!spec.options.relaxed);
         assert_eq!(spec.sim_options.run_options, Some(RunOptions::new()));
+    }
+
+    /// The own options of the library `name` of `spec`.
+    fn own_options<'spec>(spec: &'spec ProjectSpec, name: &str) -> &'spec Options {
+        let Some(LibrarySpec::Sources { options, .. }) =
+            spec.libraries.iter().find(|library| library.name() == name)
+        else {
+            panic!("no source library '{name}'");
+        };
+        options
+    }
+
+    #[test]
+    fn sv_keys_are_valid_in_both_tables() {
+        let config = parse_str(
+            r#"
+[options]
+include-dirs = ["inc", "/abs/inc"]
+defines = { WIDTH = "8", DEBUG = true, EMPTY = "", "MAX(a,b)" = "((a)>(b)?(a):(b))" }
+compilation-unit = "library"
+keywords = "1800-2017"
+encoding = "latin-1"
+
+[libraries.a]
+files = []
+
+[libraries.b]
+files = []
+[libraries.b.options]
+include-dirs = []
+defines = { WIDTH = "16", DEBUG = false, "MIN(a, b=0)" = true }
+compilation-unit = "file"
+keywords = "1364-2005"
+encoding = "utf-8"
+sv-libraries = ["A", "vunit_lib"]
+"#,
+        );
+        assert_eq!(config.diagnostics, []);
+        let spec = config.spec.unwrap();
+        let location = |line, start, end| {
+            Some(PatternLocation {
+                file: PATH.into(),
+                range: Range {
+                    start: Position::new(line, start),
+                    end: Position::new(line, end),
+                },
+            })
+        };
+        assert_eq!(
+            spec.options,
+            Options {
+                relaxed: false,
+                include_dirs: Some(vec![
+                    IncludeDir {
+                        path: "inc".into(),
+                        location: location(3, 17, 21),
+                    },
+                    IncludeDir {
+                        path: "/abs/inc".into(),
+                        location: location(3, 24, 33),
+                    },
+                ]),
+                defines: BTreeMap::from([
+                    ("WIDTH".to_owned(), Define::text("8")),
+                    ("DEBUG".to_owned(), Define::text("")),
+                    ("EMPTY".to_owned(), Define::text("")),
+                    (
+                        "MAX".to_owned(),
+                        Define::Defined {
+                            formals: Some("(a,b)".to_owned()),
+                            text: "((a)>(b)?(a):(b))".to_owned(),
+                        }
+                    ),
+                ]),
+                compilation_unit: Some(CompilationUnit::Library),
+                keywords: Some("1800-2017".parse().unwrap()),
+                encoding: Some(Encoding::Latin1),
+                sv_libraries: None,
+            }
+        );
+        assert_eq!(*own_options(&spec, "a"), Options::default());
+        assert_eq!(
+            *own_options(&spec, "b"),
+            Options {
+                relaxed: false,
+                include_dirs: Some(Vec::new()),
+                defines: BTreeMap::from([
+                    ("WIDTH".to_owned(), Define::text("16")),
+                    ("DEBUG".to_owned(), Define::Removed),
+                    (
+                        "MIN".to_owned(),
+                        Define::Defined {
+                            formals: Some("(a, b=0)".to_owned()),
+                            text: String::new(),
+                        }
+                    ),
+                ]),
+                compilation_unit: Some(CompilationUnit::File),
+                keywords: Some("1364-2005".parse().unwrap()),
+                encoding: Some(Encoding::Utf8),
+                sv_libraries: Some(vec!["A".to_owned(), "vunit_lib".to_owned()]),
+            }
+        );
+        // `vunit_lib` is known, also when the configuration doesn't name it.
+        assert!(!library_names(&spec).contains(&"vunit_lib"));
+    }
+
+    fn keywords_message(table: &str, value: &str) -> String {
+        format!(
+            "'keywords' in {table} is a version of IEEE 1800 22.14, one of: {}; not {value}",
+            KEYWORD_VERSIONS.join(", ")
+        )
+    }
+
+    #[test]
+    fn sv_keys_errors_in_the_project() {
+        let config = parse_str(
+            r#"
+[options]
+include-dirs = "inc"
+defines = ["WIDTH=8"]
+compilation-unit = "unit"
+keywords = "1800-2020"
+encoding = "latin1"
+"#,
+        );
+        let keywords = keywords_message("[options]", "\"1800-2020\"");
+        assert_eq!(
+            messages(&config),
+            [
+                (
+                    Severity::Error,
+                    "'include-dirs' in [options] is a list of directories, such as [\"inc\"], not \
+                     \"inc\"",
+                    Some(Position::new(3, 16))
+                ),
+                (
+                    Severity::Error,
+                    "'defines' in [options] is a table of macros, such as { WIDTH = \"8\", DEBUG \
+                     = true }, not [\"WIDTH=8\"]",
+                    Some(Position::new(4, 11))
+                ),
+                (
+                    Severity::Error,
+                    "'compilation-unit' in [options] is \"file\" or \"library\", not \"unit\"",
+                    Some(Position::new(5, 20))
+                ),
+                (
+                    Severity::Error,
+                    keywords.as_str(),
+                    Some(Position::new(6, 12))
+                ),
+                (
+                    Severity::Error,
+                    "'encoding' in [options] is \"utf-8\" or \"latin-1\", not \"latin1\"",
+                    Some(Position::new(7, 12))
+                ),
+            ]
+        );
+        assert_eq!(config.spec.unwrap().options, Options::default());
+    }
+
+    #[test]
+    fn sv_keys_errors_in_a_library() {
+        let config = parse_str(
+            r#"
+[libraries.lib]
+files = []
+[libraries.lib.options]
+include-dirs = ["inc", 1]
+defines = 1
+compilation-unit = 1
+keywords = 2017
+encoding = true
+sv-libraries = "other"
+"#,
+        );
+        let keywords = keywords_message("[libraries.lib.options]", "2017");
+        assert_eq!(
+            messages(&config),
+            [
+                (
+                    Severity::Error,
+                    "a directory of 'include-dirs' in [libraries.lib.options] is a string, not 1",
+                    Some(Position::new(5, 24))
+                ),
+                (
+                    Severity::Error,
+                    "'defines' in [libraries.lib.options] is a table of macros, such as { WIDTH = \
+                     \"8\", DEBUG = true }, not 1",
+                    Some(Position::new(6, 11))
+                ),
+                (
+                    Severity::Error,
+                    "'compilation-unit' in [libraries.lib.options] is \"file\" or \"library\", \
+                     not 1",
+                    Some(Position::new(7, 20))
+                ),
+                (
+                    Severity::Error,
+                    keywords.as_str(),
+                    Some(Position::new(8, 12))
+                ),
+                (
+                    Severity::Error,
+                    "'encoding' in [libraries.lib.options] is \"utf-8\" or \"latin-1\", not true",
+                    Some(Position::new(9, 12))
+                ),
+                (
+                    Severity::Error,
+                    "'sv-libraries' in [libraries.lib.options] is a list of library names, not \
+                     \"other\"",
+                    Some(Position::new(10, 16))
+                ),
+            ]
+        );
+        // Nothing invalid is applied; the valid directory is.
+        let mut options = own_options(&config.spec.unwrap(), "lib").clone();
+        let directories = options.include_dirs.take().unwrap();
+        assert_eq!(directories.len(), 1);
+        assert_eq!(directories[0].path, "inc");
+        assert_eq!(options, Options::default());
+    }
+
+    #[test]
+    fn defines_errors() {
+        let config = parse_str(
+            r#"
+[options]
+defines = { WIDTH = 8, DEBUG = false, "1X" = "1", "MAX(a" = "", "F(a)b" = "", ifdef = "", A = 1.5 }
+
+[libraries.lib]
+files = []
+[libraries.lib.options]
+defines = { "MAX(a,b)" = "a", MAX = "b", DEBUG = false, DEPTH = 4 }
+"#,
+        );
+        assert_eq!(
+            messages(&config),
+            [
+                (
+                    Severity::Error,
+                    "macro 'MAX' is defined twice in 'defines' in [libraries.lib.options]",
+                    Some(Position::new(8, 31))
+                ),
+                (
+                    Severity::Error,
+                    "the text of macro 'DEPTH' in 'defines' in [libraries.lib.options] is a \
+                     string: \"DEPTH\" = \"4\"",
+                    Some(Position::new(8, 65))
+                ),
+                (
+                    Severity::Error,
+                    "the text of macro 'WIDTH' in 'defines' in [options] is a string: \"WIDTH\" = \
+                     \"8\"",
+                    Some(Position::new(3, 21))
+                ),
+                (
+                    Severity::Error,
+                    "macro 'DEBUG' in 'defines' in [options] is false, which only a library's \
+                     'defines' can be, to remove a macro of [options]; leave the macro out \
+                     instead",
+                    Some(Position::new(3, 32))
+                ),
+                (
+                    Severity::Error,
+                    "'1X' is no macro name; expected a name such as WIDTH, or MAX(a,b) with \
+                     formal arguments in 'defines' in [options]",
+                    Some(Position::new(3, 39))
+                ),
+                (
+                    Severity::Error,
+                    "'MAX(a' is no macro name; expected a name such as WIDTH, or MAX(a,b) with \
+                     formal arguments in 'defines' in [options]",
+                    Some(Position::new(3, 51))
+                ),
+                (
+                    Severity::Error,
+                    "'F(a)b' is no macro name; expected a name such as WIDTH, or MAX(a,b) with \
+                     formal arguments in 'defines' in [options]",
+                    Some(Position::new(3, 65))
+                ),
+                (
+                    Severity::Error,
+                    "macro 'ifdef' is named like a directive, which a macro may not be in \
+                     'defines' in [options]",
+                    Some(Position::new(3, 79))
+                ),
+                (
+                    Severity::Error,
+                    "the text of macro 'A' in 'defines' in [options] is a string, or true for an \
+                     empty one, not 1.5",
+                    Some(Position::new(3, 95))
+                ),
+            ]
+        );
+        let spec = config.spec.unwrap();
+        assert_eq!(spec.options.defines, BTreeMap::new());
+        assert_eq!(
+            own_options(&spec, "lib").defines,
+            BTreeMap::from([
+                (
+                    "MAX".to_owned(),
+                    Define::Defined {
+                        formals: Some("(a,b)".to_owned()),
+                        text: "a".to_owned(),
+                    }
+                ),
+                ("DEBUG".to_owned(), Define::Removed),
+            ])
+        );
+    }
+
+    #[test]
+    fn sv_libraries_errors() {
+        let config = parse_str(
+            r#"
+[options]
+sv-libraries = ["a"]
+
+[libraries.a]
+files = []
+[libraries.a.options]
+sv-libraries = ["b", "A", "missing", "B", "vunit_lib", 1, "later"]
+
+[libraries.b]
+files = []
+
+[libraries.later]
+files = []
+"#,
+        );
+        assert_eq!(
+            messages(&config),
+            [
+                (
+                    Severity::Error,
+                    "a library of 'sv-libraries' in [libraries.a.options] is a string, not 1",
+                    Some(Position::new(8, 56))
+                ),
+                (
+                    Severity::Error,
+                    "library 'a' itself in 'sv-libraries' in [libraries.a.options], which it \
+                     searches first anyway",
+                    Some(Position::new(8, 22))
+                ),
+                (
+                    Severity::Error,
+                    "unknown library 'missing' in 'sv-libraries' in [libraries.a.options]",
+                    Some(Position::new(8, 27))
+                ),
+                (
+                    Severity::Error,
+                    "library 'B' is listed twice in 'sv-libraries' in [libraries.a.options]",
+                    Some(Position::new(8, 38))
+                ),
+                (
+                    Severity::Error,
+                    "'sv-libraries' is a library option; set it in [libraries.NAME.options]",
+                    Some(Position::new(3, 1))
+                ),
+            ]
+        );
+        let spec = config.spec.unwrap();
+        assert_eq!(spec.options, Options::default());
+        assert_eq!(
+            own_options(&spec, "a").sv_libraries,
+            Some(vec![
+                "b".to_owned(),
+                "vunit_lib".to_owned(),
+                "later".to_owned()
+            ])
+        );
+    }
+
+    #[test]
+    fn vunit_lib_takes_no_options() {
+        let config = parse_str(
+            r#"
+[libraries.vunit_lib]
+files = []
+[libraries.vunit_lib.options]
+encoding = "latin-1"
+defines = { A = "1" }
+sv-libraries = []
+relaxed = true
+"#,
+        );
+        let message = |key: &str| {
+            format!(
+                "'{key}' can't be set for library 'vunit_lib', whose files take the options of \
+                 VUnit's builtin library"
+            )
+        };
+        let (encoding, defines, sv_libraries) = (
+            message("encoding"),
+            message("defines"),
+            message("sv-libraries"),
+        );
+        assert_eq!(
+            messages(&config),
+            [
+                (
+                    Severity::Error,
+                    encoding.as_str(),
+                    Some(Position::new(5, 1))
+                ),
+                (Severity::Error, defines.as_str(), Some(Position::new(6, 1))),
+                (
+                    Severity::Error,
+                    sv_libraries.as_str(),
+                    Some(Position::new(7, 1))
+                ),
+                (
+                    Severity::Error,
+                    "'relaxed' is a project option; set it in [options]",
+                    Some(Position::new(8, 1))
+                ),
+            ]
+        );
+        assert_eq!(
+            *own_options(&config.spec.unwrap(), "vunit_lib"),
+            Options::default()
+        );
     }
 
     #[test]
@@ -1292,7 +2127,7 @@ loops = "on"
                 (
                     Severity::Error,
                     "unknown option 'finish-after' in [options]; expected one of: relaxed, \
-                     opt-level, opt",
+                     opt-level, opt, include-dirs, defines, compilation-unit, keywords, encoding",
                     Some(Position::new(3, 1))
                 ),
                 (

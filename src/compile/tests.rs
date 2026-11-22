@@ -8,6 +8,10 @@
 //! AI NOTICE: Generated, minimally reviewed.
 
 use super::*;
+use crate::spec::CompilationUnit;
+use crate::spec::Define;
+use crate::spec::Encoding;
+use crate::spec::IncludeDir;
 use crate::spec::Options;
 use crate::test_support::TempRoot;
 use crate::test_support::add_vhdl;
@@ -200,9 +204,13 @@ fn compile_keys_depend_on_options_and_simulator() {
     // The options of a library change its files' keys and those of their dependents, and only
     // the commands of its batches have their arguments.
     let lib = fixture.project.find_library("lib").unwrap();
-    fixture
-        .project
-        .set_library_options(lib, Options { relaxed: true });
+    fixture.project.set_library_options(
+        lib,
+        Options {
+            relaxed: true,
+            ..Options::default()
+        },
+    );
     let relaxed_plan = fixture.plan(&targets, &state);
     let compiled: Vec<_> = relaxed_plan
         .files()
@@ -225,6 +233,31 @@ fn compile_keys_depend_on_options_and_simulator() {
     assert_eq!(relaxed, ["pkg.vhd"]);
     fixture.project.set_library_options(lib, Options::default());
     assert_eq!(fixture.plan(&targets, &state).compile_count(), 0);
+
+    // The keys of SystemVerilog files don't reach the arguments of VHDL files; `encoding` does.
+    let sv_options = Options {
+        include_dirs: Some(vec![IncludeDir::new("/inc")]),
+        defines: BTreeMap::from([("WIDTH".to_owned(), Define::text("8"))]),
+        compilation_unit: Some(CompilationUnit::Library),
+        keywords: Some("1800-2017".parse().unwrap()),
+        sv_libraries: Some(vec!["other".to_owned()]),
+        ..Options::default()
+    };
+    fixture.project.set_library_options(lib, sv_options.clone());
+    assert_eq!(fixture.plan(&targets, &state).compile_count(), 0);
+    fixture.project.set_library_options(
+        lib,
+        Options {
+            encoding: Some(Encoding::Utf8),
+            ..sv_options
+        },
+    );
+    let encoded_plan = fixture.plan(&targets, &state);
+    assert_eq!(encoded_plan.compile_count(), 2);
+    let command = encoded_plan.compile_command(&[0]);
+    assert!(command.iter().any(|arg| arg == "--encoding=utf-8"));
+    assert!(!command.iter().any(|arg| arg.starts_with("--define")));
+    fixture.project.set_library_options(lib, Options::default());
 
     let mut identity = fixture.simulator.identity().clone();
     identity.version_output = "risim-runner 0.1.0\nhydrolyze archive format 2\n".to_owned();

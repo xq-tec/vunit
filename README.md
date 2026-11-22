@@ -37,10 +37,14 @@ A workspace is opened from a `risim-config.toml`:
 
 ```toml
 # The options of the project: relaxed analysis and elaboration, the optimization preset, and rows
-# or groups of optimizations over it. Only tables follow the header.
+# or groups of optimizations over it; then the options of SystemVerilog and Verilog files, and the
+# encoding of all files. Only tables follow the header.
 [options]
 relaxed = true
 opt-level = "full"
+include-dirs = ["inc"]
+defines = { WIDTH = "8", DEBUG = true, "MAX(a,b)" = "((a)>(b)?(a):(b))" }
+encoding = "utf-8"
 
 [options.opt]
 wake-guards = "off"
@@ -50,9 +54,10 @@ wake-guards = "off"
 [vunit]
 features = ["random", "verification_components"]
 
-# One table per library, with source globs relative to the workspace root.
+# One table per library, with source globs relative to the workspace root, and its own options.
 [libraries.my_lib]
 files = ["src/**/*.vhd", "tb/*.vhd"]
+options = { defines = { DEBUG = false }, keywords = "1800-2017" }
 
 # The riSim version that the `risim` launcher runs for the workspace; ignored here.
 [toolchain]
@@ -66,9 +71,22 @@ version = "1.4"
 - Each key `NAME` of `[options.opt]` (or `opt = { … }`) is the run option `opt.NAME`, with a string mode.
   A dotted name is quoted (`"mir.cse" = "off"`); a table in `[options.opt]`, such as `mir.cse = "off"` or `[options.opt.mir]`, is an error that names the quoted form.
 
+- `include-dirs` is a list of directories, relative to the workspace root, that a quoted `` `include `` searches; a directory that doesn't exist gives a warning.
+- `defines` is a table of macros, defined at the start of every compilation unit: a name, optionally with formal arguments (`"MAX(a,b)" = "…"`), and its text, or `true` for an empty macro.
+  A macro named like a directive, and an integer as text, are errors.
+- `compilation-unit` is `"file"` (the default: each file is a compilation unit) or `"library"` (the files of a library form one, in the order of collection).
+- `keywords` is a version specifier of `` `begin_keywords `` (IEEE 1800 22.14), such as `"1800-2017"`, which replaces the default of the file's extension.
+- `encoding` is `"utf-8"` or `"latin-1"`, the encoding of the library's files of both languages and of their include files; by default, VHDL files are Latin-1 and the others UTF-8.
+
 The table can also be written inline, `options = { relaxed = true }`, which avoids the TOML pitfall that bare and dotted keys after the `[options]` header belong to it.
-`[libraries.NAME.options]` holds a library's own options, over the project's (`Options::for_library`); it has no valid keys yet, and the keys of `[options]` are project level only.
-The builtin libraries take the project's `relaxed` (`Options::for_builtins`).
+
+`[libraries.NAME.options]` holds a library's own options, over the project's (`Options::for_library`): a key of the library replaces the project's, except `defines`, which merge by name, and where `false` removes the project's macro of that name.
+`relaxed`, `opt-level`, and `opt` are project level only.
+`sv-libraries` is library level only: the libraries, in order, that the library's SystemVerilog files search for packages and definitions after their own library.
+It can't name the library itself, and accepts `vunit_lib`, a library of every project.
+Instead of upstream's `include_dirs` and `defines` per file (`add_source_file`), these options are per library, as `risim analyze` takes them per call.
+The builtin libraries take the project's `relaxed` only (`Options::for_builtins`), and the files of a user library `vunit_lib` join VUnit's library and take its options, so `[libraries.vunit_lib.options]` has no valid keys.
+Libraries without SystemVerilog or Verilog files are analysed with `relaxed` and `encoding` only (`Options::without_sv_keys`), so that the other keys don't change their compile keys; SystemVerilog and Verilog files aren't compiled yet.
 
 Unknown keys and wrong types in the options tables are configuration errors at their keys or values; the rest of the file still loads.
 The former list `options = ["-frelaxed"]` and the former `[run]` table are errors that give the new spelling, and nothing of them is applied.

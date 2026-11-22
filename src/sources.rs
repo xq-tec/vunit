@@ -39,6 +39,7 @@ use crate::project::Project;
 use crate::spec::FilePattern;
 use crate::spec::LibrarySpec;
 use crate::spec::Options;
+use crate::spec::PatternLocation;
 use crate::spec::ProjectSpec;
 use crate::store;
 use crate::store::FileTime;
@@ -106,7 +107,8 @@ pub struct CollectedLibrary {
     pub files: Vec<Utf8PathBuf>,
     /// The effective options of the library's files: [`Options::for_builtins`] of the project's
     /// for the builtin libraries (also for files added to `vunit_lib`),
-    /// [`Options::for_library`] for user libraries, and the default for precompiled ones.
+    /// [`Options::for_library`] for user libraries, with the include directories resolved
+    /// against the workspace root, and the default for precompiled ones.
     pub options: Options,
 }
 
@@ -146,6 +148,8 @@ pub fn collect(root: &Utf8Path, spec: &ProjectSpec, builtins_dir: &Utf8Path) -> 
         });
     }
 
+    // The include directories that don't exist, so that each gets one warning.
+    let mut missing_dirs = FxHashSet::default();
     for library in libraries {
         match library {
             LibrarySpec::Sources {
@@ -196,7 +200,13 @@ pub fn collect(root: &Utf8Path, spec: &ProjectSpec, builtins_dir: &Utf8Path) -> 
                     vhdl_standard: vhdl_standard.unwrap_or(spec.vhdl_standard),
                     external_path: None,
                     files: library_files,
-                    options: spec.options.for_library(options),
+                    options: library_options(
+                        root,
+                        &spec.options,
+                        options,
+                        &mut missing_dirs,
+                        &mut collected.config_diagnostics,
+                    ),
                 });
             },
             LibrarySpec::External { name, path } => {
@@ -218,6 +228,38 @@ pub fn collect(root: &Utf8Path, spec: &ProjectSpec, builtins_dir: &Utf8Path) -> 
         }
     }
     collected
+}
+
+/// Returns the effective options of a user library whose own options are `library`, with
+/// `project` as the project's ([`Options::for_library`]).
+///
+/// The include directories are resolved against `root`; a directory that doesn't exist stays,
+/// since it may be created later, and gives a warning in `diagnostics` unless it is in
+/// `missing_dirs` already, as it is for the project's directories after the first library.
+fn library_options(
+    root: &Utf8Path,
+    project: &Options,
+    library: &Options,
+    missing_dirs: &mut FxHashSet<(Utf8PathBuf, Option<PatternLocation>)>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Options {
+    let mut options = project.for_library(library);
+    for directory in options.include_dirs.iter_mut().flatten() {
+        directory.path = normalize(&root.join(&directory.path));
+        if !directory.path.is_dir()
+            && missing_dirs.insert((directory.path.clone(), directory.location.clone()))
+        {
+            let diagnostic = Diagnostic::warning(format!(
+                "include directory {} doesn't exist",
+                directory.path
+            ));
+            diagnostics.push(match &directory.location {
+                Some(location) => diagnostic.in_file(&location.file).at(Some(location.range)),
+                None => diagnostic,
+            });
+        }
+    }
+    options
 }
 
 /// Returns the libraries of `spec` with valid names, and whether the builtin OSVVM library is
@@ -683,7 +725,12 @@ pub fn build_project(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::diagnostics::Position;
+    use crate::diagnostics::Range;
     use crate::diagnostics::Severity;
+    use crate::spec::Define;
+    use crate::spec::Encoding;
+    use crate::spec::IncludeDir;
     use crate::test_support::TempRoot as Workspace;
 
     fn glob(workspace: &Workspace, pattern: &str) -> Vec<String> {
@@ -875,6 +922,101 @@ mod tests {
                 ("ext", false)
             ]
         );
+    }
+
+    #[test]
+    fn collect_merges_the_options_of_libraries() {
+        let workspace = Workspace::new();
+        workspace.write("inc/defs.svh", "");
+        let mut spec = ProjectSpec::new();
+        spec.options = Options {
+            relaxed: true,
+            include_dirs: Some(vec![IncludeDir::new("project")]),
+            defines: BTreeMap::from([
+                ("WIDTH".to_owned(), Define::text("8")),
+                ("DEBUG".to_owned(), Define::text("")),
+            ]),
+            encoding: Some(Encoding::Latin1),
+            ..Options::default()
+        };
+        spec.add_library("lib", Vec::<String>::new())
+            .add_library("plain", Vec::<String>::new());
+        let LibrarySpec::Sources { options, .. } = &mut spec.libraries[0] else {
+            unreachable!();
+        };
+        *options = Options {
+            include_dirs: Some(vec![IncludeDir::new("./inc/../inc")]),
+            defines: BTreeMap::from([("DEBUG".to_owned(), Define::Removed)]),
+            sv_libraries: Some(vec!["plain".to_owned()]),
+            ..Options::default()
+        };
+        let collected = collect(&workspace.root, &spec, Utf8Path::new("/builtins"));
+
+        let options_of = |name: &str| {
+            &collected
+                .libraries
+                .iter()
+                .find(|library| library.name == name)
+                .unwrap()
+                .options
+        };
+        let relaxed = Options {
+            relaxed: true,
+            ..Options::default()
+        };
+        assert_eq!(*options_of("vunit_lib"), relaxed);
+        assert_eq!(*options_of("osvvm"), relaxed);
+        assert_eq!(
+            *options_of("lib"),
+            Options {
+                relaxed: true,
+                include_dirs: Some(vec![IncludeDir::new(workspace.root.join("inc"))]),
+                defines: BTreeMap::from([("WIDTH".to_owned(), Define::text("8"))]),
+                encoding: Some(Encoding::Latin1),
+                sv_libraries: Some(vec!["plain".to_owned()]),
+                ..Options::default()
+            }
+        );
+        // The project's include directories are resolved for libraries without their own.
+        assert_eq!(
+            options_of("plain").include_dirs,
+            Some(vec![IncludeDir::new(workspace.root.join("project"))])
+        );
+    }
+
+    #[test]
+    fn collect_warns_once_about_a_missing_include_dir() {
+        let workspace = Workspace::new();
+        let location = PatternLocation {
+            file: workspace.root.join("risim-config.toml"),
+            range: Range {
+                start: Position::new(3, 17),
+                end: Position::new(3, 25),
+            },
+        };
+        let mut spec = ProjectSpec::new();
+        spec.options.include_dirs = Some(vec![IncludeDir {
+            path: "missing".into(),
+            location: Some(location.clone()),
+        }]);
+        spec.add_library("a", Vec::<String>::new())
+            .add_library("b", Vec::<String>::new());
+        let collected = collect(&workspace.root, &spec, Utf8Path::new("/builtins"));
+
+        let missing = workspace.root.join("missing");
+        assert_eq!(
+            collected.config_diagnostics,
+            [
+                Diagnostic::warning(format!("include directory {missing} doesn't exist"))
+                    .in_file(&location.file)
+                    .at(Some(location.range))
+            ]
+        );
+        // The directory stays, since it may be created later.
+        for library in &collected.libraries[2..] {
+            let directories = library.options.include_dirs.as_deref().unwrap();
+            assert_eq!(directories[0].path, missing);
+        }
     }
 
     #[test]

@@ -288,10 +288,11 @@ impl CompilePlan {
         for &id in order {
             let file = project.file(id);
             let library = &project.library(file.library).name;
-            let library_args =
-                Arc::clone(analyze_args.entry(file.library).or_insert_with(|| {
-                    project.library(file.library).options.analyze_args().into()
-                }));
+            // Only VHDL files are compiled yet, so no SystemVerilog option applies.
+            let library_args = Arc::clone(analyze_args.entry(file.library).or_insert_with(|| {
+                let options = &project.library(file.library).options;
+                options.without_sv_keys().analyze_args().into()
+            }));
             let dependencies: Vec<usize> = self
                 .graph
                 .direct_dependencies(id)

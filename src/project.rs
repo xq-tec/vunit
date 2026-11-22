@@ -276,6 +276,11 @@ impl LibraryNames {
         self.by_lowercase.insert(lowercase, name.to_owned());
         Ok(())
     }
+
+    /// Returns `true` if `name` is one of the names, compared case-insensitively.
+    pub fn contains(&self, name: &str) -> bool {
+        self.by_lowercase.contains_key(&name.to_ascii_lowercase())
+    }
 }
 
 /// The libraries and source files of a project.
