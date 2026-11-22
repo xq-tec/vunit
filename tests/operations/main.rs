@@ -32,6 +32,7 @@ use std::time::Instant;
 use camino::Utf8Path;
 use camino::Utf8PathBuf;
 use libtest_mimic::Arguments;
+use libtest_mimic::Trial;
 use risim_vunit_frontend::builtins;
 use risim_vunit_frontend::compile;
 use risim_vunit_frontend::compile::CompileContext;
@@ -54,7 +55,13 @@ use risim_vunit_frontend::simulator::RunOptions;
 use risim_vunit_frontend::simulator::Simulator;
 use risim_vunit_frontend::sources;
 use risim_vunit_frontend::sources::SourceCache;
+use risim_vunit_frontend::spec::CompilationUnit;
+use risim_vunit_frontend::spec::Define;
 use risim_vunit_frontend::spec::Feature;
+use risim_vunit_frontend::spec::FilePattern;
+use risim_vunit_frontend::spec::IncludeDir;
+use risim_vunit_frontend::spec::LibrarySpec;
+use risim_vunit_frontend::spec::Options;
 use risim_vunit_frontend::spec::ProjectSpec;
 use risim_vunit_frontend::store::CompileState;
 use risim_vunit_frontend::store::FileKey;
@@ -178,8 +185,38 @@ fn main() -> ExitCode {
             env::var_os("RISIM_RUNNER").is_none() || env::var_os("RISIM_ANALYZER").is_none(),
         ),
     ];
-    let trials = trials.into_iter().chain(workspace::trials()).collect();
+    let trials = trials
+        .into_iter()
+        .chain(sv_trials())
+        .chain(workspace::trials())
+        .collect();
     libtest_mimic::run(&args, trials).exit_code()
+}
+
+/// The trials of SystemVerilog and Verilog files.
+fn sv_trials() -> Vec<Trial> {
+    vec![
+        trial(
+            "sv_files_compile_with_their_library_options",
+            sv_files_compile_with_their_library_options,
+        ),
+        trial(
+            "editing_an_include_recompiles_its_includers",
+            editing_an_include_recompiles_its_includers,
+        ),
+        trial(
+            "library_mode_compiles_every_sv_file_of_the_library_in_one_call",
+            library_mode_compiles_every_sv_file_of_the_library_in_one_call,
+        ),
+        trial(
+            "a_report_in_an_include_goes_to_its_includer",
+            a_report_in_an_include_goes_to_its_includer,
+        ),
+        trial(
+            "up_to_date_sv_files_are_not_compiled",
+            up_to_date_sv_files_are_not_compiled,
+        ),
+    ]
 }
 
 // -------------------------------------------------------------------------------------------------
@@ -348,6 +385,38 @@ impl Workspace {
             .add_library("a", ["a/*.vhd"])
             .add_library("b", ["b/*.vhd"])
             .add_library("tb", ["tb/*.vhd"]);
+    }
+
+    /// Adds the library `name` with the files of `patterns` and the options `options`.
+    fn add_library_with_options(&mut self, name: &str, patterns: &[&str], options: Options) {
+        self.spec.libraries.push(LibrarySpec::Sources {
+            name: name.to_owned(),
+            files: patterns
+                .iter()
+                .map(|&pattern| FilePattern::new(pattern))
+                .collect(),
+            vhdl_standard: None,
+            options,
+        });
+    }
+
+    /// Returns and clears the arguments of the `analyze` calls of the fake simulator, by
+    /// library.
+    fn take_args(&self) -> Vec<(String, Vec<String>)> {
+        let path = self.root.join(fake_risim::ARGS);
+        let log = fs::read_to_string(&path).unwrap_or_default();
+        let _ignored = fs::remove_file(&path);
+        log.lines()
+            .map(|line| {
+                let args: Vec<String> = serde_json::from_str(line).expect("the arguments");
+                let work = args
+                    .iter()
+                    .find_map(|arg| arg.strip_prefix("--work="))
+                    .expect("--work")
+                    .to_owned();
+                (work, args)
+            })
+            .collect()
     }
 
     async fn compile(&self, state: &mut CompileState) -> Run {
@@ -1038,6 +1107,201 @@ async fn detect_rejects_other_programs() {
 }
 
 /// `lib` with a testbench with three explicit tests and one without explicit tests.
+/// The SystemVerilog files compile with the arguments of their library, after `vunit_lib`,
+/// whose `vunit_pkg.sv` the project gets; a VHDL-only library gets no SystemVerilog arguments.
+async fn sv_files_compile_with_their_library_options() {
+    let mut workspace = Workspace::new().await;
+    workspace.write("inc/defs.svh", "");
+    workspace.write("rtl/counter.sv", "module counter;\nendmodule\n");
+    workspace.write("tb/tb_top.vhd", &testbench("tb_top", ""));
+    workspace.add_library_with_options(
+        "rtl",
+        &["rtl/*.sv"],
+        Options {
+            include_dirs: Some(vec![IncludeDir::new("inc")]),
+            defines: [("W".to_owned(), Define::text("8"))].into(),
+            ..Options::default()
+        },
+    );
+    workspace.spec.add_library("tb", ["tb/*.vhd"]);
+    let mut state = CompileState::default();
+    let run = workspace.compile(&mut state).await;
+    assert_eq!(run.report.status, CompileStatus::Succeeded);
+    assert_eq!(
+        run.statuses(),
+        [
+            ("vunit_pkg.sv", FileStatus::Compiled),
+            ("counter.sv", FileStatus::Compiled),
+            ("tb_top.vhd", FileStatus::Compiled),
+        ]
+    );
+    let calls = workspace.take_args();
+    let libraries: Vec<&str> = calls.iter().map(|(work, _)| work.as_str()).collect();
+    let position = |library: &str| libraries.iter().position(|&work| work == library);
+    assert!(position("vunit_lib") < position("rtl"), "{libraries:?}");
+    let sv_args = |library: &str| -> Vec<&str> {
+        let (_, args) = &calls[position(library).expect("a call")];
+        args.iter()
+            .map(String::as_str)
+            .filter(|arg| {
+                ["--include-dir", "--define", "--sv-library"]
+                    .iter()
+                    .any(|prefix| arg.starts_with(prefix))
+            })
+            .collect()
+    };
+    assert_eq!(
+        sv_args("rtl"),
+        [
+            format!("--include-dir={}", BUILTINS.join("verilog/include")).as_str(),
+            &format!("--include-dir={}", workspace.root.join("inc")),
+            "--define=W=8",
+            "--sv-library=vunit_lib",
+        ]
+    );
+    assert_eq!(sv_args("tb"), Vec::<&str>::new());
+    assert_eq!(sv_args("vunit_lib"), Vec::<&str>::new());
+}
+
+/// Editing an include file recompiles the files that include it, and no other.
+async fn editing_an_include_recompiles_its_includers() {
+    let mut workspace = Workspace::new().await;
+    workspace.write("rtl/defs.svh", "`define W 8\n");
+    workspace.write("rtl/a.sv", "`include \"defs.svh\"\nmodule a;\nendmodule\n");
+    workspace.write("rtl/b.sv", "module b;\nendmodule\n");
+    workspace.spec.add_library("rtl", ["rtl/*.sv"]);
+    let mut state = CompileState::default();
+    let first = workspace.compile(&mut state).await;
+    assert_eq!(first.report.status, CompileStatus::Succeeded);
+    assert_eq!(
+        workspace.take_calls(),
+        ["vunit_lib vunit_pkg.sv", "rtl a.sv b.sv"]
+    );
+
+    workspace.write("rtl/defs.svh", "`define W 16\n");
+    let edited = workspace.compile(&mut state).await;
+    assert_eq!(edited.with_status(FileStatus::Compiled), ["a.sv"]);
+    assert_eq!(workspace.take_calls(), ["rtl a.sv"]);
+}
+
+/// In `library` mode, a change of one file compiles all SystemVerilog files of the library in
+/// one call, and a failed dependency of one of them skips all of them.
+async fn library_mode_compiles_every_sv_file_of_the_library_in_one_call() {
+    let mut workspace = Workspace::new().await;
+    workspace.write("pkgs/p.sv", "package p;\nendpackage\n");
+    workspace.write("rtl/a.sv", "module a;\n  import p::*;\nendmodule\n");
+    workspace.write("rtl/b.sv", "module b;\nendmodule\n");
+    workspace.write("rtl/c.sv", "module c;\nendmodule\n");
+    workspace.spec.add_library("pkgs", ["pkgs/*.sv"]);
+    workspace.add_library_with_options(
+        "rtl",
+        &["rtl/*.sv"],
+        Options {
+            compilation_unit: Some(CompilationUnit::Library),
+            ..Options::default()
+        },
+    );
+    let mut state = CompileState::default();
+    let first = workspace.compile(&mut state).await;
+    assert_eq!(first.report.status, CompileStatus::Succeeded);
+    assert_eq!(
+        workspace.take_calls(),
+        ["vunit_lib vunit_pkg.sv", "pkgs p.sv", "rtl a.sv b.sv c.sv"]
+    );
+
+    workspace.write("rtl/b.sv", "module b;\n  // changed\nendmodule\n");
+    let edited = workspace.compile(&mut state).await;
+    assert_eq!(
+        edited.with_status(FileStatus::Compiled),
+        ["a.sv", "b.sv", "c.sv"]
+    );
+    assert_eq!(workspace.take_calls(), ["rtl a.sv b.sv c.sv"]);
+
+    workspace.write(
+        "pkgs/p.sv",
+        "// -- fake: error broken\npackage p;\nendpackage\n",
+    );
+    let failed = workspace.compile(&mut state).await;
+    assert_eq!(failed.with_status(FileStatus::Failed), ["p.sv"]);
+    assert_eq!(
+        failed.with_status(FileStatus::Skipped),
+        ["a.sv", "b.sv", "c.sv"]
+    );
+    assert_eq!(workspace.take_calls(), ["pkgs p.sv"]);
+}
+
+/// A report in an include file goes to the batch member that includes it, also when that isn't
+/// the first one, and keeps its location in the include file.
+async fn a_report_in_an_include_goes_to_its_includer() {
+    let mut workspace = Workspace::new().await;
+    workspace.write("rtl/defs.svh", "`define W 8\n");
+    workspace.write("rtl/a.sv", "module a;\nendmodule\n");
+    workspace.write(
+        "rtl/b.sv",
+        "`include \"defs.svh\"\n// -- fake: include-error rtl/defs.svh broken\nmodule b;\nendmodule\n",
+    );
+    workspace.spec.add_library("rtl", ["rtl/*.sv"]);
+    let mut state = CompileState::default();
+    let run = workspace.compile(&mut state).await;
+    assert_eq!(
+        workspace.take_calls(),
+        ["vunit_lib vunit_pkg.sv", "rtl a.sv b.sv"]
+    );
+    assert_eq!(
+        run.with_status(FileStatus::Compiled),
+        ["vunit_pkg.sv", "a.sv"]
+    );
+    assert_eq!(run.with_status(FileStatus::Failed), ["b.sv"]);
+    let diagnostics = |name: &str| {
+        let key = FileKey::new("rtl", &workspace.root.join("rtl").join(name));
+        run.report
+            .diagnostics
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
+    };
+    assert_eq!(diagnostics("a.sv"), []);
+    let reported = diagnostics("b.sv");
+    let located: Vec<(&str, Severity, Option<&str>)> = reported
+        .iter()
+        .map(|diagnostic| {
+            (
+                diagnostic.message.as_str(),
+                diagnostic.severity,
+                diagnostic
+                    .file
+                    .as_deref()
+                    .map(|file| file_name(file.as_str())),
+            )
+        })
+        .collect();
+    assert_eq!(
+        located,
+        [
+            ("broken", Severity::Error, Some("defs.svh")),
+            ("included from here", Severity::Note, Some("b.sv")),
+        ]
+    );
+}
+
+/// SystemVerilog files whose compile keys are unchanged aren't compiled again.
+async fn up_to_date_sv_files_are_not_compiled() {
+    let mut workspace = Workspace::new().await;
+    workspace.write("rtl/a.sv", "module a;\nendmodule\n");
+    workspace.spec.add_library("rtl", ["rtl/*.sv"]);
+    let mut state = CompileState::load(&workspace.layout);
+    workspace.compile(&mut state).await;
+    assert_eq!(workspace.take_calls().len(), 2);
+    let mut reloaded = CompileState::load(&workspace.layout);
+    let second = workspace.compile(&mut reloaded).await;
+    assert_eq!(second.report.status, CompileStatus::Succeeded);
+    assert_eq!(
+        second.with_status(FileStatus::UpToDate),
+        ["vunit_pkg.sv", "a.sv"]
+    );
+    assert_eq!(workspace.take_calls(), Vec::<String>::new());
+}
+
 fn simulation_project(workspace: &mut Workspace) {
     workspace.write(
         "tb/tb_tests.vhd",

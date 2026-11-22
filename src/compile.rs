@@ -9,27 +9,39 @@
 //!
 //! - **Compile set:** the testbench files, the files that declare the VHDL configurations the
 //!   test runs elaborate, and everything they need, following implementation dependencies.
-//!   Files no testbench uses aren't compiled.
+//!   VHDL files no testbench uses aren't compiled. Every SystemVerilog and Verilog file is
+//!   compiled, since their testbenches don't run yet ([`targets`]).
 //! - **Recompile decision:** every file gets a compile key, a Merkle-style hash over its
-//!   contents, standard, options, the simulator identity and the keys of its direct
-//!   dependencies. A file is compiled if its stored key differs, its library archive is
-//!   missing, or one of its dependencies is compiled. A change anywhere upstream changes the keys
-//!   of all dependents. Compiling a file removes the stored keys of dependents outside the
-//!   compile set: risim analyses a dependent in another file again when it loads the archive,
-//!   and drops it if that fails (it is obsolete, LRM 13.5), or at the next load of its library if
-//!   it is in another one. A file whose design unit `risim analyze` reports as obsolete loses its
-//!   stored key too, unless a later batch compiles it, also when the dependency graph doesn't
-//!   know the dependency; the report itself is dropped, because it is about another file.
+//!   contents, the contents of the files its includes found (or that they found none), its
+//!   standard, its library's `risim analyze` arguments ([`Project::analyze_args`]), the
+//!   simulator identity and the keys of its direct dependencies. A file is compiled if its
+//!   stored key differs, its library archive is missing, or one of its dependencies is compiled.
+//!   A change anywhere upstream changes the keys of all dependents. Compiling a file removes the
+//!   stored keys of dependents outside the compile set: risim analyses a dependent in another
+//!   file again when it loads the archive, and drops it if that fails (it is obsolete, LRM 13.5),
+//!   or at the next load of its library if it is in another one. A file whose design unit
+//!   `risim analyze` reports as obsolete loses its stored key too, unless a later batch compiles
+//!   it, also when the dependency graph doesn't know the dependency; the report itself is
+//!   dropped, because it is about another file.
+//! - **Groups:** the SystemVerilog and Verilog files of a library with
+//!   `compilation-unit = "library"` are one compilation unit, which `risim analyze` needs whole
+//!   in every call. They are one compile item ([`PlannedFile::group`]): one node in the compile
+//!   order, expanded in the order of their collection, with one compile key, compiled or skipped
+//!   together.
 //! - **Scheduling:** libraries that depend on each other are merged into scheduling units. A
-//!   unit starts once the units it depends on have finished, and units run in parallel. Within
-//!   a unit, files compile in compile order. The consecutive files of one library that need
-//!   compiling compile in one batch, one `risim analyze` with all of them, because every call
-//!   loads and saves the archives of the libraries; the reports are mapped back to the files by
-//!   their locations.
+//!   unit starts once the units it depends on have finished, among them those of the libraries
+//!   that its `--sv-library` arguments name, and units run in parallel. Within a unit, files
+//!   compile in compile order. The consecutive files of one library that need compiling compile
+//!   in one batch, one `risim analyze` with all of them, because every call loads and saves the
+//!   archives of the libraries; the reports are mapped back to the files by their locations, a
+//!   report in an include file to the file that includes it.
 //! - **Failures:** the transitive dependents of a failed file are skipped, also those in the
 //!   batch of the failed file, whose reports are dropped; all other files are still compiled.
 //!   The stored keys of failed and cancelled files and of all their dependents are removed,
 //!   because the analysis may have made their units obsolete.
+//! - **Refusals:** a dependency cycle between the files to compile, a VHDL standard that riSim
+//!   doesn't support, and a cycle between the SystemVerilog dependencies of libraries, which
+//!   `risim analyze` can't load, prevent compiling anything.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -52,6 +64,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::dependency_graph::CircularDependency;
 use crate::dependency_graph::DependencyGraph;
+use crate::diagnostics::AnalysisReport;
 use crate::diagnostics::Diagnostic;
 use crate::diagnostics::ReportLine;
 use crate::diagnostics::Severity;
@@ -60,6 +73,7 @@ use crate::process;
 use crate::project::FileId;
 use crate::project::LibraryId;
 use crate::project::Project;
+use crate::project::SourceFile;
 use crate::project::UnitKind;
 use crate::runtime::ProcessLimit;
 use crate::simulator;
@@ -68,6 +82,7 @@ use crate::simulator::Simulator;
 use crate::simulator::SimulatorIdentity;
 use crate::sources::ContentHash;
 use crate::sources::FileKind;
+use crate::spec::CompilationUnit;
 use crate::store::CompileKey;
 use crate::store::CompileState;
 use crate::store::FileKey;
@@ -80,9 +95,11 @@ mod tests;
 
 /// The files a compile starts from.
 ///
-/// These are the entity and architecture files of all testbenches, and the files declaring the
-/// VHDL configurations the test runs elaborate. Nothing depends on a configuration declaration,
-/// so it must be a target itself.
+/// These are the entity and architecture files of all testbenches, the files declaring the
+/// VHDL configurations the test runs elaborate, and every SystemVerilog and Verilog file of the
+/// libraries that aren't precompiled, the builtins' included. Nothing depends on a configuration
+/// declaration, so it must be a target itself. SystemVerilog testbenches aren't run yet, so the
+/// SystemVerilog and Verilog files are compiled whether a testbench needs them or not.
 pub fn targets(project: &Project, discovery: &Discovery) -> Vec<FileId> {
     let mut seen = FxHashSet::default();
     let testbench_files = discovery
@@ -101,8 +118,13 @@ pub fn targets(project: &Project, discovery: &Discovery) -> Vec<FileId> {
         }
         unit.map(|unit| unit.file)
     });
+    let sv_files = project
+        .files()
+        .filter(|(_, file)| file.kind.is_sv() && !project.library(file.library).is_external())
+        .map(|(id, _)| id);
     testbench_files
         .chain(configuration_files)
+        .chain(sv_files)
         .filter(|&file| seen.insert(file))
         .collect()
 }
@@ -136,15 +158,28 @@ pub struct PlannedFile {
     /// Whether the file must be compiled: its stored compile key differs, its library archive
     /// is missing, or a dependency must be compiled.
     pub needs_compile: bool,
-    /// The standard of the file.
+    /// The kind of file: VHDL, SystemVerilog, or Verilog.
+    pub kind: FileKind,
+    /// The standard of a VHDL file; the library's for any other.
     pub vhdl_standard: VhdlStandard,
+    /// The compile item that the file is a member of, if its library's SystemVerilog and Verilog
+    /// files form one compilation unit (`compilation-unit = "library"`).
+    ///
+    /// The members of a group follow each other in the compile order, in the order of their
+    /// collection, which is the text order of the compilation unit. They share their compile
+    /// key, [`needs_compile`](Self::needs_compile), and the union of their dependencies, so they
+    /// are compiled, or skipped, together, in one batch.
+    pub group: Option<usize>,
     /// The file receiving the compiler output.
     pub output_file: Utf8PathBuf,
     library_dir: Utf8PathBuf,
-    /// The `risim analyze` arguments of the library's options, shared by its files.
+    /// The `risim analyze` arguments of the library ([`Project::analyze_args`]), shared by its
+    /// files.
     analyze_args: Arc<[String]>,
     /// Direct dependencies, as indices into [`CompilePlan::files`].
     dependencies: Vec<usize>,
+    /// The files that the includes of a SystemVerilog or Verilog file found.
+    includes: Vec<Utf8PathBuf>,
 }
 
 /// What a compile will do.
@@ -167,6 +202,10 @@ pub struct CompilePlan {
     library_dirs: Vec<Utf8PathBuf>,
     /// Errors that prevent compiling: dependency cycles, unsupported standards.
     pub errors: Vec<Diagnostic>,
+    /// Errors among the project's own diagnostics that prevent compiling, which the compile
+    /// doesn't report again: cycles between the SystemVerilog dependencies of libraries
+    /// ([`Project::sv_library_cycle_errors`]), whose archives `risim analyze` can't load.
+    pub project_errors: Vec<Diagnostic>,
     /// Problems with the dependencies that don't prevent compiling.
     pub warnings: Vec<Diagnostic>,
 }
@@ -201,11 +240,16 @@ impl CompilePlan {
             .map(|&index| self.files[index].path.as_path())
             .collect();
         // The standards were checked when the files were added.
+        let vhdl_standard = batch
+            .iter()
+            .map(|&index| &self.files[index])
+            .find(|member| member.kind == FileKind::Vhdl)
+            .map(|member| member.vhdl_standard);
         simulator
             .compile_command(&CompileArgs {
                 library: &file.library,
                 library_dir: &file.library_dir,
-                vhdl_standard: file.vhdl_standard,
+                vhdl_standard,
                 library_dirs: &self.library_dirs,
                 analyze_args: &file.analyze_args,
                 files: &paths,
@@ -223,15 +267,9 @@ impl CompilePlan {
 
         let analysis = project.dependency_graph(false);
         let implementation = project.dependency_graph(true);
-        // TODO: SystemVerilog and Verilog files aren't compiled yet, so they are left out of the
-        // compile set, also where an instance or a component edge pulls them in. This filter, and
-        // the VHDL-only arguments in `add_files`, go once their compiles are planned.
-        let selected: FxHashSet<FileId> = implementation
+        let selected = implementation
             .graph
-            .dependencies(input.targets.iter().copied())
-            .into_iter()
-            .filter(|&id| project.file(id).kind == FileKind::Vhdl)
-            .collect();
+            .dependencies(input.targets.iter().copied());
         let selected_paths: FxHashSet<&Utf8Path> = selected
             .iter()
             .map(|&id| project.file(id).path.as_path())
@@ -252,7 +290,12 @@ impl CompilePlan {
             .map(|(id, file)| (id, file_key(project, id, &file.path)))
             .collect();
 
-        let order = match compile_order(&plan.graph, &selected) {
+        plan.project_errors = project.sv_library_cycle_errors().to_vec();
+        if !plan.project_errors.is_empty() {
+            return plan;
+        }
+        let groups = groups(project, &selected);
+        let order = match compile_order(&plan.graph, &selected, &groups) {
             Ok(order) => order,
             Err(cycle) => {
                 plan.errors.push(project.circular_dependency(&cycle));
@@ -262,7 +305,9 @@ impl CompilePlan {
 
         let standards: BTreeSet<VhdlStandard> = order
             .iter()
-            .map(|&id| project.file(id).vhdl_standard)
+            .map(|&id| project.file(id))
+            .filter(|file| file.kind == FileKind::Vhdl)
+            .map(|file| file.vhdl_standard)
             .collect();
         plan.errors.extend(
             standards
@@ -274,13 +319,20 @@ impl CompilePlan {
             return plan;
         }
 
-        plan.add_files(input, state, &order);
+        plan.add_files(input, state, &order, &groups);
         plan.schedule(project);
         plan
     }
 
-    /// Adds the files of `order` with their compile keys.
-    fn add_files(&mut self, input: &PlanInput<'_>, state: &CompileState, order: &[FileId]) {
+    /// Adds the files of `order` with their compile keys; the members of each of `groups`
+    /// follow each other in `order`, and share their key.
+    fn add_files(
+        &mut self,
+        input: &PlanInput<'_>,
+        state: &CompileState,
+        order: &[FileId],
+        groups: &[Vec<FileId>],
+    ) {
         let project = input.project;
         self.simulator = Some(input.simulator.clone());
         self.library_dirs = library_dirs(project, input.layout);
@@ -291,65 +343,97 @@ impl CompilePlan {
             .enumerate()
             .map(|(position, &id)| (id, position))
             .collect();
+        let group_of: FxHashMap<FileId, usize> = groups
+            .iter()
+            .enumerate()
+            .flat_map(|(group, members)| members.iter().map(move |&member| (member, group)))
+            .collect();
 
-        for &id in order {
+        let mut position = 0;
+        while position < order.len() {
+            let id = order[position];
+            let group = group_of.get(&id).copied();
+            let members = &order[position..position + group.map_or(1, |group| groups[group].len())];
+            position += members.len();
             let file = project.file(id);
             let library = &project.library(file.library).name;
-            // TODO: While SystemVerilog and Verilog files aren't compiled, a library's VHDL files
-            // take only the options that apply to VHDL, rather than `Project::analyze_args`:
-            // the archives that its `--sv-library` arguments name may not exist yet, which
-            // `risim analyze` reports as an error. This goes with the filter of SV files in
-            // `CompilePlan::new`.
-            let library_args = Arc::clone(analyze_args.entry(file.library).or_insert_with(|| {
-                let options = &project.library(file.library).options;
-                options.without_sv_keys().analyze_args().into()
-            }));
-            let dependencies: Vec<usize> = self
-                .graph
-                .direct_dependencies(id)
-                .filter_map(|dependency| positions.get(&dependency).copied())
-                .collect();
+            let library_args = Arc::clone(
+                analyze_args
+                    .entry(file.library)
+                    .or_insert_with(|| project.analyze_args(file.library).into()),
+            );
+            // The dependencies of all members, without those between them.
+            let mut dependencies: Vec<usize> = Vec::new();
+            for &member in members {
+                for dependency in self.graph.direct_dependencies(member) {
+                    if let Some(&index) = positions.get(&dependency)
+                        && !members.contains(&dependency)
+                        && !dependencies.contains(&index)
+                    {
+                        dependencies.push(index);
+                    }
+                }
+            }
             let compile_key = compile_key(&CompileKeyInput {
-                content_hash: file.content_hash,
+                files: members
+                    .iter()
+                    .map(|&member| KeyedFile::of(project.file(member)))
+                    .collect(),
                 library,
                 vhdl_standard: file.vhdl_standard,
-                analyze_args: &library_args,
+                args: &library_args,
                 simulator_hash,
                 dependencies: dependencies
                     .iter()
                     .map(|&dependency| self.files[dependency].compile_key)
                     .collect(),
             });
-            let key = self.all_keys[&id].clone();
             let library_dir = input.layout.library_dir(library);
             // Recompiling a file may make its dependents obsolete, even if its compile key is
             // unchanged, for example because its library archive was deleted.
-            let needs_compile = state
-                .files
-                .get(&key)
-                .is_none_or(|stored| stored.compile_key != compile_key)
-                || !input.layout.library_archive(library).is_file()
+            let needs_compile = members.iter().any(|member| {
+                state
+                    .files
+                    .get(&self.all_keys[member])
+                    .is_none_or(|stored| stored.compile_key != compile_key)
+            }) || !input.layout.library_archive(library).is_file()
                 || dependencies
                     .iter()
                     .any(|&dependency| self.files[dependency].needs_compile);
-            self.files.push(PlannedFile {
-                id,
-                key,
-                library: library.clone(),
-                path: file.path.clone(),
-                compile_key,
-                needs_compile,
-                vhdl_standard: file.vhdl_standard,
-                output_file: input.layout.compile_output_file(library, &file.path),
-                library_dir,
-                analyze_args: library_args,
-                dependencies,
-            });
+            for &member in members {
+                let member_file = project.file(member);
+                self.files.push(PlannedFile {
+                    id: member,
+                    key: self.all_keys[&member].clone(),
+                    library: library.clone(),
+                    path: member_file.path.clone(),
+                    compile_key,
+                    needs_compile,
+                    kind: member_file.kind,
+                    vhdl_standard: member_file.vhdl_standard,
+                    group,
+                    output_file: input.layout.compile_output_file(library, &member_file.path),
+                    library_dir: library_dir.clone(),
+                    analyze_args: Arc::clone(&library_args),
+                    dependencies: dependencies.clone(),
+                    includes: member_file
+                        .sv_file
+                        .iter()
+                        .flat_map(|sv_file| &sv_file.includes)
+                        .filter_map(|include| include.path.clone())
+                        .collect(),
+                });
+            }
         }
     }
 
     /// Groups the files into scheduling units: libraries that depend on each other, directly
     /// or indirectly, form one unit.
+    ///
+    /// A library with SystemVerilog or Verilog files also depends on the libraries of its
+    /// [SystemVerilog dependencies](crate::project::Library::sv_dependencies) that have files in
+    /// the plan, because `risim analyze` loads their archives (`--sv-library`). These edges
+    /// order the units only: they don't make files depend on each other.
     fn schedule(&mut self, project: &Project) {
         let mut libraries: Vec<LibraryId> = Vec::new();
         let mut library_index: FxHashMap<LibraryId, usize> = FxHashMap::default();
@@ -365,6 +449,17 @@ impl CompilePlan {
             })
             .collect();
 
+        // The libraries each library's `--sv-library` arguments name, among those of the plan.
+        let sv_dependencies: Vec<Vec<usize>> = libraries
+            .iter()
+            .map(|&library| {
+                project
+                    .library(library)
+                    .sv_dependencies()
+                    .filter_map(|dependency| library_index.get(&dependency).copied())
+                    .collect()
+            })
+            .collect();
         let mut library_graph = DependencyGraph::new();
         for library in 0..libraries.len() {
             library_graph.add_node(library);
@@ -374,6 +469,11 @@ impl CompilePlan {
                 if library_of[dependency] != library_of[index] {
                     library_graph.add_dependency(library_of[dependency], library_of[index]);
                 }
+            }
+        }
+        for (library, dependencies) in sv_dependencies.iter().enumerate() {
+            for &dependency in dependencies {
+                library_graph.add_dependency(dependency, library);
             }
         }
         // `reachable[a]` holds library `a` and the libraries it depends on, directly or
@@ -409,10 +509,16 @@ impl CompilePlan {
             .iter()
             .enumerate()
             .map(|(unit, files)| {
-                let dependencies: BTreeSet<usize> = files
+                let file_dependencies = files
                     .iter()
                     .flat_map(|&file| &self.files[file].dependencies)
-                    .map(|&dependency| unit_of_file[dependency])
+                    .map(|&dependency| unit_of_file[dependency]);
+                let library_dependencies = files
+                    .iter()
+                    .flat_map(|&file| &sv_dependencies[library_of[file]])
+                    .filter_map(|&library| unit_of_library[library]);
+                let dependencies: BTreeSet<usize> = file_dependencies
+                    .chain(library_dependencies)
                     .filter(|&dependency| dependency != unit)
                     .collect();
                 dependencies.into_iter().collect()
@@ -439,26 +545,72 @@ fn file_key(project: &Project, id: FileId, path: &Utf8Path) -> FileKey {
     FileKey::new(&project.library(library).name, path)
 }
 
+/// The compile items of several files: per library whose SystemVerilog and Verilog files form
+/// one compilation unit (`compilation-unit = "library"`), those of `selected`, in the order of
+/// their collection.
+fn groups(project: &Project, selected: &FxHashSet<FileId>) -> Vec<Vec<FileId>> {
+    let mut groups: Vec<(LibraryId, Vec<FileId>)> = Vec::new();
+    for (id, file) in project.files() {
+        let library = project.library(file.library);
+        if !file.kind.is_sv()
+            || library.options.compilation_unit != Some(CompilationUnit::Library)
+            || !selected.contains(&id)
+        {
+            continue;
+        }
+        // Files are added in the order of their collection, so their IDs follow it.
+        match groups.iter_mut().find(|(other, _)| *other == file.library) {
+            Some((_, members)) => members.push(id),
+            None => groups.push((file.library, vec![id])),
+        }
+    }
+    groups.into_iter().map(|(_, members)| members).collect()
+}
+
 /// Sorts `selected` in compile order, considering only dependencies within `selected`.
+///
+/// The members of each of `groups` are ordered as one node, with the dependencies between them
+/// dropped and the others united, which is expanded into the members in their order.
 fn compile_order(
     graph: &DependencyGraph<FileId>,
     selected: &FxHashSet<FileId>,
+    groups: &[Vec<FileId>],
 ) -> Result<Vec<FileId>, CircularDependency<FileId>> {
+    // The node of each group is its first member.
+    let mut node_of: FxHashMap<FileId, FileId> = FxHashMap::default();
+    let mut group_of_node: FxHashMap<FileId, &[FileId]> = FxHashMap::default();
+    for members in groups {
+        if let Some(&first) = members.first() {
+            group_of_node.insert(first, members);
+            node_of.extend(members.iter().map(|&member| (member, first)));
+        }
+    }
+    let node = |id: FileId| node_of.get(&id).copied().unwrap_or(id);
     let mut subgraph = DependencyGraph::new();
     for &id in graph.nodes() {
         if selected.contains(&id) {
-            subgraph.add_node(id);
+            subgraph.add_node(node(id));
         }
     }
-    let nodes = subgraph.nodes().to_vec();
-    for id in nodes {
+    for &id in graph.nodes() {
+        if !selected.contains(&id) {
+            continue;
+        }
         for dependency in graph.direct_dependencies(id) {
-            if selected.contains(&dependency) {
-                subgraph.add_dependency(dependency, id);
+            if selected.contains(&dependency) && node(dependency) != node(id) {
+                subgraph.add_dependency(node(dependency), node(id));
             }
         }
     }
-    subgraph.toposort()
+    let sorted = subgraph.toposort()?;
+    Ok(sorted
+        .into_iter()
+        .flat_map(|id| {
+            group_of_node
+                .get(&id)
+                .map_or_else(|| vec![id], |members| members.to_vec())
+        })
+        .collect())
 }
 
 /// What a compile key is computed from.
@@ -466,13 +618,41 @@ fn compile_order(
 /// The `-L` paths of external libraries aren't part of it. Their libraries can't be configured
 /// yet; once they can, a changed path or a recompiled external library must change the key.
 struct CompileKeyInput<'a> {
-    content_hash: ContentHash,
+    /// The files compiled under the key: one, or the members of a group, in order.
+    files: Vec<KeyedFile<'a>>,
     library: &'a str,
     vhdl_standard: VhdlStandard,
-    /// The `risim analyze` arguments of the file's library.
-    analyze_args: &'a [String],
+    /// The `risim analyze` arguments of the files' library ([`Project::analyze_args`]).
+    args: &'a [String],
     simulator_hash: [u8; 32],
     dependencies: Vec<CompileKey>,
+}
+
+/// What a compile key takes from a file.
+struct KeyedFile<'a> {
+    content_hash: ContentHash,
+    /// Per include of a SystemVerilog or Verilog file, its spelling and the hash of the file it
+    /// found, or `None` if it found none, so that creating the file changes the key.
+    includes: Vec<(&'a str, Option<ContentHash>)>,
+}
+
+impl<'a> KeyedFile<'a> {
+    fn of(file: &'a SourceFile) -> Self {
+        let includes = file
+            .sv_file
+            .iter()
+            .flat_map(|sv_file| &sv_file.includes)
+            .enumerate()
+            .map(|(index, include)| {
+                let hash = file.include_hashes.get(index).copied().flatten();
+                (include.spelling.as_str(), hash)
+            })
+            .collect();
+        Self {
+            content_hash: file.content_hash,
+            includes,
+        }
+    }
 }
 
 fn update_str(hasher: &mut blake3::Hasher, text: &str) {
@@ -482,12 +662,28 @@ fn update_str(hasher: &mut blake3::Hasher, text: &str) {
 
 fn compile_key(input: &CompileKeyInput<'_>) -> CompileKey {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"risim-vunit compile key 1\0");
-    hasher.update(&input.content_hash.0);
+    hasher.update(b"risim-vunit compile key 2\0");
+    hasher.update(&(input.files.len() as u64).to_le_bytes());
+    for file in &input.files {
+        hasher.update(&file.content_hash.0);
+        hasher.update(&(file.includes.len() as u64).to_le_bytes());
+        for &(spelling, hash) in &file.includes {
+            update_str(&mut hasher, spelling);
+            match hash {
+                Some(hash) => {
+                    hasher.update(&[1]);
+                    hasher.update(&hash.0);
+                },
+                None => {
+                    hasher.update(&[0]);
+                },
+            }
+        }
+    }
     update_str(&mut hasher, &input.library.to_ascii_lowercase());
     update_str(&mut hasher, input.vhdl_standard.vunit_name());
-    hasher.update(&(input.analyze_args.len() as u64).to_le_bytes());
-    for arg in input.analyze_args {
+    hasher.update(&(input.args.len() as u64).to_le_bytes());
+    for arg in input.args {
         update_str(&mut hasher, arg);
     }
     hasher.update(&input.simulator_hash);
@@ -697,7 +893,7 @@ pub async fn execute(
     let total = compile_plan.compile_count();
     emit(&context.events, CompileEvent::Started { total });
     let mut project_diagnostics = compile_plan.warnings.clone();
-    if !compile_plan.errors.is_empty() {
+    if !compile_plan.errors.is_empty() || !compile_plan.project_errors.is_empty() {
         project_diagnostics.extend(compile_plan.errors.iter().cloned());
         return CompileReport {
             status: CompileStatus::Failed,
@@ -935,6 +1131,13 @@ async fn run_unit(shared: &Shared, unit: usize, mut bad: FxHashSet<usize>) -> Un
 /// call made obsolete.
 const OBSOLETE_DESIGN_UNIT: &str = "obsolete-design-unit";
 
+/// The code of the warning of `risim analyze` that a call changed the SystemVerilog options of
+/// a library with SystemVerilog sources of other files, which it analyzes again.
+///
+/// A compile always passes the library's full options, and its compile keys recompile the
+/// files whose options changed, so the warning tells the user nothing.
+const SV_OPTIONS_CHANGED: &str = "sv-options-changed";
+
 /// Whether `file` depends directly on one of the files `files`.
 fn depends_on(file: &PlannedFile, files: &FxHashSet<usize>) -> bool {
     file.dependencies
@@ -1051,8 +1254,8 @@ impl<'a> BatchOutput<'a> {
         );
     }
 
-    /// Takes a line of the output: a report goes to the file of its location, otherwise to the
-    /// first one.
+    /// Takes a line of the output: a report goes to the file it is attributed to
+    /// ([`Self::member_of`]).
     fn push_line(&mut self, line: &str) {
         let report = match ReportLine::parse(line) {
             ReportLine::Diagnostic(report) => report,
@@ -1067,6 +1270,9 @@ impl<'a> BatchOutput<'a> {
             .location
             .as_ref()
             .and_then(|location| location.path(root));
+        if report.code.as_deref() == Some(SV_OPTIONS_CHANGED) {
+            return;
+        }
         // A design unit of a file outside the batch that the batch made obsolete; that file is
         // compiled again ([`forget_obsolete`]).
         if report.code.as_deref() == Some(OBSOLETE_DESIGN_UNIT)
@@ -1089,10 +1295,7 @@ impl<'a> BatchOutput<'a> {
         {
             return;
         }
-        let member = report_path
-            .as_ref()
-            .and_then(|path| self.files.iter().position(|file| file.path == *path))
-            .unwrap_or(0);
+        let member = self.member_of(&report, report_path.as_deref());
         for location_path in report
             .location
             .iter()
@@ -1123,6 +1326,30 @@ impl<'a> BatchOutput<'a> {
             );
             self.diagnostics[member].push(diagnostic);
         }
+    }
+
+    /// The member of the batch that `report`, located in `report_path`, is attributed to:
+    ///
+    /// 1. the file of its location, if that is a member;
+    /// 2. else the first member among the files of its notes, such as the includer of an
+    ///    include file from an `included from here` note;
+    /// 3. else the first member whose includes found the file of its location;
+    /// 4. else the first member.
+    ///
+    /// The diagnostic keeps its own location, such as an include file.
+    fn member_of(&self, report: &AnalysisReport, report_path: Option<&Utf8Path>) -> usize {
+        let member = |path: &Utf8Path| self.files.iter().position(|file| file.path == path);
+        let root = &self.shared.context.workspace_root;
+        report_path
+            .and_then(member)
+            .or_else(|| report.note_files(root).find_map(|path| member(&path)))
+            .or_else(|| {
+                let path = report_path?;
+                self.files
+                    .iter()
+                    .position(|file| file.includes.iter().any(|include| include == path))
+            })
+            .unwrap_or(0)
     }
 
     /// Returns the results of the files after the process ended with `result`.

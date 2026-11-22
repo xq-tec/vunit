@@ -83,25 +83,46 @@ pub(crate) fn add_vhdl(
     )
 }
 
-/// Scans `code` and adds it to `library` as the SystemVerilog file `path`; includes aren't
-/// found.
+/// Scans `code` and adds it to `library` as the SystemVerilog file `path`; includes are read
+/// from disk, from the directory of `path` only.
 pub(crate) fn add_sv(project: &mut Project, library: &str, path: &Utf8Path, code: &str) -> FileId {
+    add_sv_including(project, library, path, code, &[])
+}
+
+/// Scans `code` and adds it to `library` as the SystemVerilog file `path`; includes are read
+/// from disk, from the directory of `path` and then from `include_dirs`.
+pub(crate) fn add_sv_including(
+    project: &mut Project,
+    library: &str,
+    path: &Utf8Path,
+    code: &str,
+    include_dirs: &[Utf8PathBuf],
+) -> FileId {
     let library = project.find_library(library).unwrap();
     let (design_file, _) = verilog_parser::scan(
         &ScanInput {
             path,
             contents: code.as_bytes(),
-            include_dirs: &[],
+            include_dirs,
             defines: &Defines::new(),
             keywords: KeywordSet::Sv,
         },
-        |_| Err(std::io::ErrorKind::NotFound.into()),
+        |candidate| fs::read(candidate).map(Arc::from),
     );
+    let include_hashes = design_file
+        .includes
+        .iter()
+        .map(|include| {
+            let contents = fs::read(include.path.as_ref()?).ok()?;
+            Some(ContentHash::of(&contents))
+        })
+        .collect();
     project.add_sv_file(
         library,
         path,
         FileKind::SystemVerilog,
         ContentHash::of(code.as_bytes()),
         Some(Arc::new(design_file)),
+        include_hashes,
     )
 }

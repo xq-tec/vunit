@@ -340,6 +340,20 @@ impl ReportLocation {
 }
 
 impl AnalysisReport {
+    /// The files on disk of the notes' locations, in the order of the notes, resolved against
+    /// `cwd`.
+    ///
+    /// For a report in an include file, they start with the files of its `included from here`
+    /// notes, innermost first.
+    pub fn note_files<'report>(
+        &'report self,
+        cwd: &'report Utf8Path,
+    ) -> impl Iterator<Item = Utf8PathBuf> + 'report {
+        self.notes
+            .iter()
+            .filter_map(move |note| note.location.as_ref()?.path(cwd))
+    }
+
     /// Converts the report into diagnostics: the report itself, then one note per note with a
     /// location on disk. Notes without such a location are appended to the message.
     ///
@@ -506,6 +520,12 @@ mod tests {
             ]
         );
         assert_eq!(read, ["/abs/p.vhd", "/root/src/e.vhd"]);
+        assert_eq!(
+            report
+                .note_files(Utf8Path::new("/root"))
+                .collect::<Vec<_>>(),
+            ["/abs/p.vhd"]
+        );
     }
 
     #[test]

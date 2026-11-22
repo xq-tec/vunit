@@ -58,6 +58,10 @@ pub struct ScannedFile {
     pub content_hash: ContentHash,
     /// What the scan found.
     pub design_file: Arc<SvDesignFile>,
+    /// The hashes of the contents of the files that the
+    /// [`includes`](SvDesignFile::includes) of the scan found, in the same order; `None` for an
+    /// include that wasn't found.
+    pub include_hashes: Vec<Option<ContentHash>>,
 }
 
 /// When a file was last modified, and its size: while both stay the same, so do its contents.
@@ -95,6 +99,23 @@ struct ScanEntry {
     design_file: Arc<SvDesignFile>,
     /// The macros at the end of the file.
     end_defines: Defines,
+}
+
+impl ScanEntry {
+    /// The hashes of the files that the includes of the scan found, in their order.
+    fn include_hashes(&self) -> Vec<Option<ContentHash>> {
+        self.design_file
+            .includes
+            .iter()
+            .map(|include| {
+                let path = include.path.as_ref()?;
+                self.reads
+                    .iter()
+                    .find(|(read, _)| read == path)
+                    .and_then(|&(_, hash)| hash)
+            })
+            .collect()
+    }
 }
 
 /// Scan results of SystemVerilog and Verilog files, kept in memory between loads of a project.
@@ -147,6 +168,7 @@ impl SvScanCache {
                         result.map(|entry| ScannedFile {
                             content_hash: entry.content_hash,
                             design_file: Arc::clone(&entry.design_file),
+                            include_hashes: entry.include_hashes(),
                         })
                     })
                     .collect()

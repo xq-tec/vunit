@@ -30,6 +30,7 @@ use risim_vunit_frontend::TestOutcome;
 use risim_vunit_frontend::Workspace;
 use risim_vunit_frontend::WorkspaceEvent;
 use risim_vunit_frontend::WorkspaceEventKind;
+use risim_vunit_frontend::diagnostics::Diagnostic;
 use risim_vunit_frontend::diagnostics::Severity;
 use risim_vunit_frontend::simulator::RunOptions;
 use risim_vunit_frontend::spec::ConfigurationSpec;
@@ -309,6 +310,50 @@ pub async fn simulate_all(runtime: &Runtime, root: &Utf8Path, spec: &ProjectSpec
     outcome
 }
 
+/// What a compile operation produced.
+pub struct Compiled {
+    /// Whether every file of the compile set was compiled.
+    pub success: bool,
+    /// The diagnostics of all sources, the warnings and notes included.
+    pub diagnostics: Vec<(DiagnosticSource, Diagnostic)>,
+}
+
+/// Opens a workspace at `root` with `spec`, compiles it, and closes it.
+pub async fn compile_all(runtime: &Runtime, root: &Utf8Path, spec: &ProjectSpec) -> Compiled {
+    let (workspace, mut events) = open(runtime, root, spec).await;
+    workspace.compile(Some(RequestTag(TAG.to_owned())), None);
+    let deadline = tokio::time::Instant::now() + OPERATION_TIMEOUT;
+    let success = loop {
+        let event = tokio::time::timeout_at(deadline, events.recv()).await;
+        if event.is_err() {
+            workspace.cancel_all();
+        }
+        let event = event
+            .expect("timed out")
+            .expect("the workspace closed early");
+        if let WorkspaceEventKind::CompileFinished { tags, success, .. } = event.kind
+            && has_tag(&tags)
+        {
+            break success;
+        }
+    };
+    let snapshot = workspace.snapshot();
+    let diagnostics = snapshot
+        .diagnostics
+        .iter()
+        .flat_map(|(source, diagnostics)| {
+            diagnostics
+                .iter()
+                .map(move |diagnostic| (source, diagnostic.clone()))
+        })
+        .collect();
+    workspace.close().await;
+    Compiled {
+        success,
+        diagnostics,
+    }
+}
+
 fn has_tag(tags: &[RequestTag]) -> bool {
     tags.iter().any(|tag| tag.0 == TAG)
 }
@@ -410,12 +455,19 @@ pub fn config(name: &str) -> ConfigurationSpec {
 
 /// The paths of the `.vhd` files in `dir`, sorted, without those for which `skip` is true.
 pub fn vhd_files(dir: &Utf8Path, skip: impl Fn(&str) -> bool) -> Vec<String> {
-    let mut files: Vec<String> = fs::read_dir(dir)
-        .expect("read the directory")
-        .map(|entry| Utf8PathBuf::from_path_buf(entry.expect("entry").path()).expect("UTF-8"))
-        .filter(|path| path.extension() == Some("vhd"))
+    files_with_extension(dir, "vhd")
+        .into_iter()
         .filter(|path| !skip(path.file_name().unwrap_or_default()))
         .map(String::from)
+        .collect()
+}
+
+/// The paths of the files with `extension` in `dir`, sorted.
+pub fn files_with_extension(dir: &Utf8Path, extension: &str) -> Vec<Utf8PathBuf> {
+    let mut files: Vec<Utf8PathBuf> = fs::read_dir(dir)
+        .expect("read the directory")
+        .map(|entry| Utf8PathBuf::from_path_buf(entry.expect("entry").path()).expect("UTF-8"))
+        .filter(|path| path.extension() == Some(extension))
         .collect();
     files.sort();
     files

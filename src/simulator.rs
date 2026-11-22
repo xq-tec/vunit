@@ -308,9 +308,11 @@ impl Simulator {
     ///
     /// # Errors
     ///
-    /// Fails if the standard isn't supported.
+    /// Fails if the standard of the VHDL files isn't supported.
     pub fn compile_command(&self, args: &CompileArgs<'_>) -> Result<Vec<String>, CommandError> {
-        check_standard(args.vhdl_standard)?;
+        if let Some(standard) = args.vhdl_standard {
+            check_standard(standard)?;
+        }
         let mut command = vec![
             self.analyzer().to_string(),
             "analyze".to_owned(),
@@ -395,13 +397,13 @@ pub struct CompileArgs<'a> {
     pub library: &'a str,
     /// The directory of the library's archive.
     pub library_dir: &'a Utf8Path,
-    /// The standard.
-    pub vhdl_standard: VhdlStandard,
+    /// The standard of the VHDL files; `None` if there are only SystemVerilog and Verilog files.
+    pub vhdl_standard: Option<VhdlStandard>,
     /// The directories of all libraries, passed with `-L`.
     pub library_dirs: &'a [Utf8PathBuf],
-    /// The arguments of the library's options, [`Options::analyze_args`].
+    /// The arguments of the library's options, [`Project::analyze_args`].
     ///
-    /// [`Options::analyze_args`]: crate::spec::Options::analyze_args
+    /// [`Project::analyze_args`]: crate::project::Project::analyze_args
     pub analyze_args: &'a [String],
     /// The files to compile, in compile order.
     pub files: &'a [&'a Utf8Path],
@@ -517,7 +519,7 @@ mod tests {
         let mut args = CompileArgs {
             library: "lib",
             library_dir: Utf8Path::new("/out/libraries/lib"),
-            vhdl_standard: VhdlStandard::Vhdl2008,
+            vhdl_standard: Some(VhdlStandard::Vhdl2008),
             library_dirs: &library_dirs,
             analyze_args: &["--relaxed".to_owned()],
             files: &[Utf8Path::new("/src/a.vhd"), Utf8Path::new("/src/b.vhd")],
@@ -539,13 +541,16 @@ mod tests {
                 "/src/b.vhd",
             ]
         );
-        args.vhdl_standard = VhdlStandard::Vhdl2019;
+        args.vhdl_standard = Some(VhdlStandard::Vhdl2019);
         assert_eq!(
             simulator().compile_command(&args),
             Err(CommandError::UnsupportedStandard {
                 standard: VhdlStandard::Vhdl2019
             })
         );
+        // SystemVerilog and Verilog files have no VHDL standard.
+        args.vhdl_standard = None;
+        simulator().compile_command(&args).unwrap();
     }
 
     /// The runner must name the format of the run options that this build writes.

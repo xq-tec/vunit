@@ -38,7 +38,7 @@ The fork also fixes seven testcases of `vunit/vhdl/verification_components/test`
 
 ## Tests
 
-The `acceptance` test target ports VUnit's `tests/acceptance` (artificial VHDL testbenches and the package body dependency test) and the `run.py` of every VUnit VHDL library with a test directory. It leaves out what needs unsupported features: Verilog, `add_package`, test history, the check and location preprocessors, com codec generation, and the testbenches that `run.py` generates with Python. The expected outcomes follow VUnit, adapted to the deviations below; `tests/acceptance/vhdl_libraries.rs` lists the tests that fail only because every test runs in its own simulation.
+The `acceptance` test target ports VUnit's `tests/acceptance` (artificial VHDL testbenches and the package body dependency test) and the `run.py` of every VUnit VHDL library with a test directory. Verilog's acceptance testbenches (`tests/acceptance/artificial/verilog`) are compiled only, since riSim doesn't simulate SystemVerilog yet. It leaves out what needs unsupported features: simulating Verilog, `add_package`, test history, the check and location preprocessors, com codec generation, and the testbenches that `run.py` generates with Python. The expected outcomes follow VUnit, adapted to the deviations below; `tests/acceptance/vhdl_libraries.rs` lists the tests that fail only because every test runs in its own simulation.
 
 ## Module mapping
 
@@ -88,7 +88,7 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - Compile and simulation processes run with the workspace root as working directory.
 - Files that are independent of each other compile in the order they were added. VUnit sorts them by path. Both orders respect the dependencies.
 - An ambiguous direct entity instantiation is an error for the instantiating file instead of aborting. Dependency cycles are reported only when they involve files that a testbench needs.
-- Standards other than VHDL-2008 are checked among the files to compile, not among all files of the project.
+- Standards other than VHDL-2008 are checked among the VHDL files to compile, not among all files of the project.
 - Compiler warnings and notes in the files of VUnit and OSVVM themselves are dropped; errors are kept.
 - A compile that fails without a parsable error message gets an error diagnostic with the compiler output, even if it printed parsable warnings.
 - Library directories are `risim-out/libraries/<lowercase library name>`, each with the archive `<lowercase library name>.hlib`.
@@ -111,7 +111,11 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
   They become `--sv-library` arguments of `risim analyze`, and libraries that depend on each other in a cycle are a project error, since riSim can't load them.
   Upstream has no such list, since its simulators resolve these names across all libraries.
 - The Verilog builtins (`vunit_pkg.sv` in `vunit_lib`, and the `verilog/include` directory before the include directories of each library with SystemVerilog or Verilog files) are added only when the project has such files, rather than by a call to `add_verilog_builtins`.
-- SystemVerilog and Verilog testbenches (definitions with a `runner_cfg` parameter) aren't discovered: each gets a warning that riSim doesn't simulate SystemVerilog yet, and their files aren't compiled yet.
+- SystemVerilog and Verilog testbenches (definitions with a `runner_cfg` parameter) aren't discovered: each gets a warning that riSim doesn't simulate SystemVerilog yet.
+- The compile set has every SystemVerilog and Verilog file of the libraries that aren't precompiled, `vunit_pkg.sv` included, also those that no testbench needs; a VHDL component that names an SV module makes its file a dependency of the instantiating file for recompiles, as an SV instance of a definition or entity does.
+- A compile key hashes the contents of the files that a file's includes found (or that an include found none) instead of upstream's content hash with the includes, so that editing an include file recompiles its includers, and creating a missing one recompiles too.
+- The SystemVerilog and Verilog files of a library with `compilation-unit = "library"` are one compile item: they are ordered as one node of the dependency graph, in the order of collection, share one compile key, and are compiled, or skipped, together in one `risim analyze`, which needs all of them for the compilation unit.
+- A report in an include file goes to the file of the batch that includes it, from its `included from here` notes or the includes of the scan, and keeps its location in the include file.
 - com is always added from VHDL-2008 on, and left out for older standards instead of raising an error.
 - In file patterns, `*` also matches hidden files, and `risim-out/` and `.git/` directories are never searched. Files with unknown extensions are skipped with a warning instead of raising an error.
 - Testcase names keep the case of the entity declaration; VUnit uses the lowercase entity name. Test names that differ only in case produce a warning.

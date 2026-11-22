@@ -882,6 +882,7 @@ pub fn build_project(
                             *kind,
                             file.content_hash,
                             Some(file.design_file),
+                            file.include_hashes,
                         );
                         None
                     },

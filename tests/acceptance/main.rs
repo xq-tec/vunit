@@ -34,6 +34,7 @@ fn main() -> ExitCode {
     let args = Arguments::from_args();
     let trials = [
         trials("artificial_vhdl", artificial::artificial),
+        trials("artificial_verilog", artificial::artificial_verilog),
         trials("component_binding", component_binding::component_binding),
         trials(
             "package_body_dependencies",

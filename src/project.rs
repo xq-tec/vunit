@@ -163,6 +163,10 @@ pub struct SourceFile {
     pub dependencies: Vec<VhdlReference>,
     /// The scan of a SystemVerilog or Verilog file.
     pub sv_file: Option<Arc<SvDesignFile>>,
+    /// The hashes of the contents of the files that the scan's
+    /// [`includes`](SvDesignFile::includes) found, in the same order; `None` for an include that
+    /// wasn't found.
+    pub include_hashes: Vec<Option<ContentHash>>,
 }
 
 impl SourceFile {
@@ -494,6 +498,7 @@ impl Project {
             design_units,
             dependencies,
             sv_file: None,
+            include_hashes: Vec::new(),
         };
         self.register_design_units(id, &file);
         self.libraries[library.index()]
@@ -506,8 +511,9 @@ impl Project {
     /// Adds a SystemVerilog or Verilog file of `kind` to `library` and registers its
     /// definitions and packages.
     ///
-    /// `sv_file` is the scan of the file, `None` if it couldn't be scanned. Adding the same path
-    /// to the same library again returns the existing file.
+    /// `sv_file` is the scan of the file, `None` if it couldn't be scanned, and `include_hashes`
+    /// are the hashes of the files its includes found ([`SourceFile::include_hashes`]). Adding the
+    /// same path to the same library again returns the existing file.
     pub fn add_sv_file(
         &mut self,
         library: LibraryId,
@@ -515,6 +521,7 @@ impl Project {
         kind: FileKind,
         content_hash: ContentHash,
         sv_file: Option<Arc<SvDesignFile>>,
+        include_hashes: Vec<Option<ContentHash>>,
     ) -> FileId {
         if let Some(existing) = self.libraries[library.index()].file(path) {
             return existing;
@@ -530,6 +537,7 @@ impl Project {
             design_units: Vec::new(),
             dependencies: Vec::new(),
             sv_file,
+            include_hashes,
         };
         self.register_sv_names(id, &file);
         let library = &mut self.libraries[library.index()];

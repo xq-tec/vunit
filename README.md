@@ -17,8 +17,8 @@ This is a fork of VUnit. The VHDL libraries under `vunit/vhdl` (the testbench ru
 The scope of this crate is intentionally limited:
 
 - riSim has two executables: the riSim CLI `risim` analyses all libraries with `risim analyze`, and the runner `risim-runner` simulates with `risim-runner run`.
-  They support VHDL-2008 only.
-- VHDL first. SystemVerilog and Verilog files (`.sv`, `.v`, `.vo`) are collected and scanned for their design elements, imports, and includes, with VUnit's SystemVerilog package and include directory added to projects that have them, but they aren't compiled or simulated yet; include files (`.svh`, `.vh`) are read only where a file includes them, and encrypted and Verilog-AMS files are skipped with a warning.
+  `risim-runner` simulates VHDL-2008 only.
+- VHDL first. SystemVerilog and Verilog files (`.sv`, `.v`, `.vo`) compile, but don't simulate: they are scanned for their design elements, imports, and includes, and compiled with VUnit's SystemVerilog package and include directory, which projects with such files get; their testbenches aren't run, and get a warning. Include files (`.svh`, `.vh`) are read only where a file includes them, and encrypted and Verilog-AMS files are skipped with a warning.
 - There is no command-line interface. Callers open a `Runtime` and drive workspaces through the library API.
 
 The crate provides:
@@ -85,11 +85,10 @@ The table can also be written inline, `options = { relaxed = true }`, which avoi
 `sv-libraries` is library level only: the libraries, in order, that the library's SystemVerilog files search for packages and definitions after their own library.
 It can't name the library itself, and accepts `vunit_lib`, a library of every project.
 Without it, the libraries are derived from the packages that the library's files import or refer to, and the interfaces they use, that other libraries define, in the order of their first use; `vunit_lib` is added last either way, so naming it is optional.
-Libraries that depend on each other in a cycle are a project error, which names the uses that formed it; an explicit list breaks it.
+Libraries that depend on each other in a cycle are a project error, which names the uses that formed it, and nothing is compiled; an explicit list breaks it.
 Instead of upstream's `include_dirs` and `defines` per file (`add_source_file`), these options are per library, as `risim analyze` takes them per call.
 The builtin libraries take the project's `relaxed` only (`Options::for_builtins`), and the files of a user library `vunit_lib` join VUnit's library and take its options, so `[libraries.vunit_lib.options]` has no valid keys.
-`Project::analyze_args` gives every library its arguments: a library without SystemVerilog or Verilog files gets `relaxed` and `encoding` only (`Options::without_sv_keys`), so that the other keys don't change its compile keys, and one with such files also gets the derived or listed libraries as `--sv-library`.
-SystemVerilog and Verilog files aren't compiled yet, and until they are, the VHDL files of every library are compiled with `relaxed` and `encoding` only.
+`Project::analyze_args` gives every library its arguments, for the files of both languages: a library without SystemVerilog or Verilog files gets `relaxed` and `encoding` only (`Options::without_sv_keys`), so that the other keys don't change its compile keys, and one with such files also gets the derived or listed libraries as `--sv-library`.
 
 Unknown keys and wrong types in the options tables are configuration errors at their keys or values; the rest of the file still loads.
 The former list `options = ["-frelaxed"]` and the former `[run]` table are errors that give the new spelling, and nothing of them is applied.
@@ -152,7 +151,12 @@ The runner names the format of the object in `--version` (`run options format N`
 
 `Runtime::simulation_limit` returns the shared budget of threads as a `SimulationLimit`, so that a simulation that the application runs outside of a workspace, such as a standalone run of riSim's hub, waits for it like a testcase; `Runtime::leases` grants it its lease.
 
-The consecutive files of one library that need compiling are analysed by one `risim analyze`, which prints its reports as JSON lines (`--message-format=json`); each report goes to the file of its location, and a file whose design units the call made obsolete is compiled again. The compiled libraries are kept as long as the paths of both executables and the `--version` output of `risim-runner` are the same, which names the archive format.
+The compile set is what the testbenches need, and every SystemVerilog and Verilog file, since their testbenches don't run yet.
+The consecutive files of one library that need compiling are analysed by one `risim analyze`, with the library's arguments, which prints its reports as JSON lines (`--message-format=json`); a library's batches wait for the libraries of its `--sv-library` arguments.
+Each report goes to the file of its location, or, for one in an include file, to the file of the batch that includes it, while keeping its location; a file whose design units the call made obsolete is compiled again.
+A file is compiled again when its compile key changes, a hash of its contents, the contents of the files its includes found (or that they found none), its library's arguments, the simulator, and the keys of its dependencies.
+The SystemVerilog and Verilog files of a library with `compilation-unit = "library"` form one compile item, with one key: a change of one of them compiles all of them, in one call, in the order of collection.
+The compiled libraries are kept as long as the paths of both executables and the `--version` output of `risim-runner` are the same, which names the archive format.
 
 ## Building
 
@@ -170,7 +174,7 @@ cargo test
 ```
 
 - The unit tests and the `operations` integration tests need no simulator. The `operations` test binary doubles as a fake risim-runner. Its trial `real_risim_compiles_uart` compiles VUnit's UART example with the risim-runner named by `RISIM_RUNNER` and the analyzer (`risim`) named by `RISIM_ANALYZER`, and is skipped without either.
-- The `acceptance` tests run VUnit's acceptance projects, the test benches of the VUnit VHDL libraries and a few fixtures of riSim's own with a real simulator. They are skipped unless `RISIM_RUNNER` names a risim-runner executable and `RISIM_ANALYZER` a `risim` executable. Testcases that fail on risim are listed per trial, with the reason:
+- The `acceptance` tests run VUnit's acceptance projects, the test benches of the VUnit VHDL libraries and a few fixtures of riSim's own with a real simulator; VUnit's Verilog acceptance testbenches are compiled only. They are skipped unless `RISIM_RUNNER` names a risim-runner executable and `RISIM_ANALYZER` a `risim` executable. Testcases that fail on risim are listed per trial, with the reason:
 
   ```sh
   RISIM_RUNNER=/path/to/risim-runner RISIM_ANALYZER=/path/to/risim cargo test --test acceptance
