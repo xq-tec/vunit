@@ -88,8 +88,8 @@ Without it, the libraries are derived from the packages that the library's files
 Libraries that depend on each other in a cycle are a project error, which names the uses that formed it; an explicit list breaks it.
 Instead of upstream's `include_dirs` and `defines` per file (`add_source_file`), these options are per library, as `risim analyze` takes them per call.
 The builtin libraries take the project's `relaxed` only (`Options::for_builtins`), and the files of a user library `vunit_lib` join VUnit's library and take its options, so `[libraries.vunit_lib.options]` has no valid keys.
-Libraries without SystemVerilog or Verilog files are analyzed with `relaxed` and `encoding` only (`Options::without_sv_keys`), so that the other keys don't change their compile keys; `Project::analyze_args` gives every library its arguments, with the derived or listed libraries as `--sv-library`.
-SystemVerilog and Verilog files aren't compiled yet.
+`Project::analyze_args` gives every library its arguments: a library without SystemVerilog or Verilog files gets `relaxed` and `encoding` only (`Options::without_sv_keys`), so that the other keys don't change its compile keys, and one with such files also gets the derived or listed libraries as `--sv-library`.
+SystemVerilog and Verilog files aren't compiled yet, and until they are, the VHDL files of every library are compiled with `relaxed` and `encoding` only.
 
 Unknown keys and wrong types in the options tables are configuration errors at their keys or values; the rest of the file still loads.
 The former list `options = ["-frelaxed"]` and the former `[run]` table are errors that give the new spelling, and nothing of them is applied.

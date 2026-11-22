@@ -285,8 +285,9 @@ impl Library {
     ///
     /// They are those of the `sv-libraries` option as written, or else those that the imports,
     /// package references, and interface uses of the files find in other libraries, in the
-    /// order of their first use; `vunit_lib` comes last in a project with SystemVerilog or
-    /// Verilog files, and isn't repeated.
+    /// order of their first use.
+    /// In a project with SystemVerilog or Verilog files, `vunit_lib` comes last, also when the
+    /// files use its packages, unless the option names it elsewhere; it isn't repeated.
     /// Empty for a library without SystemVerilog or Verilog files, and until
     /// [`Project::finish`].
     pub fn sv_dependencies(&self) -> impl ExactSizeIterator<Item = LibraryId> + '_ {
@@ -618,6 +619,9 @@ impl Project {
 
     /// The SystemVerilog dependencies of `library`, with their first use, as
     /// [`Library::sv_dependencies`] describes them; `vunit_lib` is the library to add last.
+    ///
+    /// The derivation doesn't search `vunit_lib`, which comes last anyway, so that a name is
+    /// attributed to the library that the final search order finds it in.
     fn sv_library_dependencies(
         &self,
         library: LibraryId,
@@ -640,7 +644,9 @@ impl Project {
             let package_library = |package: &str| {
                 self.libraries()
                     .find(|&(other, candidate)| {
-                        other != library && candidate.sv_packages.contains_key(package)
+                        other != library
+                            && Some(other) != vunit_lib
+                            && candidate.sv_packages.contains_key(package)
                     })
                     .map(|(other, _)| other)
             };
@@ -648,6 +654,7 @@ impl Project {
                 self.libraries()
                     .find(|&(other, candidate)| {
                         other != library
+                            && Some(other) != vunit_lib
                             && matches!(
                                 candidate.sv_definitions.get(name),
                                 Some((SvDefinitionKind::Interface, _))

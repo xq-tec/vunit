@@ -223,7 +223,9 @@ impl CompilePlan {
 
         let analysis = project.dependency_graph(false);
         let implementation = project.dependency_graph(true);
-        // SystemVerilog and Verilog files aren't compiled yet.
+        // TODO: SystemVerilog and Verilog files aren't compiled yet, so they are left out of the
+        // compile set, also where an instance or a component edge pulls them in. This filter, and
+        // the VHDL-only arguments in `add_files`, go once their compiles are planned.
         let selected: FxHashSet<FileId> = implementation
             .graph
             .dependencies(input.targets.iter().copied())
@@ -293,11 +295,15 @@ impl CompilePlan {
         for &id in order {
             let file = project.file(id);
             let library = &project.library(file.library).name;
-            let library_args = Arc::clone(
-                analyze_args
-                    .entry(file.library)
-                    .or_insert_with(|| project.analyze_args(file.library).into()),
-            );
+            // TODO: While SystemVerilog and Verilog files aren't compiled, a library's VHDL files
+            // take only the options that apply to VHDL, rather than `Project::analyze_args`:
+            // the archives that its `--sv-library` arguments name may not exist yet, which
+            // `risim analyze` reports as an error. This goes with the filter of SV files in
+            // `CompilePlan::new`.
+            let library_args = Arc::clone(analyze_args.entry(file.library).or_insert_with(|| {
+                let options = &project.library(file.library).options;
+                options.without_sv_keys().analyze_args().into()
+            }));
             let dependencies: Vec<usize> = self
                 .graph
                 .direct_dependencies(id)

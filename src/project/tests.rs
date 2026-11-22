@@ -1540,7 +1540,7 @@ fn derived_sv_dependencies_in_first_use_order_with_vunit_lib_last() {
 }
 
 #[test]
-fn an_import_of_vunit_pkg_adds_vunit_lib_once() {
+fn an_import_of_vunit_pkg_keeps_vunit_lib_last_and_once() {
     let mut test = TestProject::new();
     test.add_library("vunit_lib");
     test.add_library("a");
@@ -1557,7 +1557,8 @@ fn an_import_of_vunit_pkg_adds_vunit_lib_once() {
         "module tb;\n  import vunit_pkg::*;\n  import pb::*;\nendmodule\n",
     );
     test.project.finish();
-    assert_eq!(test.sv_dependencies("a"), ["vunit_lib", "b"]);
+    // `vunit_lib` stays last, also when a file imports from it first.
+    assert_eq!(test.sv_dependencies("a"), ["b", "vunit_lib"]);
 }
 
 #[test]

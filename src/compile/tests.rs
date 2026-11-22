@@ -14,6 +14,7 @@ use crate::spec::Encoding;
 use crate::spec::IncludeDir;
 use crate::spec::Options;
 use crate::test_support::TempRoot;
+use crate::test_support::add_sv;
 use crate::test_support::add_vhdl;
 use crate::test_support::simulator;
 
@@ -263,6 +264,65 @@ fn compile_keys_depend_on_options_and_simulator() {
     identity.version_output = "risim-runner 0.1.0\nhydrolyze archive format 2\n".to_owned();
     fixture.simulator = Simulator::from_identity(identity).unwrap();
     assert_eq!(fixture.plan(&targets, &state).compile_count(), 3);
+}
+
+/// SystemVerilog files aren't compiled yet, also where a component pulls one in, and the VHDL
+/// files of a library with such files get the arguments of a VHDL-only library, without the
+/// `--sv-library` archives, which don't exist yet.
+#[test]
+fn sv_files_are_not_compiled_yet() {
+    let mut fixture = Fixture::new();
+    fixture.library("vunit_lib").library("pkgs").library("rtl");
+    let pkg_path = fixture.temp.root.join("types_pkg.sv");
+    add_sv(
+        &mut fixture.project,
+        "pkgs",
+        &pkg_path,
+        "package types_pkg;\nendpackage\n",
+    );
+    let sv_path = fixture.temp.root.join("counter.sv");
+    add_sv(
+        &mut fixture.project,
+        "rtl",
+        &sv_path,
+        "module counter;\n  import types_pkg::*;\nendmodule\n",
+    );
+    let top = fixture.add(
+        "rtl",
+        "top.vhd",
+        "entity top is end;\narchitecture a of top is\n  component counter is end \
+         component;\nbegin\n  u : counter;\nend;",
+    );
+    let rtl = fixture.project.find_library("rtl").unwrap();
+    fixture.project.set_library_options(
+        rtl,
+        Options {
+            relaxed: true,
+            include_dirs: Some(vec![IncludeDir::new("/inc")]),
+            ..Options::default()
+        },
+    );
+    fixture.project.finish();
+    assert_eq!(
+        fixture.project.analyze_args(rtl),
+        [
+            "--relaxed",
+            "--include-dir=/inc",
+            "--sv-library=pkgs",
+            "--sv-library=vunit_lib"
+        ]
+    );
+
+    let plan = fixture.plan(&[top], &CompileState::default());
+    assert_eq!(plan.errors, []);
+    assert_eq!(names(&plan), ["top.vhd"]);
+    let command = plan.compile_command(&[0]);
+    assert!(command.iter().any(|arg| arg == "--relaxed"));
+    assert!(
+        !command
+            .iter()
+            .any(|arg| arg.starts_with("--sv-library") || arg.starts_with("--include-dir"))
+    );
 }
 
 #[test]
