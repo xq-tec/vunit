@@ -103,6 +103,7 @@ use crate::spec::LibrarySpec;
 use crate::spec::Options;
 use crate::spec::PatternLocation;
 use crate::spec::ProjectSpec;
+use crate::spec::SV_DIRECTIVES;
 use crate::spec::SimOptions;
 
 /// The result of reading a configuration file.
@@ -189,32 +190,6 @@ const SHARED_KEYS: [&str; 5] = [
 
 /// The key of `[libraries.NAME.options]` that is library level only.
 const SV_LIBRARIES: &str = "sv-libraries";
-
-/// The directives of IEEE 1800 clause 22, which no macro may be named after (22.5.1).
-const SV_DIRECTIVES: [&str; 22] = [
-    "__FILE__",
-    "__LINE__",
-    "begin_keywords",
-    "celldefine",
-    "default_nettype",
-    "define",
-    "else",
-    "elsif",
-    "end_keywords",
-    "endcelldefine",
-    "endif",
-    "ifdef",
-    "ifndef",
-    "include",
-    "line",
-    "nounconnected_drive",
-    "pragma",
-    "resetall",
-    "timescale",
-    "unconnected_drive",
-    "undef",
-    "undefineall",
-];
 
 /// The elements of the former list `options` that make the project relaxed.
 const LEGACY_RELAXED: [&str; 3] = ["--relaxed", "-frelaxed", "-frelaxed-rules"];
@@ -613,14 +588,13 @@ impl Parser<'_> {
         let is_vunit_lib = library.eq_ignore_ascii_case(builtins::VUNIT_LIB);
         for (key, entry) in in_file_order(table, keys, path) {
             let key_span = key_span(table, &path(&key));
-            let is_library_key = SHARED_KEYS.contains(&key.as_str()) || key == SV_LIBRARIES;
             if PROJECT_KEYS.contains(&key.as_str()) {
                 self.diagnostic(
                     Severity::Error,
                     format!("'{key}' is a project option; set it in [options]"),
                     key_span,
                 );
-            } else if is_library_key && is_vunit_lib {
+            } else if is_vunit_lib {
                 self.diagnostic(
                     Severity::Error,
                     format!(
@@ -631,7 +605,7 @@ impl Parser<'_> {
                 );
             } else if key == SV_LIBRARIES {
                 listed = self.library_list(library, entry, table);
-            } else if is_library_key {
+            } else if SHARED_KEYS.contains(&key.as_str()) {
                 self.shared_option(&key, entry, &base, table, &mut options);
             } else {
                 let message = format!(
@@ -1365,8 +1339,9 @@ files = []
             [(
                 Severity::Error,
                 "unknown option 'libraries' in [options]; expected one of: relaxed, opt-level, \
-                 opt, include-dirs, defines, compilation-unit, keywords, encoding; keys after the [options] header belong to it, so put them above the \
-                 header, or write options = { … }",
+                 opt, include-dirs, defines, compilation-unit, keywords, encoding; keys after \
+                 the [options] header belong to it, so put them above the header, or write \
+                 options = { … }",
                 Some(Position::new(3, 1))
             )]
         );
@@ -1761,6 +1736,57 @@ defines = { "MAX(a,b)" = "a", MAX = "b", DEBUG = false, DEPTH = 4 }
         );
     }
 
+    /// `defines` as header tables, whose keys and values have their spans too.
+    #[test]
+    fn defines_in_header_tables() {
+        let config = parse_str(
+            r#"
+[options.defines]
+WIDTH = 8
+"MAX(a,b)" = "x"
+
+[libraries.lib]
+files = []
+
+[libraries.lib.options.defines]
+WIDTH = false
+"1X" = "1"
+"#,
+        );
+        assert_eq!(
+            messages(&config),
+            [
+                (
+                    Severity::Error,
+                    "'1X' is no macro name; expected a name such as WIDTH, or MAX(a,b) with \
+                     formal arguments in 'defines' in [libraries.lib.options]",
+                    Some(Position::new(11, 1))
+                ),
+                (
+                    Severity::Error,
+                    "the text of macro 'WIDTH' in 'defines' in [options] is a string: \"WIDTH\" = \
+                     \"8\"",
+                    Some(Position::new(3, 9))
+                ),
+            ]
+        );
+        let spec = config.spec.unwrap();
+        assert_eq!(
+            spec.options.defines,
+            BTreeMap::from([(
+                "MAX".to_owned(),
+                Define::Defined {
+                    formals: Some("(a,b)".to_owned()),
+                    text: "x".to_owned(),
+                }
+            )])
+        );
+        assert_eq!(
+            own_options(&spec, "lib").defines,
+            BTreeMap::from([("WIDTH".to_owned(), Define::Removed)])
+        );
+    }
+
     #[test]
     fn sv_libraries_errors() {
         let config = parse_str(
@@ -1833,6 +1859,7 @@ files = []
 encoding = "latin-1"
 defines = { A = "1" }
 sv-libraries = []
+colour = 1
 relaxed = true
 "#,
         );
@@ -1842,10 +1869,11 @@ relaxed = true
                  VUnit's builtin library"
             )
         };
-        let (encoding, defines, sv_libraries) = (
+        let (encoding, defines, sv_libraries, colour) = (
             message("encoding"),
             message("defines"),
             message("sv-libraries"),
+            message("colour"),
         );
         assert_eq!(
             messages(&config),
@@ -1861,10 +1889,11 @@ relaxed = true
                     sv_libraries.as_str(),
                     Some(Position::new(7, 1))
                 ),
+                (Severity::Error, colour.as_str(), Some(Position::new(8, 1))),
                 (
                     Severity::Error,
                     "'relaxed' is a project option; set it in [options]",
-                    Some(Position::new(8, 1))
+                    Some(Position::new(9, 1))
                 ),
             ]
         );

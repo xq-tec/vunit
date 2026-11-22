@@ -451,6 +451,36 @@ pub const KEYWORD_VERSIONS: [&str; 9] = [
     "1800-2023",
 ];
 
+/// The directives of IEEE 1800-2023 clause 22, as 22.1 lists them, without `` ` ``; no macro
+/// of `defines` may be named after one (22.5.1).
+///
+/// A copy of hydrolyze's list (`hydrolyze::is_sv_directive`), since this crate builds without
+/// hydrolyze; riSim's tests check that the two agree.
+pub const SV_DIRECTIVES: [&str; 22] = [
+    "__FILE__",
+    "__LINE__",
+    "begin_keywords",
+    "celldefine",
+    "default_nettype",
+    "define",
+    "else",
+    "elsif",
+    "end_keywords",
+    "endcelldefine",
+    "endif",
+    "ifdef",
+    "ifndef",
+    "include",
+    "line",
+    "nounconnected_drive",
+    "pragma",
+    "resetall",
+    "timescale",
+    "unconnected_drive",
+    "undef",
+    "undefineall",
+];
+
 /// A version of `keywords`, one of [`KEYWORD_VERSIONS`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KeywordVersion(&'static str);

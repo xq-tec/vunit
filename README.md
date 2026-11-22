@@ -86,7 +86,7 @@ The table can also be written inline, `options = { relaxed = true }`, which avoi
 It can't name the library itself, and accepts `vunit_lib`, a library of every project.
 Instead of upstream's `include_dirs` and `defines` per file (`add_source_file`), these options are per library, as `risim analyze` takes them per call.
 The builtin libraries take the project's `relaxed` only (`Options::for_builtins`), and the files of a user library `vunit_lib` join VUnit's library and take its options, so `[libraries.vunit_lib.options]` has no valid keys.
-Libraries without SystemVerilog or Verilog files are analysed with `relaxed` and `encoding` only (`Options::without_sv_keys`), so that the other keys don't change their compile keys; SystemVerilog and Verilog files aren't compiled yet.
+Libraries without SystemVerilog or Verilog files are analyzed with `relaxed` and `encoding` only (`Options::without_sv_keys`), so that the other keys don't change their compile keys; SystemVerilog and Verilog files aren't compiled yet.
 
 Unknown keys and wrong types in the options tables are configuration errors at their keys or values; the rest of the file still loads.
 The former list `options = ["-frelaxed"]` and the former `[run]` table are errors that give the new spelling, and nothing of them is applied.

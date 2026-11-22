@@ -94,6 +94,7 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - Library directories are `risim-out/libraries/<lowercase library name>`, each with the archive `<lowercase library name>.hlib`.
 - The VHDL parser skips enumeration, record and array types, which VUnit only uses for com codec generation. Word boundaries (`\b`) only treat ASCII characters as word characters.
 - The files of a user library named `vunit_lib` are added to the VUnit library, like `ui.library("vunit_lib").add_source_files(…)`; a precompiled library can't be named `vunit_lib`. A user library named `osvvm` replaces the builtin OSVVM library, with a warning. Library names, including `work`, are compared case-insensitively.
+- The include directories and macros of SystemVerilog and Verilog files are options of the project or of a library (`include-dirs` and `defines` of `[options]` and `[libraries.NAME.options]`), not of each file (`add_source_file(…, include_dirs=…, defines=…)`), since `risim analyze` takes them per call.
 - com is always added from VHDL-2008 on, and left out for older standards instead of raising an error.
 - In file patterns, `*` also matches hidden files, and `risim-out/` and `.git/` directories are never searched. Files with unknown extensions are skipped with a warning instead of raising an error.
 - Testcase names keep the case of the entity declaration; VUnit uses the lowercase entity name. Test names that differ only in case produce a warning.
