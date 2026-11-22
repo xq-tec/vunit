@@ -4,6 +4,9 @@
 
 //! Running a project with the real analyzer and risim-runner through the public workspace API.
 //!
+//! The runners have a free plan of their own ([`isolate_slots`]): as many threads as the
+//! runtime runs simulations at once, in a slot directory of their own.
+//!
 //! AI NOTICE: Generated, minimally reviewed.
 
 use std::collections::BTreeMap;
@@ -42,6 +45,12 @@ pub const RISIM_RUNNER: &str = "RISIM_RUNNER";
 /// The environment variable naming the analyzer, the riSim CLI `risim`.
 pub const RISIM_ANALYZER: &str = "RISIM_ANALYZER";
 
+/// The environment variable of debug builds of risim-runner with the free plan's threads.
+const RISIM_FREE_THREADS: &str = "RISIM_FREE_THREADS";
+
+/// The environment variable of debug builds of risim-runner with the slot directory.
+const RISIM_SLOT_DIR: &str = "RISIM_SLOT_DIR";
+
 /// How long a whole simulate operation may take.
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(900);
 
@@ -78,13 +87,47 @@ impl Root {
     }
 }
 
+/// The simulations, and compiles, that a runtime runs at once: the logical cores.
+fn parallelism() -> NonZeroUsize {
+    std::thread::available_parallelism().unwrap_or(NonZeroUsize::new(4).expect("non-zero"))
+}
+
+/// Gives the runners of this process a free plan of their own, and returns its slot directory,
+/// which is deleted when dropped.
+///
+/// Sets `RISIM_FREE_THREADS` to the simulations that a runtime runs at once ([`parallelism`]),
+/// so that the runners don't queue for the free plan's 2 threads, and `RISIM_SLOT_DIR` to a new
+/// temporary directory, so that they neither wait for nor take the slots of other riSim
+/// processes on the machine.
+/// Only debug builds of risim-runner honor them; a release build has the free plan's 2 threads,
+/// shared with the machine.
+///
+/// # Safety
+///
+/// No other threads may exist, as for [`env::set_var`].
+pub unsafe fn isolate_slots() -> tempfile::TempDir {
+    let slots = tempfile::Builder::new()
+        .prefix("risim-acceptance-slots-")
+        .tempdir()
+        .expect("create the slot directory");
+    // SAFETY: The caller guarantees that no other threads exist. The runners inherit the
+    // variables.
+    unsafe {
+        env::set_var(RISIM_FREE_THREADS, parallelism().to_string());
+    }
+    // SAFETY: As above.
+    unsafe {
+        env::set_var(RISIM_SLOT_DIR, slots.path());
+    }
+    slots
+}
+
 /// A runtime with the risim-runner named by [`RISIM_RUNNER`] and the analyzer named by
 /// [`RISIM_ANALYZER`].
 pub async fn runtime() -> Runtime {
     let runner = Utf8PathBuf::from(env::var(RISIM_RUNNER).expect("RISIM_RUNNER"));
     let analyzer = Utf8PathBuf::from(env::var(RISIM_ANALYZER).expect("RISIM_ANALYZER"));
-    let parallelism =
-        std::thread::available_parallelism().unwrap_or(NonZeroUsize::new(4).expect("non-zero"));
+    let parallelism = parallelism();
     Runtime::new(RuntimeOptions {
         analyzer,
         runner,

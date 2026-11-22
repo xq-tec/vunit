@@ -155,6 +155,9 @@ cargo test
   RISIM_RUNNER=/path/to/risim-runner RISIM_ANALYZER=/path/to/risim cargo test --test acceptance
   ```
 
+  The runners get a free plan of their own: as many threads as logical cores (`RISIM_FREE_THREADS`), in a temporary slot directory (`RISIM_SLOT_DIR`), so that they neither queue for the free plan's 2 threads nor wait for or take the slots of other riSim processes on the machine.
+  Only debug builds of risim-runner honor these variables; with a release build, the trials run 2 simulations at a time, shared with the machine, and may time out.
+
 ## License
 
 The Rust code and VUnit's VHDL libraries are licensed under the [Mozilla Public License, v. 2.0](LICENSE.rst). OSVVM (`vunit/vhdl/osvvm`) is redistributed under the Apache License, v. 2.0; see [`LICENSE.rst`](LICENSE.rst).
