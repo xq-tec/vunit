@@ -67,6 +67,7 @@ use crate::simulator::CompileArgs;
 use crate::simulator::Simulator;
 use crate::simulator::SimulatorIdentity;
 use crate::sources::ContentHash;
+use crate::sources::FileKind;
 use crate::store::CompileKey;
 use crate::store::CompileState;
 use crate::store::FileKey;
@@ -222,9 +223,13 @@ impl CompilePlan {
 
         let analysis = project.dependency_graph(false);
         let implementation = project.dependency_graph(true);
-        let selected = implementation
+        // SystemVerilog and Verilog files aren't compiled yet.
+        let selected: FxHashSet<FileId> = implementation
             .graph
-            .dependencies(input.targets.iter().copied());
+            .dependencies(input.targets.iter().copied())
+            .into_iter()
+            .filter(|&id| project.file(id).kind == FileKind::Vhdl)
+            .collect();
         let selected_paths: FxHashSet<&Utf8Path> = selected
             .iter()
             .map(|&id| project.file(id).path.as_path())
@@ -288,11 +293,11 @@ impl CompilePlan {
         for &id in order {
             let file = project.file(id);
             let library = &project.library(file.library).name;
-            // Only VHDL files are compiled yet, so no SystemVerilog option applies.
-            let library_args = Arc::clone(analyze_args.entry(file.library).or_insert_with(|| {
-                let options = &project.library(file.library).options;
-                options.without_sv_keys().analyze_args().into()
-            }));
+            let library_args = Arc::clone(
+                analyze_args
+                    .entry(file.library)
+                    .or_insert_with(|| project.analyze_args(file.library).into()),
+            );
             let dependencies: Vec<usize> = self
                 .graph
                 .direct_dependencies(id)

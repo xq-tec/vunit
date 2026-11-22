@@ -18,12 +18,12 @@ The scope of this crate is intentionally limited:
 
 - riSim has two executables: the riSim CLI `risim` analyses all libraries with `risim analyze`, and the runner `risim-runner` simulates with `risim-runner run`.
   They support VHDL-2008 only.
-- VHDL only. Verilog is not supported yet.
+- VHDL first. SystemVerilog and Verilog files (`.sv`, `.v`, `.vo`) are collected and scanned for their design elements, imports, and includes, with VUnit's SystemVerilog package and include directory added to projects that have them, but they aren't compiled or simulated yet; include files (`.svh`, `.vh`) are read only where a file includes them, and encrypted and Verilog-AMS files are skipped with a warning.
 - There is no command-line interface. Callers open a `Runtime` and drive workspaces through the library API.
 
 The crate provides:
 
-- the project model: libraries, source globs, VHDL parsing, dependency analysis and compile order;
+- the project model: libraries, source globs, VHDL parsing and SystemVerilog scanning, dependency analysis and compile order;
 - test discovery, with VUnit's testbench conventions (`runner_cfg`, `run("…")`, `-- vunit:` attributes, configurations and generics);
 - incremental, parallel compilation, with recompilation decided by content hashes instead of timestamps;
 - simulation runs, one simulation per test, with results persisted in `risim-out/`;
@@ -84,9 +84,12 @@ The table can also be written inline, `options = { relaxed = true }`, which avoi
 `relaxed`, `opt-level`, and `opt` are project level only.
 `sv-libraries` is library level only: the libraries, in order, that the library's SystemVerilog files search for packages and definitions after their own library.
 It can't name the library itself, and accepts `vunit_lib`, a library of every project.
+Without it, the libraries are derived from the packages that the library's files import or refer to, and the interfaces they use, that other libraries define, in the order of their first use; `vunit_lib` is added last either way, so naming it is optional.
+Libraries that depend on each other in a cycle are a project error, which names the uses that formed it; an explicit list breaks it.
 Instead of upstream's `include_dirs` and `defines` per file (`add_source_file`), these options are per library, as `risim analyze` takes them per call.
 The builtin libraries take the project's `relaxed` only (`Options::for_builtins`), and the files of a user library `vunit_lib` join VUnit's library and take its options, so `[libraries.vunit_lib.options]` has no valid keys.
-Libraries without SystemVerilog or Verilog files are analyzed with `relaxed` and `encoding` only (`Options::without_sv_keys`), so that the other keys don't change their compile keys; SystemVerilog and Verilog files aren't compiled yet.
+Libraries without SystemVerilog or Verilog files are analyzed with `relaxed` and `encoding` only (`Options::without_sv_keys`), so that the other keys don't change their compile keys; `Project::analyze_args` gives every library its arguments, with the derived or listed libraries as `--sv-library`.
+SystemVerilog and Verilog files aren't compiled yet.
 
 Unknown keys and wrong types in the options tables are configuration errors at their keys or values; the rest of the file still loads.
 The former list `options = ["-frelaxed"]` and the former `[run]` table are errors that give the new spelling, and nothing of them is applied.

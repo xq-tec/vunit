@@ -22,6 +22,9 @@
 //! - Every test runs in its own simulation; `run_all_in_same_sim` is accepted and ignored.
 //! - Testcase names keep the case of the entity declaration (VUnit lowercases them).
 //! - Test names that differ only in case produce a warning, since patterns can't tell them apart.
+//! - SystemVerilog testbenches, modules and other definitions with a `runner_cfg` parameter
+//!   (which `` `TEST_SUITE `` declares), aren't run, since riSim doesn't simulate SystemVerilog
+//!   yet; each gets a warning.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -535,6 +538,7 @@ impl BenchState {
 /// Finds the testbenches and testcases of `project` and applies `test_configs` in order.
 pub fn discover(project: &Project, test_configs: &[TestConfigSpec]) -> Discovery {
     let mut discovery = Discovery::default();
+    warn_about_sv_testbenches(project, &mut discovery.project_diagnostics);
     let candidates = find_testbench_entities(project, &mut discovery.project_diagnostics);
 
     let mut benches: Vec<BenchState> = Vec::new();
@@ -639,6 +643,37 @@ fn find_testbench_entities<'project>(
         }
     }
     candidates
+}
+
+/// Warns about each SystemVerilog testbench, a definition with a `runner_cfg` parameter
+/// (`tb_filter` of `test/bench_list.py`), once per file.
+fn warn_about_sv_testbenches(project: &Project, diagnostics: &mut Vec<Diagnostic>) {
+    let mut seen: FxHashSet<&Utf8Path> = FxHashSet::default();
+    for (_, file) in project.files() {
+        let Some(sv_file) = &file.sv_file else {
+            continue;
+        };
+        if !seen.insert(&file.path) {
+            continue;
+        }
+        for definition in &sv_file.definitions {
+            if definition
+                .parameters
+                .iter()
+                .any(|parameter| parameter == "runner_cfg")
+            {
+                diagnostics.push(
+                    Diagnostic::warning(format!(
+                        "SystemVerilog testbench '{}' isn't run: riSim doesn't simulate \
+                         SystemVerilog yet",
+                        definition.name
+                    ))
+                    .in_file(&file.path)
+                    .at(definition.name_location),
+                );
+            }
+        }
+    }
 }
 
 /// Checks the architecture of a testbench and finds its tests.

@@ -48,12 +48,12 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 | ------------------ | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
 | `config`           | — (new)                                                             | `risim-config.toml` → `ProjectSpec`, with spans for diagnostics                                |
 | `spec`             | `ui/__init__.py`, `ui/library.py`, `ui/testbench.py` (setters only) | Programmatic `ProjectSpec` (libraries, options, configurations, features)                      |
-| `sources`          | `ui/common.py` (globs), `ostools.py` (file reading), `cached.py`    | Glob expansion, file reading (Latin-1), content hashing, parse cache                           |
+| `sources`          | `ui/common.py` (globs), `ostools.py` (file reading), `cached.py`    | Glob expansion, file kinds, content hashing, parse cache, SystemVerilog scan cache             |
 | `vhdl_parser`      | `vhdl_parser.py`                                                    | Regex-based design-unit/reference/generic extraction                                           |
 | `vhdl_standard`    | `vhdl_standard.py`                                                  | `VhdlStandard` and file-name tags (`2008p`, `93m`, …)                                          |
 | `project`          | `project.py`, `library.py`, `source_file.py`, `design_unit.py`      | Libraries, source files, design units, dependency extraction                                   |
 | `dependency_graph` | `dependency_graph.py`                                               | Graph, toposort, dependents/dependencies, cycle reporting                                      |
-| `builtins`         | `builtins.py`                                                       | Selection of VUnit/OSVVM files from the generated table                                        |
+| `builtins`         | `builtins.py`                                                       | Selection of VUnit/OSVVM VHDL files and the Verilog builtins from the generated table          |
 | `discovery`        | `test/bench.py`, `test/bench_list.py`, `test/list.py`               | Testbenches, tests, attributes, pragmas, locations                                             |
 | `configuration`    | `configuration.py`                                                  | Configurations (generics, sim options, attributes, VHDL configuration name)                    |
 | `pattern`          | `fnmatch` usage in `ui/__init__.py`                                 | Testcase pattern matching                                                                      |
@@ -94,7 +94,8 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - Library directories are `risim-out/libraries/<lowercase library name>`, each with the archive `<lowercase library name>.hlib`.
 - The VHDL parser skips enumeration, record and array types, which VUnit only uses for com codec generation. Word boundaries (`\b`) only treat ASCII characters as word characters.
 - The files of a user library named `vunit_lib` are added to the VUnit library, like `ui.library("vunit_lib").add_source_files(…)`; a precompiled library can't be named `vunit_lib`. A user library named `osvvm` replaces the builtin OSVVM library, with a warning. Library names, including `work`, are compared case-insensitively.
-- The scanner of SystemVerilog and Verilog files (`verilog_parser`) has no parse cache, and deviates from `parsing/verilog/*` in these points:
+- The scanner of SystemVerilog and Verilog files (`verilog_parser`) has no parse cache of its own: `sources::SvScanCache` keeps its results in memory only (not in `parse_cache.json`), and reuses a scan while the file, its options, and every file that its includes tried to read are unchanged, as upstream's `_lookup_parse_cache` checks.
+  The scanner deviates from `parsing/verilog/*` in these points:
   - A quoted `` `include `` searches the directory of the including file first, then the include directories, as hydrolyze does; upstream searches the directory of the top file, then the include directories.
   - Interfaces, programs, primitives, and `macromodule` are definitions too.
   - Upstream uses one keyword set for all files; the scanner has a second one (`KeywordSet::Verilog1364`), with the keywords of IEEE 1364-2005, for Verilog files (`.v`, `.vo`) and `keywords = "1364-…"`, in which SystemVerilog-only keywords such as `package`, `import`, and `interface` are identifiers.
@@ -104,6 +105,13 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
   - `import a::x, b::y;` imports `b` too, a package reference `p::x` right after an identifier is found, `name.modport port` is an instance of `name`, and the name of a parameter is the last identifier before its default, not the type in `parameter int unsigned N`.
   - A few inputs on which upstream raises an uncaught exception are skipped instead, and macro expansions and includes stop at nesting and token limits.
 - The include directories and macros of SystemVerilog and Verilog files are options of the project or of a library (`include-dirs` and `defines` of `[options]` and `[libraries.NAME.options]`), not of each file (`add_source_file(…, include_dirs=…, defines=…)`), since `risim analyze` takes them per call.
+- File kinds come from one table of extensions, a copy of hydrolyze's that riSim's tests check against it (`sources::FileKind`): `.sv` (SystemVerilog), `.v` and `.vo` (Verilog) are sources; `.svh` and `.vh` are include files, which a pattern may match without a warning; `.svp`, `.vp` (encrypted), and `.vams` (Verilog-AMS) are skipped with a warning that names the reason.
+  Upstream adds every Verilog extension as a source.
+- The libraries that a library's SystemVerilog files search for packages and definitions are derived from the packages they import or refer to, and the interfaces they use, in other libraries, in the order of their first use, with `vunit_lib` last; `sv-libraries` of `[libraries.NAME.options]` replaces the derived list.
+  They become `--sv-library` arguments of `risim analyze`, and libraries that depend on each other in a cycle are a project error, since riSim can't load them.
+  Upstream has no such list, since its simulators resolve these names across all libraries.
+- The Verilog builtins (`vunit_pkg.sv` in `vunit_lib`, and the `verilog/include` directory before the include directories of each library with SystemVerilog or Verilog files) are added only when the project has such files, rather than by a call to `add_verilog_builtins`.
+- SystemVerilog and Verilog testbenches (definitions with a `runner_cfg` parameter) aren't discovered: each gets a warning that riSim doesn't simulate SystemVerilog yet, and their files aren't compiled yet.
 - com is always added from VHDL-2008 on, and left out for older standards instead of raising an error.
 - In file patterns, `*` also matches hidden files, and `risim-out/` and `.git/` directories are never searched. Files with unknown extensions are skipped with a warning instead of raising an error.
 - Testcase names keep the case of the entity declaration; VUnit uses the lowercase entity name. Test names that differ only in case produce a warning.

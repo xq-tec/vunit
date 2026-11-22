@@ -17,6 +17,11 @@ use crate::project::Project;
 use crate::simulator::Simulator;
 use crate::simulator::SimulatorIdentity;
 use crate::sources::ContentHash;
+use crate::sources::FileKind;
+use crate::verilog_parser;
+use crate::verilog_parser::Defines;
+use crate::verilog_parser::KeywordSet;
+use crate::verilog_parser::ScanInput;
 use crate::vhdl_parser::VhdlDesignFile;
 
 /// A temporary directory with a UTF-8 path, deleted when dropped.
@@ -75,5 +80,28 @@ pub(crate) fn add_vhdl(
         None,
         ContentHash::of(code.as_bytes()),
         design_file,
+    )
+}
+
+/// Scans `code` and adds it to `library` as the SystemVerilog file `path`; includes aren't
+/// found.
+pub(crate) fn add_sv(project: &mut Project, library: &str, path: &Utf8Path, code: &str) -> FileId {
+    let library = project.find_library(library).unwrap();
+    let (design_file, _) = verilog_parser::scan(
+        &ScanInput {
+            path,
+            contents: code.as_bytes(),
+            include_dirs: &[],
+            defines: &Defines::new(),
+            keywords: KeywordSet::Sv,
+        },
+        |_| Err(std::io::ErrorKind::NotFound.into()),
+    );
+    project.add_sv_file(
+        library,
+        path,
+        FileKind::SystemVerilog,
+        ContentHash::of(code.as_bytes()),
+        Some(Arc::new(design_file)),
     )
 }

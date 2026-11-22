@@ -1624,6 +1624,32 @@ mod parser_tests {
             .map(|package| (package.name.as_str(), package.name_range.clone()))
             .collect();
         assert_eq!(packages, [("inc_pkg", None), ("pkg", Some(pkg..pkg + 3))]);
+        // The lines and columns of the names, for diagnostics.
+        let locations: Vec<_> = design_file
+            .definitions
+            .iter()
+            .map(|definition| definition.name_location)
+            .chain(
+                design_file
+                    .packages
+                    .iter()
+                    .map(|package| package.name_location),
+            )
+            .collect();
+        let range = |line, start, end| diagnostics::Range {
+            start: diagnostics::Position::new(line, start),
+            end: diagnostics::Position::new(line, end),
+        };
+        assert_eq!(
+            locations,
+            [
+                None,
+                None,
+                Some(range(6, 8, 14)),
+                None,
+                Some(range(9, 9, 11))
+            ]
+        );
         assert_eq!(
             design_file.includes,
             [SvInclude {

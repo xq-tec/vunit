@@ -27,6 +27,7 @@ mod preprocessor;
 mod tests;
 mod tokenizer;
 
+use std::fmt;
 use std::io;
 use std::ops::Range;
 use std::sync::Arc;
@@ -39,6 +40,8 @@ use self::preprocessor::Preprocessor;
 use self::preprocessor::Problem;
 pub use self::tokenizer::KeywordSet;
 use self::tokenizer::Source;
+use crate::diagnostics;
+use crate::diagnostics::LineIndex;
 
 /// The input of [`scan`]: a file, its contents, and its options.
 #[derive(Debug, Clone, Copy)]
@@ -88,6 +91,8 @@ pub struct SvDefinition {
     /// The bytes of the name in the file, if the file spells it itself, not an include or a
     /// macro.
     pub name_range: Option<Range<usize>>,
+    /// The lines and columns of [`name_range`](Self::name_range), for diagnostics.
+    pub name_location: Option<diagnostics::Range>,
 }
 
 /// The kind of a [`SvDefinition`], by its keyword.
@@ -105,6 +110,18 @@ pub enum SvDefinitionKind {
     Primitive,
 }
 
+impl fmt::Display for SvDefinitionKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Module => "module",
+            Self::Macromodule => "macromodule",
+            Self::Interface => "interface",
+            Self::Program => "program",
+            Self::Primitive => "primitive",
+        })
+    }
+}
+
 /// A named design element other than a definition: a package.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SvName {
@@ -113,6 +130,8 @@ pub struct SvName {
     /// The bytes of the name in the file, if the file spells it itself, not an include or a
     /// macro.
     pub name_range: Option<Range<usize>>,
+    /// The lines and columns of [`name_range`](Self::name_range), for diagnostics.
+    pub name_location: Option<diagnostics::Range>,
 }
 
 /// An `` `include `` directive.
@@ -173,7 +192,7 @@ fn scan_with_problems(
     } = preprocessor;
 
     let tokens = parser::significant_tokens(tokens, input.keywords);
-    let design_file = SvDesignFile {
+    let mut design_file = SvDesignFile {
         definitions: parser::find_definitions(&tokens, &source),
         packages: parser::find_packages(&tokens, &source),
         imports: parser::find_imports(&tokens, &mut problems),
@@ -181,5 +200,19 @@ fn scan_with_problems(
         instances: parser::find_instances(&tokens),
         includes: included,
     };
+    let lines = LineIndex::new(input.contents);
+    let names = design_file
+        .definitions
+        .iter_mut()
+        .map(|definition| (&definition.name_range, &mut definition.name_location))
+        .chain(
+            design_file
+                .packages
+                .iter_mut()
+                .map(|package| (&package.name_range, &mut package.name_location)),
+        );
+    for (range, location) in names {
+        *location = range.clone().map(|range| lines.range(range));
+    }
     (design_file, defines, problems)
 }

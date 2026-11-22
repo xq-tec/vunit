@@ -57,6 +57,8 @@
 //! of `[options]` are project level only.
 //! `sv-libraries` can't name the library itself, and accepts `vunit_lib`, a library of every
 //! project.
+//! Invalid names are errors and left out; a list without any valid name is left out as a whole,
+//! so that the library keeps the libraries derived from its files.
 //! `[libraries.vunit_lib.options]` has no valid keys, since the files of `vunit_lib` take the
 //! options of VUnit's library.
 //!
@@ -386,7 +388,7 @@ impl Parser<'_> {
                 unreachable!("a configuration file has source libraries only");
             };
             let name = name.clone();
-            options.sv_libraries = Some(self.sv_libraries(&name, listed, &names));
+            options.sv_libraries = self.sv_libraries(&name, listed, &names);
         }
 
         let mut run_options = RunOptions::new();
@@ -776,7 +778,7 @@ impl Parser<'_> {
     }
 
     /// Reads the list `sv-libraries` of the library `library` from `entry`: the names with their
-    /// spans, or `None` if it isn't a list.
+    /// spans, or `None` if it isn't a list, or if none of its elements is a string.
     fn library_list(
         &mut self,
         library: &str,
@@ -790,6 +792,7 @@ impl Parser<'_> {
             self.diagnostic(Severity::Error, message, value_span(table, &path));
             return None;
         };
+        let had_names = !names.is_empty();
         let mut listed = Vec::new();
         for (index, name) in names.into_iter().enumerate() {
             let mut path = path.clone();
@@ -803,6 +806,9 @@ impl Parser<'_> {
                 },
             }
         }
+        if listed.is_empty() && had_names {
+            return None;
+        }
         Some(listed)
     }
 
@@ -810,12 +816,15 @@ impl Parser<'_> {
     /// project, `names`, and returns the valid ones.
     ///
     /// `vunit_lib` is a library of every project, also when the configuration doesn't name it.
+    /// A list whose names are all invalid gives `None`, so that the library keeps the libraries
+    /// derived from its files rather than searching none.
     fn sv_libraries(
         &mut self,
         library: &str,
         listed: Vec<ListedLibrary>,
         names: &LibraryNames,
-    ) -> Vec<String> {
+    ) -> Option<Vec<String>> {
+        let had_names = !listed.is_empty();
         let what = format!("'{SV_LIBRARIES}' in [libraries.{library}.options]");
         let mut valid: Vec<String> = Vec::new();
         for (name, span) in listed {
@@ -831,7 +840,11 @@ impl Parser<'_> {
             };
             self.diagnostic(Severity::Error, message, span);
         }
-        valid
+        if valid.is_empty() && had_names {
+            None
+        } else {
+            Some(valid)
+        }
     }
 
     /// Reports the former list `options`, with the table that replaces it; nothing of it is
@@ -1846,6 +1859,28 @@ files = []
                 "vunit_lib".to_owned(),
                 "later".to_owned()
             ])
+        );
+        // A list without a valid name keeps the derived libraries; an empty one searches none.
+        let fallback = parse_str(
+            r#"
+[libraries.a]
+files = []
+options = { sv-libraries = ["typo", "a"] }
+[libraries.b]
+files = []
+options = { sv-libraries = [1] }
+[libraries.c]
+files = []
+options = { sv-libraries = [] }
+"#,
+        );
+        assert_eq!(messages(&fallback).len(), 3);
+        let fallback_spec = fallback.spec.unwrap();
+        assert_eq!(own_options(&fallback_spec, "a").sv_libraries, None);
+        assert_eq!(own_options(&fallback_spec, "b").sv_libraries, None);
+        assert_eq!(
+            own_options(&fallback_spec, "c").sv_libraries,
+            Some(Vec::new())
         );
     }
 

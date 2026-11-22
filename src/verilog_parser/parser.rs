@@ -68,6 +68,7 @@ fn name_of(token: &Token, top: &Arc<Source>) -> SvName {
             .location
             .is_spelled_in(top)
             .then(|| token.location.range.clone()),
+        name_location: None,
     }
 }
 
@@ -134,12 +135,17 @@ pub(crate) fn find_definitions(tokens: &[Token], top: &Arc<Source>) -> Vec<SvDef
         if let Some(kind) = definition_start(tokens, index) {
             if balance == 0 {
                 current = name_index(tokens, index).map(|name| {
-                    let SvName { name, name_range } = name_of(&tokens[name], top);
+                    let SvName {
+                        name,
+                        name_range,
+                        name_location,
+                    } = name_of(&tokens[name], top);
                     SvDefinition {
                         name,
                         kind,
                         parameters: Vec::new(),
                         name_range,
+                        name_location,
                     }
                 });
             }

@@ -11,6 +11,8 @@
 //!   recursively if the pattern reaches into subdirectories. A missing base directory is
 //!   replaced by its closest existing ancestor, watched non-recursively; once the directory is
 //!   created, the project is reloaded and the watched directories are updated;
+//! - every include directory of the project's and the libraries' options, recursively, since an
+//!   `` `include `` may name a subdirectory, with a missing one replaced like a base directory;
 //! - the ancestors of these directories up to the workspace root, non-recursively. A watch ends
 //!   when its directory is deleted, so a directory that is deleted and recreated (for example
 //!   by a branch switch) is only reported by a parent that stays in place. Without it, a
@@ -42,7 +44,8 @@ use notify::event::ModifyKind;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::sources::file_type_of;
+use crate::sources::FileKind;
+use crate::sources::normalize;
 use crate::sources::split_pattern;
 use crate::spec::LibrarySpec;
 use crate::spec::ProjectSpec;
@@ -87,6 +90,20 @@ pub fn watch_targets(
     let mut targets = WatchTargets::new();
     if let Some(parent) = config_file.and_then(Utf8Path::parent) {
         add_existing(&mut targets, parent, false, excluded, root);
+    }
+    let library_include_dirs = spec.libraries.iter().filter_map(|library| match library {
+        LibrarySpec::Sources { options, .. } => options.include_dirs.as_ref(),
+        LibrarySpec::External { .. } => None,
+    });
+    for directory in spec
+        .options
+        .include_dirs
+        .iter()
+        .chain(library_include_dirs)
+        .flatten()
+    {
+        let directory = normalize(&root.join(&directory.path));
+        add_existing(&mut targets, &directory, true, excluded, root);
     }
     for library in &spec.libraries {
         let LibrarySpec::Sources { files, .. } = library else {
@@ -176,7 +193,8 @@ fn add(targets: &mut WatchTargets, dir: &Utf8Path, recursive: bool, excluded: &U
 ///
 /// Accesses are ignored, and so are paths in `excluded` or in a `.git` directory below the
 /// workspace root (the parent of `excluded`), and existing files that aren't HDL files (for
-/// example editor swap files). The paths of a deleted file or directory
+/// example editor swap files); include files and skipped files are HDL files, so a changed
+/// include file is a source change. The paths of a deleted file or directory
 /// can't be checked, so they count as source changes.
 pub fn classify(
     event: &notify::Event,
@@ -205,7 +223,7 @@ pub fn classify(
         {
             continue;
         }
-        if file_type_of(path).is_some() || !path.is_file() {
+        if FileKind::from_path(path).is_some() || !path.is_file() {
             change = Some(Change::Sources);
         }
     }
@@ -432,6 +450,7 @@ mod tests {
     use notify::event::RenameMode;
 
     use super::*;
+    use crate::spec::IncludeDir;
     use crate::test_support::TempRoot as Temp;
 
     fn mkdir(temp: &Temp, rel_path: &str) {
@@ -475,6 +494,34 @@ mod tests {
         assert_eq!(
             targets(&temp, &["src/*.vhd", "src/**/*.vhd"]),
             owned(&[("", false), ("src", true)])
+        );
+    }
+
+    #[test]
+    fn include_directories_are_watched_recursively() {
+        let temp = Temp::new();
+        mkdir(&temp, "src");
+        mkdir(&temp, "inc/sub");
+        mkdir(&temp, "lib_inc");
+        let mut spec = ProjectSpec::new();
+        spec.options.include_dirs = Some(vec![IncludeDir::new("inc"), IncludeDir::new("gone/x")]);
+        spec.add_library("lib", ["src/*.vhd"]);
+        let LibrarySpec::Sources { options, .. } = &mut spec.libraries[0] else {
+            unreachable!();
+        };
+        options.include_dirs = Some(vec![IncludeDir::new("./lib_inc")]);
+        let watched: Vec<_> = watch_targets(&temp.root, &temp.root.join("risim-out"), None, &spec)
+            .into_iter()
+            .map(|(dir, recursive)| (dir.strip_prefix(&temp.root).unwrap().to_string(), recursive))
+            .collect();
+        assert_eq!(
+            watched,
+            owned(&[
+                ("", false),
+                ("inc", true),
+                ("lib_inc", true),
+                ("src", false)
+            ])
         );
     }
 
@@ -548,6 +595,7 @@ mod tests {
         let temp = Temp::new();
         let config = temp.write("risim-config.toml", "");
         let source = temp.write("src/a.vhd", "");
+        let header = temp.write("inc/defs.SVH", "");
         let swap = temp.write("src/.a.vhd.swp", "");
         let output = temp.write("risim-out/state.json", "");
         let git = temp.write(".git/index", "");
@@ -558,6 +606,7 @@ mod tests {
             |kind, paths: &[&Utf8Path]| classify(&event(kind, paths), Some(&config), &excluded);
 
         assert_eq!(classify(modify, &[&source]), Some(Change::Sources));
+        assert_eq!(classify(modify, &[&header]), Some(Change::Sources));
         assert_eq!(classify(modify, &[&source, &config]), Some(Change::Config));
         assert_eq!(
             classify(EventKind::Create(CreateKind::Folder), &[&deleted]),

@@ -4,15 +4,27 @@
 
 //! Libraries, source files and design units, and the dependencies between files.
 //!
-//! A port of `project.py`, `library.py`, `source_file.py` and `design_unit.py`, restricted to
-//! VHDL. Differences from VUnit:
+//! A port of `project.py`, `library.py`, `source_file.py` and `design_unit.py`. Differences
+//! from VUnit:
 //!
 //! - An ambiguous direct entity instantiation is reported as a diagnostic instead of aborting.
 //! - Missing libraries, units and architectures are only logged, as in VUnit.
 //! - A component instantiation matches entities with the component's name in all libraries
 //!   that the file's context clauses make visible, not only in the file's own library. Other
-//!   primary units with that name don't match. See `Project::component_dependencies`.
+//!   primary units with that name don't match, apart from SystemVerilog modules, which a
+//!   component binds to too. See `Project::component_dependencies`.
 //! - Recompilation isn't decided here (see the `compile` module).
+//!
+//! SystemVerilog and Verilog files register their definitions (modules, interfaces, programs,
+//! and primitives) and packages in name spaces of their own, which are case-sensitive
+//! (IEEE 1800 3.13), so an entity and a module of the same name coexist.
+//! Each library with such files searches other libraries for the packages it imports and the
+//! interfaces it uses: those of its `sv-libraries` option, or else those that
+//! [`Project::finish`] derives from the scans, and always `vunit_lib` last
+//! ([`Library::sv_dependencies`]).
+//! Their analysis edges go to imported and referenced packages and used interfaces, searched as
+//! hydrolyze searches them; instances of other definitions and of VHDL entities are
+//! implementation edges only.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -25,12 +37,16 @@ use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 use thiserror::Error;
 
+use crate::builtins;
 use crate::dependency_graph::CircularDependency;
 use crate::dependency_graph::DependencyGraph;
 use crate::diagnostics::Diagnostic;
 use crate::diagnostics::Range;
 use crate::sources::ContentHash;
+use crate::sources::FileKind;
 use crate::spec::Options;
+use crate::verilog_parser::SvDefinitionKind;
+use crate::verilog_parser::SvDesignFile;
 use crate::vhdl_parser::ReferenceType;
 use crate::vhdl_parser::VhdlComponentInstantiation;
 use crate::vhdl_parser::VhdlDesignFile;
@@ -123,23 +139,30 @@ pub struct DesignUnit {
     pub range: Range,
 }
 
-/// A VHDL source file in a library.
+/// A source file in a library: a VHDL, SystemVerilog, or Verilog file.
+///
+/// The VHDL fields stay empty for a SystemVerilog or Verilog file.
 #[derive(Debug, Clone)]
 pub struct SourceFile {
     /// The absolute path.
     pub path: Utf8PathBuf,
     /// The library the file is compiled into.
     pub library: LibraryId,
-    /// The standard the file is compiled with.
+    /// The kind of file: [`FileKind::Vhdl`], [`FileKind::SystemVerilog`], or
+    /// [`FileKind::Verilog`].
+    pub kind: FileKind,
+    /// The standard the file is compiled with, if it is a VHDL file.
     pub vhdl_standard: VhdlStandard,
     /// The hash of the raw file contents.
     pub content_hash: ContentHash,
-    /// The parse result; `None` if the file couldn't be parsed.
+    /// The parse result of a VHDL file; `None` if the file couldn't be parsed.
     pub design_file: Option<Arc<VhdlDesignFile>>,
-    /// Design units, in the order VUnit registers them.
+    /// Design units of a VHDL file, in the order VUnit registers them.
     pub design_units: Vec<DesignUnit>,
-    /// References to other units, with `work` replaced by the file's library.
+    /// References of a VHDL file to other units, with `work` replaced by the file's library.
     pub dependencies: Vec<VhdlReference>,
+    /// The scan of a SystemVerilog or Verilog file.
+    pub sv_file: Option<Arc<SvDesignFile>>,
 }
 
 impl SourceFile {
@@ -170,13 +193,41 @@ pub struct Library {
     /// For a precompiled library, its directory.
     pub external_path: Option<Utf8PathBuf>,
     /// The effective options of the library's files, which give their `risim analyze`
-    /// arguments; the default unless [`Project::set_library_options`] sets them.
+    /// arguments ([`Project::analyze_args`]); the default unless
+    /// [`Project::set_library_options`] sets them.
     pub options: Options,
     files: FxHashMap<Utf8PathBuf, FileId>,
     primary_units: FxHashMap<String, PrimaryUnit>,
     /// Architectures per entity name, in the order they were added.
     architectures: FxHashMap<String, Vec<(String, FileId)>>,
     package_bodies: FxHashMap<String, FileId>,
+    /// Whether the library has SystemVerilog or Verilog files.
+    has_sv: bool,
+    /// The SystemVerilog definitions by name.
+    sv_definitions: FxHashMap<String, (SvDefinitionKind, FileId)>,
+    /// The names of [`sv_definitions`](Self::sv_definitions) by their lowercase form.
+    sv_definition_names: FxHashMap<String, Vec<String>>,
+    /// The SystemVerilog packages by name.
+    sv_packages: FxHashMap<String, FileId>,
+    /// The libraries that the SystemVerilog files search after this one, with the first use
+    /// that added each; set by [`Project::finish`].
+    sv_dependencies: Vec<(LibraryId, SvDependencyUse)>,
+}
+
+/// Why a library is one of the [SystemVerilog dependencies](Library::sv_dependencies) of
+/// another: the first use that added it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SvDependencyUse {
+    /// The library's `sv-libraries` option names it.
+    Listed,
+    /// `import package::…` in a file.
+    Import { file: FileId, package: String },
+    /// `package::name` in a file.
+    PackageReference { file: FileId, package: String },
+    /// The interface `interface` used in a file, as an instance or a port.
+    Interface { file: FileId, interface: String },
+    /// `vunit_lib`, which every library with SystemVerilog or Verilog files searches.
+    VunitLib,
 }
 
 impl Library {
@@ -210,6 +261,50 @@ impl Library {
     /// The ID of the file at `path` in this library.
     pub fn file(&self, path: &Utf8Path) -> Option<FileId> {
         self.files.get(path).copied()
+    }
+
+    /// Whether the library has SystemVerilog or Verilog files.
+    pub const fn has_sv(&self) -> bool {
+        self.has_sv
+    }
+
+    /// The SystemVerilog definition (module, interface, program, or primitive) `name`, which is
+    /// case-sensitive, with the file that defines it.
+    pub fn sv_definition(&self, name: &str) -> Option<(SvDefinitionKind, FileId)> {
+        self.sv_definitions.get(name).copied()
+    }
+
+    /// The file with the SystemVerilog package `name`, which is case-sensitive.
+    pub fn sv_package(&self, name: &str) -> Option<FileId> {
+        self.sv_packages.get(name).copied()
+    }
+
+    /// The libraries that the library's SystemVerilog files search for packages and
+    /// definitions after the library itself, in order, as `risim analyze` gets them
+    /// (`--sv-library`).
+    ///
+    /// They are those of the `sv-libraries` option as written, or else those that the imports,
+    /// package references, and interface uses of the files find in other libraries, in the
+    /// order of their first use; `vunit_lib` comes last in a project with SystemVerilog or
+    /// Verilog files, and isn't repeated.
+    /// Empty for a library without SystemVerilog or Verilog files, and until
+    /// [`Project::finish`].
+    pub fn sv_dependencies(&self) -> impl ExactSizeIterator<Item = LibraryId> + '_ {
+        self.sv_dependencies.iter().map(|&(library, _)| library)
+    }
+
+    /// The files of the SystemVerilog modules whose names equal `name` case-insensitively.
+    fn sv_modules_matching(&self, name: &str) -> impl Iterator<Item = FileId> + '_ {
+        self.sv_definition_names
+            .get(&name.to_ascii_lowercase())
+            .into_iter()
+            .flatten()
+            .filter_map(|name| match self.sv_definitions.get(name) {
+                Some(&(SvDefinitionKind::Module | SvDefinitionKind::Macromodule, file)) => {
+                    Some(file)
+                },
+                _ => None,
+            })
     }
 }
 
@@ -290,6 +385,8 @@ pub struct Project {
     libraries_by_lowercase_name: FxHashMap<String, LibraryId>,
     files: Vec<SourceFile>,
     diagnostics: Vec<Diagnostic>,
+    /// The errors for cycles between SystemVerilog dependencies, among `diagnostics`.
+    sv_cycles: Vec<Diagnostic>,
 }
 
 /// A dependency graph and the problems found while building it.
@@ -345,6 +442,11 @@ impl Project {
             primary_units: FxHashMap::default(),
             architectures: FxHashMap::default(),
             package_bodies: FxHashMap::default(),
+            has_sv: false,
+            sv_definitions: FxHashMap::default(),
+            sv_definition_names: FxHashMap::default(),
+            sv_packages: FxHashMap::default(),
+            sv_dependencies: Vec::new(),
         });
         self.libraries_by_lowercase_name.insert(lowercase, id);
         Ok(id)
@@ -383,12 +485,14 @@ impl Project {
         let file = SourceFile {
             path: path.to_owned(),
             library,
+            kind: FileKind::Vhdl,
             vhdl_standard: vhdl_standard
                 .unwrap_or_else(|| self.libraries[library.index()].vhdl_standard),
             content_hash,
             design_file,
             design_units,
             dependencies,
+            sv_file: None,
         };
         self.register_design_units(id, &file);
         self.libraries[library.index()]
@@ -396,6 +500,347 @@ impl Project {
             .insert(path.to_owned(), id);
         self.files.push(file);
         id
+    }
+
+    /// Adds a SystemVerilog or Verilog file of `kind` to `library` and registers its
+    /// definitions and packages.
+    ///
+    /// `sv_file` is the scan of the file, `None` if it couldn't be scanned. Adding the same path
+    /// to the same library again returns the existing file.
+    pub fn add_sv_file(
+        &mut self,
+        library: LibraryId,
+        path: &Utf8Path,
+        kind: FileKind,
+        content_hash: ContentHash,
+        sv_file: Option<Arc<SvDesignFile>>,
+    ) -> FileId {
+        if let Some(existing) = self.libraries[library.index()].file(path) {
+            return existing;
+        }
+        let id = FileId(id_from_index(self.files.len()));
+        let file = SourceFile {
+            path: path.to_owned(),
+            library,
+            kind,
+            vhdl_standard: self.libraries[library.index()].vhdl_standard,
+            content_hash,
+            design_file: None,
+            design_units: Vec::new(),
+            dependencies: Vec::new(),
+            sv_file,
+        };
+        self.register_sv_names(id, &file);
+        let library = &mut self.libraries[library.index()];
+        library.has_sv = true;
+        library.files.insert(path.to_owned(), id);
+        self.files.push(file);
+        id
+    }
+
+    /// Registers the definitions and packages of an SV file, and warns about duplicates in
+    /// each name space, like [`Self::register_design_units`].
+    fn register_sv_names(&mut self, id: FileId, file: &SourceFile) {
+        let Some(sv_file) = &file.sv_file else {
+            return;
+        };
+        let library = &mut self.libraries[file.library.index()];
+        let mut duplicates = Vec::new();
+        for definition in &sv_file.definitions {
+            let previous = library
+                .sv_definitions
+                .insert(definition.name.clone(), (definition.kind, id));
+            let names = library
+                .sv_definition_names
+                .entry(definition.name.to_ascii_lowercase())
+                .or_default();
+            if !names.contains(&definition.name) {
+                names.push(definition.name.clone());
+            }
+            if let Some((_, previous)) = previous {
+                duplicates.push((
+                    definition.kind.to_string(),
+                    &definition.name,
+                    definition.name_location,
+                    previous,
+                ));
+            }
+        }
+        for package in &sv_file.packages {
+            if let Some(previous) = library.sv_packages.insert(package.name.clone(), id) {
+                duplicates.push((
+                    "package".to_owned(),
+                    &package.name,
+                    package.name_location,
+                    previous,
+                ));
+            }
+        }
+        for (kind, name, location, previous) in duplicates {
+            let previous_path = if previous == id {
+                &file.path
+            } else {
+                &self.files[previous.index()].path
+            };
+            self.diagnostics.push(
+                Diagnostic::warning(format!(
+                    "{kind} '{name}' previously defined in {previous_path}"
+                ))
+                .in_file(&file.path)
+                .at(location),
+            );
+        }
+    }
+
+    /// Completes the project once all files are added: derives the SystemVerilog dependencies
+    /// of the libraries ([`Library::sv_dependencies`]), and reports an error for each cycle
+    /// between them.
+    ///
+    /// Call it once.
+    pub fn finish(&mut self) {
+        let has_sv = self.libraries.iter().any(|library| library.has_sv);
+        let vunit_lib = self.find_library(builtins::VUNIT_LIB);
+        for index in 0..self.libraries.len() {
+            let id = LibraryId(id_from_index(index));
+            let dependencies = if self.libraries[index].has_sv {
+                self.sv_library_dependencies(id, vunit_lib.filter(|_| has_sv))
+            } else {
+                Vec::new()
+            };
+            self.libraries[index].sv_dependencies = dependencies;
+        }
+        for cycle in self.sv_library_cycles() {
+            let diagnostic = self.sv_library_cycle(&cycle);
+            self.sv_cycles.push(diagnostic.clone());
+            self.diagnostics.push(diagnostic);
+        }
+    }
+
+    /// The SystemVerilog dependencies of `library`, with their first use, as
+    /// [`Library::sv_dependencies`] describes them; `vunit_lib` is the library to add last.
+    fn sv_library_dependencies(
+        &self,
+        library: LibraryId,
+        vunit_lib: Option<LibraryId>,
+    ) -> Vec<(LibraryId, SvDependencyUse)> {
+        let mut dependencies: Vec<(LibraryId, SvDependencyUse)> = Vec::new();
+        let mut add = |dependency: LibraryId, first_use: SvDependencyUse| {
+            if dependency != library && !dependencies.iter().any(|&(other, _)| other == dependency)
+            {
+                dependencies.push((dependency, first_use));
+            }
+        };
+        let own = self.library(library);
+        if let Some(listed) = &own.options.sv_libraries {
+            // Unknown names were reported with the configuration.
+            for dependency in listed.iter().filter_map(|name| self.find_library(name)) {
+                add(dependency, SvDependencyUse::Listed);
+            }
+        } else {
+            let package_library = |package: &str| {
+                self.libraries()
+                    .find(|&(other, candidate)| {
+                        other != library && candidate.sv_packages.contains_key(package)
+                    })
+                    .map(|(other, _)| other)
+            };
+            let interface_library = |name: &str| {
+                self.libraries()
+                    .find(|&(other, candidate)| {
+                        other != library
+                            && matches!(
+                                candidate.sv_definitions.get(name),
+                                Some((SvDefinitionKind::Interface, _))
+                            )
+                    })
+                    .map(|(other, _)| other)
+            };
+            for (file_id, file) in self.files() {
+                let Some(sv_file) = file.sv_file.as_deref().filter(|_| file.library == library)
+                else {
+                    continue;
+                };
+                for package in &sv_file.imports {
+                    if !own.sv_packages.contains_key(package)
+                        && let Some(dependency) = package_library(package)
+                    {
+                        let package = package.clone();
+                        add(
+                            dependency,
+                            SvDependencyUse::Import {
+                                file: file_id,
+                                package,
+                            },
+                        );
+                    }
+                }
+                for package in &sv_file.package_references {
+                    if !own.sv_packages.contains_key(package)
+                        && let Some(dependency) = package_library(package)
+                    {
+                        let package = package.clone();
+                        add(
+                            dependency,
+                            SvDependencyUse::PackageReference {
+                                file: file_id,
+                                package,
+                            },
+                        );
+                    }
+                }
+                for name in &sv_file.instances {
+                    if !own.sv_definitions.contains_key(name)
+                        && let Some(dependency) = interface_library(name)
+                    {
+                        add(
+                            dependency,
+                            SvDependencyUse::Interface {
+                                file: file_id,
+                                interface: name.clone(),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        if let Some(vunit_lib) = vunit_lib {
+            add(vunit_lib, SvDependencyUse::VunitLib);
+        }
+        dependencies
+    }
+
+    /// The cycles between the SystemVerilog dependencies of the libraries, each as the libraries
+    /// along it, starting with the first one that the search reached.
+    fn sv_library_cycles(&self) -> Vec<Vec<LibraryId>> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum State {
+            New,
+            OnPath,
+            Done,
+        }
+        fn visit(
+            project: &Project,
+            library: LibraryId,
+            states: &mut [State],
+            path: &mut Vec<LibraryId>,
+            cycles: &mut Vec<Vec<LibraryId>>,
+        ) {
+            states[library.index()] = State::OnPath;
+            path.push(library);
+            for dependency in project.library(library).sv_dependencies() {
+                match states[dependency.index()] {
+                    State::New => visit(project, dependency, states, path, cycles),
+                    State::OnPath => {
+                        if let Some(start) = path.iter().position(|&other| other == dependency) {
+                            cycles.push(path[start..].to_vec());
+                        }
+                    },
+                    State::Done => {},
+                }
+            }
+            path.pop();
+            states[library.index()] = State::Done;
+        }
+        let mut states = vec![State::New; self.libraries.len()];
+        let mut cycles = Vec::new();
+        for (library, _) in self.libraries() {
+            if states[library.index()] == State::New {
+                visit(self, library, &mut states, &mut Vec::new(), &mut cycles);
+            }
+        }
+        cycles
+    }
+
+    /// The error for the cycle `cycle` of [`Self::sv_library_cycles`]: the libraries, and for
+    /// each edge the use or the `sv-libraries` list that formed it.
+    fn sv_library_cycle(&self, cycle: &[LibraryId]) -> Diagnostic {
+        let mut edges = Vec::new();
+        let mut first_file = None;
+        for (index, &library) in cycle.iter().enumerate() {
+            let next = cycle[(index + 1) % cycle.len()];
+            let name = &self.library(library).name;
+            let next_name = &self.library(next).name;
+            let first_use = self
+                .library(library)
+                .sv_dependencies
+                .iter()
+                .find(|&&(dependency, _)| dependency == next)
+                .map(|(_, first_use)| first_use);
+            let file_path = |file: &FileId| self.file(*file).path.as_str();
+            let reason = match first_use {
+                Some(SvDependencyUse::Listed) | None => {
+                    format!("its 'sv-libraries' list names '{next_name}'")
+                },
+                Some(SvDependencyUse::Import { file, package }) => {
+                    first_file.get_or_insert(*file);
+                    format!(
+                        "{} imports package '{package}' of '{next_name}'",
+                        file_path(file)
+                    )
+                },
+                Some(SvDependencyUse::PackageReference { file, package }) => {
+                    first_file.get_or_insert(*file);
+                    format!(
+                        "{} refers to package '{package}' of '{next_name}'",
+                        file_path(file)
+                    )
+                },
+                Some(SvDependencyUse::Interface { file, interface }) => {
+                    first_file.get_or_insert(*file);
+                    format!(
+                        "{} uses interface '{interface}' of '{next_name}'",
+                        file_path(file)
+                    )
+                },
+                Some(SvDependencyUse::VunitLib) => {
+                    format!("it searches '{next_name}' like every SystemVerilog library")
+                },
+            };
+            edges.push(format!(
+                "library '{name}' depends on '{next_name}': {reason}"
+            ));
+        }
+        let names: Vec<&str> = cycle
+            .iter()
+            .chain(cycle.first())
+            .map(|&library| self.library(library).name.as_str())
+            .collect();
+        let diagnostic = Diagnostic::error(format!(
+            "SystemVerilog libraries depend on each other in a cycle, which can't be compiled: \
+             {}; {}; an explicit 'sv-libraries' list in [libraries.NAME.options] breaks the cycle",
+            names.join(" -> "),
+            edges.join("; ")
+        ));
+        match first_file {
+            Some(file) => diagnostic.in_file(&self.file(file).path),
+            None => diagnostic,
+        }
+    }
+
+    /// The errors for cycles between the SystemVerilog dependencies of the libraries, which
+    /// [`Self::finish`] found; they are among [`Self::diagnostics`], too.
+    pub fn sv_library_cycle_errors(&self) -> &[Diagnostic] {
+        &self.sv_cycles
+    }
+
+    /// The `risim analyze` arguments of the files of `library`, from its options.
+    ///
+    /// A library with SystemVerilog or Verilog files gets all of its options, with its
+    /// [SystemVerilog dependencies](Library::sv_dependencies) as `sv-libraries`; any other gets
+    /// only those that apply to VHDL ([`Options::without_sv_keys`]).
+    pub fn analyze_args(&self, library: LibraryId) -> Vec<String> {
+        let library = self.library(library);
+        if !library.has_sv {
+            return library.options.without_sv_keys().analyze_args();
+        }
+        let mut options = library.options.clone();
+        options.sv_libraries = Some(
+            library
+                .sv_dependencies()
+                .map(|dependency| self.library(dependency).name.clone())
+                .collect(),
+        );
+        options.analyze_args()
     }
 
     /// `Library.add_vhdl_design_units`, which warns about duplicate units.
@@ -481,17 +926,21 @@ impl Project {
         &self.files[id.index()]
     }
 
-    /// Warnings about duplicate design units.
+    /// Warnings about duplicate design units, SystemVerilog definitions, and packages, and
+    /// errors for cycles between the SystemVerilog dependencies of libraries.
     pub fn diagnostics(&self) -> &[Diagnostic] {
         &self.diagnostics
     }
 
     /// Builds the dependency graph between files (`Project.create_dependency_graph`).
     ///
+    /// A SystemVerilog file depends on the files of the packages it imports or refers to and of
+    /// the interfaces it uses ([`Self::sv_analysis_dependencies`]).
     /// With `implementation_dependencies`, users of a package also depend on its body, users of
-    /// an entity on all its architectures, and component instantiations on matching entities in
-    /// the visible libraries and their architectures. This is the graph for deciding which files
-    /// a testbench needs.
+    /// an entity on all its architectures, component instantiations on matching entities and
+    /// SystemVerilog modules in the visible libraries, and SystemVerilog instances on the
+    /// definitions and entities they name ([`Self::sv_implementation_dependencies`]). This is
+    /// the graph for deciding which files a testbench needs.
     pub fn dependency_graph(&self, implementation_dependencies: bool) -> DependencyAnalysis {
         let mut analysis = DependencyAnalysis {
             graph: DependencyGraph::new(),
@@ -513,10 +962,16 @@ impl Project {
             for dependency in self.secondary_unit_dependencies(file) {
                 self.add_dependency(&mut analysis.graph, dependency, id);
             }
+            for dependency in self.sv_analysis_dependencies(file) {
+                self.add_dependency(&mut analysis.graph, dependency, id);
+            }
         }
         if implementation_dependencies {
             for (id, file) in self.files() {
                 for dependency in self.component_dependencies(id, file) {
+                    self.add_dependency(&mut analysis.graph, dependency, id);
+                }
+                for dependency in self.sv_implementation_dependencies(file) {
                     self.add_dependency(&mut analysis.graph, dependency, id);
                 }
             }
@@ -645,6 +1100,90 @@ impl Project {
         .in_file(&file.path)
     }
 
+    /// The files that an SV file needs for its analysis: those of the packages it imports or
+    /// refers to, and those of the interfaces it uses, searched in its library and then in the
+    /// library's SystemVerilog dependencies, in order, as hydrolyze searches them.
+    ///
+    /// An instance name counts if the first definition of that name is an interface; the
+    /// scanner can't tell interface ports from instances.
+    fn sv_analysis_dependencies(&self, file: &SourceFile) -> Vec<FileId> {
+        let Some(sv_file) = &file.sv_file else {
+            return Vec::new();
+        };
+        let own = self.library(file.library);
+        let search: Vec<&Library> = std::iter::once(own)
+            .chain(own.sv_dependencies().map(|library| self.library(library)))
+            .collect();
+        let packages = sv_file
+            .imports
+            .iter()
+            .chain(&sv_file.package_references)
+            .filter_map(|package| {
+                search
+                    .iter()
+                    .find_map(|library| library.sv_package(package))
+            });
+        let interfaces = sv_file.instances.iter().filter_map(|name| {
+            match search
+                .iter()
+                .find_map(|library| library.sv_definition(name))
+            {
+                Some((SvDefinitionKind::Interface, interface)) => Some(interface),
+                _ => None,
+            }
+        });
+        packages.chain(interfaces).collect()
+    }
+
+    /// The implementation dependencies of the instances of an SV file
+    /// (`_find_verilog_module_dependencies`): the first definition of each name, searched in the
+    /// file's library, its SystemVerilog dependencies, and then all libraries; and the first
+    /// VHDL entity whose name equals it case-insensitively, searched the same way, with its
+    /// architectures.
+    fn sv_implementation_dependencies(&self, file: &SourceFile) -> Vec<FileId> {
+        let Some(sv_file) = &file.sv_file else {
+            return Vec::new();
+        };
+        if sv_file.instances.is_empty() {
+            return Vec::new();
+        }
+        let own = self.library(file.library);
+        let mut search = vec![file.library];
+        for library in own
+            .sv_dependencies()
+            .chain(self.libraries().map(|(id, _)| id))
+        {
+            if !search.contains(&library) {
+                search.push(library);
+            }
+        }
+        let mut result = Vec::new();
+        for name in &sv_file.instances {
+            if let Some((_, definition)) = search
+                .iter()
+                .find_map(|&library| self.library(library).sv_definition(name))
+            {
+                result.push(definition);
+            }
+            let entity = name.to_ascii_lowercase();
+            if let Some(library) =
+                search
+                    .iter()
+                    .map(|&library| self.library(library))
+                    .find(|library| {
+                        library
+                            .primary_unit(&entity)
+                            .is_some_and(|unit| unit.kind == UnitKind::Entity)
+                    })
+                && let Some(unit) = library.primary_unit(&entity)
+            {
+                result.push(unit.file);
+                result.extend(library.architectures(&entity).iter().map(|&(_, id)| id));
+            }
+        }
+        result
+    }
+
     /// `_find_primary_secondary_design_unit_dependencies`.
     fn secondary_unit_dependencies(&self, file: &SourceFile) -> Vec<FileId> {
         let library = self.library(file.library);
@@ -676,7 +1215,8 @@ impl Project {
     /// the component's simple name (IEEE 1076-2008 §7.3.3 a, b). Their package and library are
     /// visible anyway: `pkg` through a `use` clause, and `lib` through the package reference the
     /// parser adds for `lib.pkg.comp`. Other primary units with the component's name don't
-    /// match.
+    /// match, apart from SystemVerilog modules whose names equal the component's
+    /// case-insensitively, which a component binds to, too.
     fn component_dependencies(&self, file_id: FileId, file: &SourceFile) -> Vec<FileId> {
         let instantiations = file.component_instantiations();
         if instantiations.is_empty() {
@@ -696,6 +1236,9 @@ impl Project {
                     result.push(primary.file);
                     result.extend(library.architectures(component).iter().map(|&(_, id)| id));
                 }
+                let before = result.len();
+                result.extend(library.sv_modules_matching(component));
+                found |= result.len() > before;
             }
             if !found {
                 tracing::debug!(
