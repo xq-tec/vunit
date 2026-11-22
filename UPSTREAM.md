@@ -44,30 +44,30 @@ The `acceptance` test target ports VUnit's `tests/acceptance` (artificial VHDL t
 
 Rust modules are added as the frontend is implemented. Paths are relative to the upstream `vunit/` Python package unless noted.
 
-| Module                      | Ported from                                                         | Responsibility                                                              |
-| --------------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| `config`                    | — (new)                                                             | `risim-config.toml` → `ProjectSpec`, with spans for diagnostics             |
-| `spec`                      | `ui/__init__.py`, `ui/library.py`, `ui/testbench.py` (setters only) | Programmatic `ProjectSpec` (libraries, options, configurations, features)   |
-| `sources`                   | `ui/common.py` (globs), `ostools.py` (file reading), `cached.py`    | Glob expansion, file reading (Latin-1), content hashing, parse cache        |
-| `vhdl_parser`               | `vhdl_parser.py`                                                    | Regex-based design-unit/reference/generic extraction                        |
-| `vhdl_standard`             | `vhdl_standard.py`                                                  | `VhdlStandard` and file-name tags (`2008p`, `93m`, …)                       |
-| `project`                   | `project.py`, `library.py`, `source_file.py`, `design_unit.py`      | Libraries, source files, design units, dependency extraction                |
-| `dependency_graph`          | `dependency_graph.py`                                               | Graph, toposort, dependents/dependencies, cycle reporting                   |
-| `builtins`                  | `builtins.py`                                                       | Selection of VUnit/OSVVM files from the generated table                     |
-| `discovery`                 | `test/bench.py`, `test/bench_list.py`, `test/list.py`               | Testbenches, tests, attributes, pragmas, locations                          |
-| `configuration`             | `configuration.py`                                                  | Configurations (generics, sim options, attributes, VHDL configuration name) |
-| `pattern`                   | `fnmatch` usage in `ui/__init__.py`                                 | Testcase pattern matching                                                   |
-| `simulator`                 | `sim_if/__init__.py`, `sim_if/ghdl.py`, `sim_if/risim_ghdl.py` (\*) | risim-runner command lines and version                                      |
-| `compile`                   | `sim_if/__init__.py` (`compile_source_files`), `project.py`         | Compile set, recompile decision, library scheduling, cancellation           |
-| `runner`                    | `test/suites.py`, `test/runner.py`, `ui/__init__.py` (output paths) | `runner_cfg`, seed, output directories, `vunit_results` parsing, outcomes   |
-| `diagnostics`               | — (new)                                                             | `Diagnostic` type, parsing of the JSON reports of `risim analyze`           |
-| `process`                   | — (new)                                                             | Spawning, output capture, process-tree termination                          |
-| `store`                     | `database.py`, `hashing.py` (replaced)                              | `risim-out/` layout, JSON state files, atomic writes, lock                  |
-| `watch`                     | — (new)                                                             | `notify` watcher, debouncing, change classification                         |
-| `workspace`                 | — (new)                                                             | Per-workspace actor: state, request merging, operations, events             |
-| `runtime`                   | — (new)                                                             | Shared limits, risim-runner detection across workspaces                     |
-| `threads`                   | — (new)                                                             | Thread budget, shares, operation thread cap, leases of simulations          |
-| `verilog_parser` (deferred) | `parsing/verilog/*`                                                 | Deferred                                                                    |
+| Module             | Ported from                                                         | Responsibility                                                                                 |
+| ------------------ | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `config`           | — (new)                                                             | `risim-config.toml` → `ProjectSpec`, with spans for diagnostics                                |
+| `spec`             | `ui/__init__.py`, `ui/library.py`, `ui/testbench.py` (setters only) | Programmatic `ProjectSpec` (libraries, options, configurations, features)                      |
+| `sources`          | `ui/common.py` (globs), `ostools.py` (file reading), `cached.py`    | Glob expansion, file reading (Latin-1), content hashing, parse cache                           |
+| `vhdl_parser`      | `vhdl_parser.py`                                                    | Regex-based design-unit/reference/generic extraction                                           |
+| `vhdl_standard`    | `vhdl_standard.py`                                                  | `VhdlStandard` and file-name tags (`2008p`, `93m`, …)                                          |
+| `project`          | `project.py`, `library.py`, `source_file.py`, `design_unit.py`      | Libraries, source files, design units, dependency extraction                                   |
+| `dependency_graph` | `dependency_graph.py`                                               | Graph, toposort, dependents/dependencies, cycle reporting                                      |
+| `builtins`         | `builtins.py`                                                       | Selection of VUnit/OSVVM files from the generated table                                        |
+| `discovery`        | `test/bench.py`, `test/bench_list.py`, `test/list.py`               | Testbenches, tests, attributes, pragmas, locations                                             |
+| `configuration`    | `configuration.py`                                                  | Configurations (generics, sim options, attributes, VHDL configuration name)                    |
+| `pattern`          | `fnmatch` usage in `ui/__init__.py`                                 | Testcase pattern matching                                                                      |
+| `simulator`        | `sim_if/__init__.py`, `sim_if/ghdl.py`, `sim_if/risim_ghdl.py` (\*) | risim-runner command lines and version                                                         |
+| `compile`          | `sim_if/__init__.py` (`compile_source_files`), `project.py`         | Compile set, recompile decision, library scheduling, cancellation                              |
+| `runner`           | `test/suites.py`, `test/runner.py`, `ui/__init__.py` (output paths) | `runner_cfg`, seed, output directories, `vunit_results` parsing, outcomes                      |
+| `diagnostics`      | — (new)                                                             | `Diagnostic` type, parsing of the JSON reports of `risim analyze`                              |
+| `process`          | — (new)                                                             | Spawning, output capture, process-tree termination                                             |
+| `store`            | `database.py`, `hashing.py` (replaced)                              | `risim-out/` layout, JSON state files, atomic writes, lock                                     |
+| `watch`            | — (new)                                                             | `notify` watcher, debouncing, change classification                                            |
+| `workspace`        | — (new)                                                             | Per-workspace actor: state, request merging, operations, events                                |
+| `runtime`          | — (new)                                                             | Shared limits, risim-runner detection across workspaces                                        |
+| `threads`          | — (new)                                                             | Thread budget, shares, operation thread cap, leases of simulations                             |
+| `verilog_parser`   | `parsing/verilog/*`, `parsing/tokenizer.py`                         | Token-level preprocessing and scanning of SV design elements, imports, instances, and includes |
 
 (\*) Only on the fork's `risim` branch, which held the Python risim-ghdl support.
 
@@ -94,6 +94,13 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - Library directories are `risim-out/libraries/<lowercase library name>`, each with the archive `<lowercase library name>.hlib`.
 - The VHDL parser skips enumeration, record and array types, which VUnit only uses for com codec generation. Word boundaries (`\b`) only treat ASCII characters as word characters.
 - The files of a user library named `vunit_lib` are added to the VUnit library, like `ui.library("vunit_lib").add_source_files(…)`; a precompiled library can't be named `vunit_lib`. A user library named `osvvm` replaces the builtin OSVVM library, with a warning. Library names, including `work`, are compared case-insensitively.
+- The scanner of SystemVerilog and Verilog files (`verilog_parser`) has no parse cache, and deviates from `parsing/verilog/*` in these points:
+  - A quoted `` `include `` searches the directory of the including file first, then the include directories, as hydrolyze does; upstream searches the directory of the top file, then the include directories.
+  - Interfaces, programs, primitives, and `macromodule` are definitions too.
+  - Upstream uses one keyword set for all files; the scanner has a second one (`KeywordSet::Verilog1364`), with the keywords of IEEE 1364-2005, for Verilog files (`.v`, `.vo`) and `keywords = "1364-…"`, in which SystemVerilog-only keywords such as `package`, `import`, and `interface` are identifiers.
+  - The scan returns the macros at the end of the file, so that a library that is one compilation unit (`compilation-unit = "library"`) carries them into its next file.
+  - `` `resetall `` doesn't undefine macros (IEEE 1800 22.3), a default of a formal argument may have several tokens and white space around `=`, and an empty actual argument takes the default (IEEE 1800 22.5.1).
+  - `import a::x, b::y;` imports `b` too, a package reference `p::x` right after an identifier is found, `name.modport port` is an instance of `name`, and a few inputs on which upstream raises an uncaught exception are skipped instead.
 - The include directories and macros of SystemVerilog and Verilog files are options of the project or of a library (`include-dirs` and `defines` of `[options]` and `[libraries.NAME.options]`), not of each file (`add_source_file(…, include_dirs=…, defines=…)`), since `risim analyze` takes them per call.
 - com is always added from VHDL-2008 on, and left out for older standards instead of raising an error.
 - In file patterns, `*` also matches hidden files, and `risim-out/` and `.git/` directories are never searched. Files with unknown extensions are skipped with a warning instead of raising an error.
