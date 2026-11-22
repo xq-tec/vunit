@@ -6,8 +6,10 @@
 //!
 //! The files are embedded at build time (see `build.rs`). [`select`] ports the selection
 //! logic of `builtins.py` for risim, which supports context declarations and package
-//! generics, but not VHDL-2019 call paths or a vendor coverage API. [`extract`] writes the
-//! files to disk so they can be compiled.
+//! generics, but not VHDL-2019 call paths or a vendor coverage API.
+//! For OSVVM, it ports `builtins.py` as it was before upstream moved OSVVM into its
+//! `vunit-osvvm` package (`UPSTREAM.md`).
+//! [`extract`] writes the files to disk so they can be compiled.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 

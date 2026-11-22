@@ -10,7 +10,7 @@ AI NOTICE: Generated, minimally reviewed.
 
 A Rust replacement for the Python frontend of [VUnit](https://github.com/VUnit/vunit), built for the riSim simulator.
 
-This is a fork of VUnit. The VHDL libraries under `vunit/vhdl` (the testbench runner, logging, checks, data types, com, verification components and OSVVM) are unchanged upstream sources, apart from fixes to a few of their testbenches ([`UPSTREAM.md`](UPSTREAM.md)). The Python frontend is replaced by this crate, so existing VUnit testbenches run as they are and need no Python at build time or at runtime.
+This is a fork of VUnit. The VHDL libraries under `vunit/vhdl` (the testbench runner, logging, checks, data types, com, and verification components) are unchanged upstream sources, apart from fixes to a few of their testbenches, and OSVVM 2023.04, which upstream no longer bundles, is a submodule of the fork ([`UPSTREAM.md`](UPSTREAM.md)). The Python frontend is replaced by this crate, so existing VUnit testbenches run as they are and need no Python at build time or at runtime.
 
 ## Scope
 
