@@ -968,12 +968,12 @@ impl Project {
     /// Builds the dependency graph between files (`Project.create_dependency_graph`).
     ///
     /// A SystemVerilog file depends on the files of the packages it imports or refers to and of
-    /// the interfaces it uses ([`Self::sv_analysis_dependencies`]).
+    /// the interfaces it uses (`sv_analysis_dependencies`).
     /// With `implementation_dependencies`, users of a package also depend on its body, users of
     /// an entity on all its architectures, component instantiations on matching entities and
     /// SystemVerilog modules in the visible libraries, and SystemVerilog instances on the
-    /// definitions and entities they name ([`Self::sv_implementation_dependencies`]). This is
-    /// the graph for deciding which files a testbench needs.
+    /// definitions and entities they name (`sv_implementation_dependencies`).
+    /// This is the graph for deciding which files a testbench needs.
     pub fn dependency_graph(&self, implementation_dependencies: bool) -> DependencyAnalysis {
         let mut analysis = DependencyAnalysis {
             graph: DependencyGraph::new(),
