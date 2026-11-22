@@ -30,13 +30,14 @@
 //!   together.
 //! - **Scheduling:** libraries that depend on each other are merged into scheduling units. A
 //!   unit starts once the units it depends on have finished, among them those of the libraries
-//!   that its `--sv-library` arguments name, and units run in parallel. These arguments leave
-//!   out the libraries that have neither files to compile nor a precompiled archive: they have
-//!   nothing for SystemVerilog to find, and maybe no archive to load. Within a unit, files
-//!   compile in compile order. The consecutive files of one library that need compiling compile
-//!   in one batch, one `risim analyze` with all of them, because every call loads and saves the
-//!   archives of the libraries; the reports are mapped back to the files by their locations, a
-//!   report in an include file to the file that includes it.
+//!   that its `--sv-library` arguments and the library clauses of its VHDL files name, and units
+//!   run in parallel. The `--sv-library` arguments leave out the libraries that have neither
+//!   files to compile nor a precompiled archive: they have nothing for SystemVerilog to find, and
+//!   maybe no archive to load. Within a unit, files compile in compile order. The consecutive
+//!   files of one library that need compiling compile in one batch, one `risim analyze` with all
+//!   of them, because every call loads and saves the archives of the libraries; the reports are
+//!   mapped back to the files by their locations, a report in an include file to the file that
+//!   includes it.
 //! - **Failures:** the transitive dependents of a failed file are skipped, also those in the
 //!   batch of the failed file, whose reports are dropped; all other files are still compiled.
 //!   The stored keys of failed and cancelled files and of all their dependents are removed,
@@ -445,8 +446,12 @@ impl CompilePlan {
     ///
     /// A library with SystemVerilog or Verilog files also depends on the libraries of its
     /// [SystemVerilog dependencies](crate::project::Library::sv_dependencies) that have files in
-    /// the plan, because `risim analyze` loads their archives (`--sv-library`). These edges
-    /// order the units only: they don't make files depend on each other.
+    /// the plan, because `risim analyze` loads their archives (`--sv-library`).
+    /// A library also depends on the other libraries with files in the plan that the library
+    /// clauses of its VHDL files in the plan name, because a library clause needs the library's
+    /// archive, also when no reference makes a file depend on a file of it, such as a component
+    /// bound to a SystemVerilog module.
+    /// These edges order the units only: they don't make files depend on each other.
     fn schedule(&mut self, project: &Project) {
         let mut libraries: Vec<LibraryId> = Vec::new();
         let mut library_index: FxHashMap<LibraryId, usize> = FxHashMap::default();
@@ -462,8 +467,9 @@ impl CompilePlan {
             })
             .collect();
 
-        // The libraries each library's `--sv-library` arguments name, among those of the plan.
-        let sv_dependencies: Vec<Vec<usize>> = libraries
+        // The libraries each library's `--sv-library` arguments and the library clauses of its
+        // VHDL files name, among those of the plan.
+        let mut library_dependencies: Vec<Vec<usize>> = libraries
             .iter()
             .map(|&library| {
                 project
@@ -473,6 +479,20 @@ impl CompilePlan {
                     .collect()
             })
             .collect();
+        for (file, &library) in self.files.iter().zip(&library_of) {
+            // `work` is the file's own library.
+            for name in project.file(file.id).library_clauses() {
+                if name != "work"
+                    && let Some(&dependency) = project
+                        .find_library(name)
+                        .and_then(|id| library_index.get(&id))
+                    && dependency != library
+                    && !library_dependencies[library].contains(&dependency)
+                {
+                    library_dependencies[library].push(dependency);
+                }
+            }
+        }
         let mut library_graph = DependencyGraph::new();
         for library in 0..libraries.len() {
             library_graph.add_node(library);
@@ -484,7 +504,7 @@ impl CompilePlan {
                 }
             }
         }
-        for (library, dependencies) in sv_dependencies.iter().enumerate() {
+        for (library, dependencies) in library_dependencies.iter().enumerate() {
             for &dependency in dependencies {
                 library_graph.add_dependency(dependency, library);
             }
@@ -528,7 +548,7 @@ impl CompilePlan {
                     .map(|&dependency| unit_of_file[dependency]);
                 let library_dependencies = files
                     .iter()
-                    .flat_map(|&file| &sv_dependencies[library_of[file]])
+                    .flat_map(|&file| &library_dependencies[library_of[file]])
                     .filter_map(|&library| unit_of_library[library]);
                 let dependencies: BTreeSet<usize> = file_dependencies
                     .chain(library_dependencies)

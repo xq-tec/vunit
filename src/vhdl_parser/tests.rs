@@ -252,6 +252,24 @@ package new_pkg is new lib.pkg;
 }
 
 #[test]
+fn library_clauses_are_found_in_order_without_duplicates() {
+    let design_file = parse(
+        "
+library IEEE;
+library lib1,Lib2 , lib3 ;
+-- library commented;
+library lib1;
+library work;
+use lib4.pkg.all;
+",
+    );
+    assert_eq!(
+        design_file.library_clauses,
+        ["ieee", "lib1", "lib2", "lib3", "work"]
+    );
+}
+
+#[test]
 fn references_are_lowercase() {
     let design_file = parse("use Lib.Pkg.All;");
     assert_eq!(

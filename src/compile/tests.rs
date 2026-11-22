@@ -458,6 +458,42 @@ fn sv_libraries_are_scheduled_first() {
     assert_eq!(plan.unit_dependencies, [vec![], vec![0]]);
 }
 
+/// A library is scheduled after the libraries that the library clauses of its VHDL files name,
+/// also when none of its files depends on theirs: here a component that a SystemVerilog module
+/// binds to, which is only an implementation dependency.
+#[test]
+fn libraries_of_library_clauses_are_scheduled_first() {
+    let mut fixture = Fixture::new();
+    fixture.library("tb").library("rtl");
+    let tb = fixture.add(
+        "tb",
+        "tb_counter.vhd",
+        "library rtl, work;\n\
+         entity tb_counter is generic (runner_cfg : string); end entity;\n\
+         architecture tb of tb_counter is\n\
+         component counter is end component;\n\
+         begin\n  dut : component counter;\nend architecture;",
+    );
+    let counter = fixture.temp.root.join("counter.sv");
+    add_sv(
+        &mut fixture.project,
+        "rtl",
+        &counter,
+        "module counter;\nendmodule\n",
+    );
+    fixture.project.finish();
+    let discovery = crate::discovery::discover(&fixture.project, &[]);
+    let targets = targets(&fixture.project, &discovery);
+    assert!(targets.contains(&tb));
+    let plan = fixture.plan(&targets, &CompileState::default());
+    // The files don't depend on each other, and compile in the order they were added, but
+    // `tb`'s unit waits for `rtl`'s.
+    assert_eq!(names(&plan), ["tb_counter.vhd", "counter.sv"]);
+    assert!(plan.files().iter().all(|file| file.dependencies.is_empty()));
+    assert_eq!(plan.units(), [vec![0], vec![1]]);
+    assert_eq!(plan.unit_dependencies, [vec![1], vec![]]);
+}
+
 /// The members of a `library`-mode library's group follow each other in collection order, share
 /// one key and their dependencies, and form one batch.
 #[test]

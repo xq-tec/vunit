@@ -5,8 +5,9 @@
 //! Regex-based extraction of design units and references from VHDL source files.
 //!
 //! A port of `vhdl_parser.py`. Like VUnit, the parser doesn't understand VHDL; it finds
-//! design units, generics, ports, references and component instantiations with regular
-//! expressions on the source text after comments are blanked out and the text is lowercased.
+//! design units, generics, ports, references, component instantiations, and library clauses
+//! with regular expressions on the source text after comments are blanked out and the text is
+//! lowercased. Library clauses are riSim's addition: they order the compile of libraries.
 //!
 //! Source files are Latin-1 (VUnit's `HDL_FILE_ENCODING`), so the regular expressions run on
 //! bytes with Unicode disabled, and offsets are byte offsets. `\w` and `\s` are expanded to the
@@ -68,6 +69,9 @@ pub struct VhdlDesignFile {
     pub configurations: Vec<VhdlConfiguration>,
     /// References to other design units.
     pub references: Vec<VhdlReference>,
+    /// The lowercase names of the libraries that library clauses name, `work` included, in
+    /// source order and without duplicates.
+    pub library_clauses: Vec<String>,
     /// Test markers, for test discovery if the file contains a testbench architecture.
     pub tests: TestScan,
 }
@@ -230,7 +234,7 @@ pub struct ParseError(String);
 ///
 /// Persistent parse caches with another version are discarded, so increment it whenever the
 /// parser's results change.
-pub const PARSER_VERSION: u32 = 2;
+pub const PARSER_VERSION: u32 = 3;
 
 impl VhdlDesignFile {
     /// Parses the raw (Latin-1) contents of a VHDL file.
@@ -323,6 +327,7 @@ impl VhdlDesignFile {
 
         let mut references = find_references(&code);
         references.extend(component_package_references(&component_instantiations));
+        let library_clauses = find_library_clauses(&code);
 
         Ok(Self {
             entities,
@@ -333,6 +338,7 @@ impl VhdlDesignFile {
             component_instantiations,
             configurations,
             references,
+            library_clauses,
             tests,
         })
     }
@@ -564,6 +570,13 @@ static CONTEXT_START_RE: LazyLock<Regex> =
 static USES_RE: LazyLock<Regex> = LazyLock::new(|| {
     python_regex(
         r"\b(?P<use_type>use|context)\s+(?P<id>(?:<ID>)(\.(?:<ID>)){1,2})(?P<extra>(\s*,\s*(?:<ID>)(\.(?:<ID>)){1,2})*)\s*;",
+        MULTILINE,
+    )
+});
+
+static LIBRARY_CLAUSE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    python_regex(
+        r"\blibrary\s+(?P<ids>(?:<ID>)(?:\s*,\s*(?:<ID>))*)\s*;",
         MULTILINE,
     )
 });
@@ -995,6 +1008,24 @@ fn component_package_references(
         }
     }
     references
+}
+
+/// Returns the libraries that the library clauses of `code` name, in source order and without
+/// duplicates.
+fn find_library_clauses(code: &[u8]) -> Vec<String> {
+    let mut libraries: Vec<String> = Vec::new();
+    for captures in LIBRARY_CLAUSE_RE.captures_iter(code) {
+        for name in group_bytes(&captures, "ids")
+            .split(|&byte| byte == b',')
+            .map(python_strip)
+        {
+            let name = latin1(name);
+            if !libraries.contains(&name) {
+                libraries.push(name);
+            }
+        }
+    }
+    libraries
 }
 
 fn find_references(code: &[u8]) -> Vec<VhdlReference> {

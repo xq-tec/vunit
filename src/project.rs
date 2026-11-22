@@ -176,6 +176,13 @@ impl SourceFile {
             .as_ref()
             .map_or(&[], |design_file| &design_file.component_instantiations)
     }
+
+    /// The libraries that the library clauses of a VHDL file name, lowercase, in source order.
+    pub fn library_clauses(&self) -> &[String] {
+        self.design_file
+            .as_ref()
+            .map_or(&[], |design_file| &design_file.library_clauses)
+    }
 }
 
 /// Where a primary unit is defined.
