@@ -221,6 +221,28 @@ mod tokenizer_tests {
         check("import", &[(Kind::Keyword(Keyword::Import), "import")]);
     }
 
+    /// An unterminated block comment leaves `/` and `*`, and later ones don't search the rest of
+    /// the text again.
+    #[test]
+    fn unterminated_multi_line_comments() {
+        check(
+            "/* a /*",
+            &[
+                (Kind::Other, "/"),
+                (Kind::Other, "*"),
+                (Kind::Whitespace, " "),
+                (Kind::Identifier, "a"),
+                (Kind::Whitespace, " "),
+                (Kind::Other, "/"),
+                (Kind::Other, "*"),
+            ],
+        );
+        let code = "/* ".repeat(300_000);
+        let start = std::time::Instant::now();
+        assert_eq!(tokenize_code(&code).len(), 900_000);
+        assert!(start.elapsed() < std::time::Duration::from_secs(20));
+    }
+
     #[test]
     fn has_location_information() {
         let tokens = tokenize_code("`define foo");
@@ -499,6 +521,43 @@ mod preprocessor_tests {
             .assert_no_log();
     }
 
+    /// Upstream takes the `,` or `)` after `=` for the default; IEEE 1800 22.5.1 allows an empty
+    /// default.
+    #[test]
+    fn preprocess_define_with_empty_default_values() {
+        preprocess("`define foo(a=, b = )a b\nkeep")
+            .assert_has_tokens("keep")
+            .assert_has_defines(&[macro_with(
+                "foo",
+                "a b",
+                &["a", "b"],
+                &[("a", ""), ("b", "")],
+            )])
+            .assert_no_log();
+        preprocess("`define foo(x, y=)x,y\n`foo(1)\n`foo(1, 2)")
+            .assert_has_tokens("1,\n1, 2")
+            .assert_no_log();
+    }
+
+    /// Examples of IEEE 1800 22.5.1: an empty or white-space actual argument takes the default.
+    #[test]
+    fn preprocess_substitute_define_with_empty_actuals() {
+        let macro1 = "`define MACRO1(a=5,b=\"B\",c) $display(a,,b,,c);\n";
+        preprocess(&format!("{macro1}`MACRO1 ( , 2, 3 )"))
+            .assert_has_tokens("$display(5,, 2,, 3 );")
+            .assert_no_log();
+        preprocess(&format!("{macro1}`MACRO1 ( 1 , , 3 )"))
+            .assert_has_tokens("$display( 1 ,,\"B\",, 3 );")
+            .assert_no_log();
+        preprocess(&format!("{macro1}`MACRO1 ( , 2, )"))
+            .assert_has_tokens("$display(5,, 2,, );")
+            .assert_no_log();
+        let macro2 = "`define MACRO2(a=5, b, c=\"C\") $display(a,,b,,c);\n";
+        preprocess(&format!("{macro2}`MACRO2 (, 2)"))
+            .assert_has_tokens("$display(5,, 2,,\"C\");")
+            .assert_no_log();
+    }
+
     #[test]
     fn preprocess_substitute_define_with_space_before_arg() {
         preprocess("`define foo(arg) arg\n`foo (hello)").assert_has_tokens("hello");
@@ -731,7 +790,6 @@ mod preprocessor_tests {
             "`define foo(a",
             "`define foo(a=",
             "`define foo(a=b",
-            "`define foo(a=)",
             r#"`define foo("a""#,
             r#"`define foo("a"="#,
         ] {
@@ -956,6 +1014,71 @@ mod preprocessor_tests {
             );
     }
 
+    /// `ifdef_macro_expression`s of IEEE 1800-2023 22.6; upstream knows only names.
+    #[test]
+    fn ifdef_expressions() {
+        let taken = |condition: &str| {
+            let result = preprocess(&format!(
+                "`define A\n`define B\n`ifdef {condition}\ntaken\n`else\nelse\n`endif"
+            ));
+            result.assert_no_log();
+            kinds_and_values(&result.tokens) == kinds_and_values(&tokenize_code("taken\n"))
+        };
+        assert!(taken("(A)"));
+        assert!(!taken("(C)"));
+        assert!(taken("( !C )"));
+        assert!(!taken("(!!C)"));
+        assert!(taken("(A && B)"));
+        assert!(!taken("(A && C)"));
+        assert!(taken("(C || B)"));
+        assert!(!taken("(A -> C)"));
+        assert!(taken("(C -> C)"));
+        assert!(taken("(C <-> D)"));
+        assert!(!taken("(A <-> D)"));
+        // `!A || B && C` is `(!A) || (B && C)`.
+        assert!(!taken("(!A || B && C)"));
+        // `->` is right associative: `C -> C -> A` is `C -> (C -> A)`.
+        assert!(taken("(C -> C -> A)"));
+        // `A || C -> C` is `(A || C) -> C`.
+        assert!(!taken("(A || C -> C)"));
+        assert!(taken("(!(A && /* c */ C))"));
+        // `ifndef` negates, and `elsif` takes expressions too.
+        preprocess("`define A\n`ifndef (A || B)\nno\n`elsif (A && !B)\nyes\n`endif\nkeep")
+            .assert_has_tokens("yes\nkeep")
+            .assert_no_log();
+    }
+
+    #[test]
+    fn ifdef_bad_expressions() {
+        for (condition, rest) in [
+            ("(A &)", ")"),
+            ("(A & B)", " B)"),
+            ("(A B)", ""),
+            ("()", ""),
+            ("(1)", ")"),
+            ("(A\n)", "\n)"),
+        ] {
+            let result = preprocess(&format!("`ifdef {condition}\nkeep"));
+            result.assert_has_tokens(&format!("{rest}\nkeep"));
+            assert_eq!(
+                result.problems.len(),
+                1,
+                "{condition}: {:?}",
+                result.problems
+            );
+            assert_eq!(result.problems[0].message, "Bad argument to `ifdef");
+            assert_eq!(chain(&result.problems[0].location), ["fn.v:1:("]);
+        }
+        // Parentheses nest at most as deeply as macros.
+        let deep = format!("{}A{}", "(".repeat(300), ")".repeat(300));
+        let result = preprocess(&format!("`ifdef {deep}\nkeep"));
+        assert_eq!(result.problems[0].message, "Bad argument to `ifdef");
+        let chain = format!("(A{})", " -> A".repeat(10_000));
+        preprocess(&format!("`ifdef {chain}\nkeep\n`endif"))
+            .assert_has_tokens("keep\n")
+            .assert_no_log();
+    }
+
     #[test]
     fn undefineall() {
         preprocess("`define foo keep\n`define bar keep2\n`foo\n`undefineall")
@@ -1087,6 +1210,72 @@ mod preprocessor_tests {
     }
 
     #[test]
+    fn too_deep_macros_and_includes_stop() {
+        let mut macros = (1..300)
+            .map(|index| format!("`define m{index} `m{} x\n", index - 1))
+            .collect::<Vec<_>>()
+            .concat();
+        macros.insert_str(0, "`define m0 x\n");
+        macros.push_str("`m299");
+        let expanded = preprocess(&macros);
+        assert_eq!(expanded.problems.len(), 1, "{:?}", expanded.problems);
+        assert_eq!(
+            expanded.problems[0].message,
+            "Macro expansions, includes, and conditional blocks nest too deeply"
+        );
+
+        let files: Vec<(String, String)> = (0..300)
+            .map(|index| {
+                (
+                    format!("/out/f{index}.svh"),
+                    format!("`include \"f{}.svh\"\n", index + 1),
+                )
+            })
+            .collect();
+        let files: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, code)| (path.as_str(), code.as_str()))
+            .collect();
+        let result = preprocess_with("`include \"f0.svh\"", &files, &[]);
+        assert_eq!(result.problems.len(), 1, "{:?}", result.problems);
+        assert_eq!(
+            result.problems[0].message,
+            "Macro expansions, includes, and conditional blocks nest too deeply"
+        );
+    }
+
+    /// Macros that double their text at each level, and includes, stop at a budget of tokens,
+    /// with one problem.
+    #[test]
+    fn exponential_expansion_stops() {
+        let mut code = (1..40)
+            .map(|index| format!("`define m{index} `m{0} `m{0}\n", index - 1))
+            .collect::<Vec<_>>()
+            .concat();
+        code.insert_str(0, "`define m0 x\n");
+        code.push_str("`m39 `m39\n`include \"a.svh\"");
+        let top = source("/out/fn.v", &code);
+        let mut preprocessor = Preprocessor::new(
+            KeywordSet::Sv,
+            &[],
+            Defines::new(),
+            reader(&[("/out/a.svh", "a")]),
+        );
+        preprocessor.budget = 10_000;
+        let tokens = preprocessor.preprocess(tokenize(&top, KeywordSet::Sv, None), &top);
+        assert!(tokens.len() < 10_000);
+        assert!(!tokens.iter().any(|token| token.text() == b"a"));
+        assert!(preprocessor.budget < 2);
+        let problems = &preprocessor.problems;
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(problems[0].severity, Severity::Error);
+        assert_eq!(
+            problems[0].message,
+            "Macro expansions and includes produce too many tokens"
+        );
+    }
+
+    #[test]
     fn too_deep_nesting_stops() {
         let code = format!(
             "{}keep\n{}",
@@ -1198,6 +1387,20 @@ mod parser_tests {
         );
         assert_eq!(definition_names(&design_file), ["foo"]);
         assert_eq!(design_file.definitions[0].parameters, ["param1", "param2"]);
+    }
+
+    /// Upstream takes the type for the name in all but the first of these.
+    #[test]
+    fn parse_parameter_with_complex_type() {
+        let design_file = parse(
+            "module foo #(parameter int unsigned a = 1, parameter logic [W-1:0] b = '0, \
+             parameter p::t c = p::C, parameter type d = int, parameter e [f(1, 2)] = '{0},\
+             parameter g)();\n  parameter [$clog2(N)-1:0] h;\nendmodule\n",
+        );
+        assert_eq!(
+            design_file.definitions[0].parameters,
+            ["a", "b", "c", "d", "e", "g", "h"]
+        );
     }
 
     #[test]

@@ -354,8 +354,9 @@ pub(crate) fn tokenize(
     let contents = &*source.contents;
     let mut tokens = Vec::new();
     let mut position = 0;
+    let mut comments_end = true;
     while position < contents.len() {
-        let (kind, end) = lex(contents, position, keywords);
+        let (kind, end) = lex(contents, position, keywords, &mut comments_end);
         if let Some(kind) = kind {
             tokens.push(Token {
                 kind,
@@ -373,7 +374,15 @@ pub(crate) fn tokenize(
 
 /// Lexes the token at `start` of `contents`, and returns its kind, `None` for an escaped
 /// newline, and its end.
-fn lex(contents: &[u8], start: usize, keywords: KeywordSet) -> (Option<Kind>, usize) {
+///
+/// `comments_end` is `false` once a `/*` had no `*/` after it, so that the lexer doesn't search
+/// the rest of the text again for the next `/*`.
+fn lex(
+    contents: &[u8],
+    start: usize,
+    keywords: KeywordSet,
+    comments_end: &mut bool,
+) -> (Option<Kind>, usize) {
     let first = contents[start];
     let next = contents.get(start + 1).copied();
     let word_end = |from: usize| {
@@ -415,11 +424,11 @@ fn lex(contents: &[u8], start: usize, keywords: KeywordSet) -> (Option<Kind>, us
         },
         _ => {},
     }
-    if first == b'/'
-        && next == Some(b'*')
-        && let Some(offset) = find(&contents[start + 2..], b"*/")
-    {
-        return (Some(Kind::MultiComment), start + 2 + offset + 2);
+    if first == b'/' && next == Some(b'*') && *comments_end {
+        match find(&contents[start + 2..], b"*/") {
+            Some(offset) => return (Some(Kind::MultiComment), start + 2 + offset + 2),
+            None => *comments_end = false,
+        }
     }
     let kind = match first {
         b':' if next == Some(b':') => return (Some(Kind::DoubleColon), start + 2),

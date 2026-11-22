@@ -17,13 +17,17 @@
 //!   include directories, as hydrolyze does; upstream searches the directory of the top file
 //!   and then the include directories.
 //!   Paths are normalized lexically instead of resolved.
-//! - The default of a formal argument may have several tokens and white space around `=`;
-//!   upstream takes the token right after `=`.
+//! - The default of a formal argument may have several tokens and white space around `=`, or be
+//!   empty, as in `(a=, b=)`; upstream takes the token right after `=`, even a `,` or `)`.
 //!   An empty actual argument takes the default (IEEE 1800 22.5.1); upstream leaves it empty.
+//! - The condition of `` `ifdef ``, `` `ifndef ``, and `` `elsif `` may be an
+//!   `ifdef_macro_expression` in parentheses (IEEE 1800-2023 22.6); upstream takes only a name.
 //! - `` `resetall `` doesn't undefine the macros (IEEE 1800 22.3); upstream undefines them.
 //! - Where upstream raises an exception that nobody catches, such as at the end of the file in
 //!   `` `pragma ``, after `` `define NAME `` followed by neither white space nor `(`, or in a
 //!   too deep nesting of macros and includes, the directive is dropped with a problem.
+//!   So are macro calls and includes beyond a budget of tokens, which bounds the work on
+//!   macros that grow exponentially.
 //!
 //! Problems are collected instead of logged; the scanner logs them at debug level, since
 //! hydrolyze reports the real errors.
@@ -55,6 +59,14 @@ use super::tokenizer::tokenize;
 ///
 /// Upstream relies on Python's recursion limit.
 const MAX_DEPTH: usize = 200;
+
+/// How many tokens the macro expansions and included files of one file may produce in total,
+/// counted at each level of nested expansions.
+///
+/// This bounds the work on macros or includes that grow exponentially, such as a chain of
+/// macros that each use the previous one twice.
+/// The UVM package (`uvm_pkg.sv`) takes about 630,000.
+const MAX_TOKENS: usize = 1 << 22;
 
 /// The macros defined at a point of the preprocessing.
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -235,7 +247,9 @@ impl Macro {
             // An empty actual argument takes the default (IEEE 1800 22.5.1).
             for (value, default) in values.iter_mut().zip(&self.defaults) {
                 if let Some(default) = default
-                    && value.iter().all(|item| item.kind == Kind::Whitespace)
+                    && value
+                        .iter()
+                        .all(|item| matches!(item.kind, Kind::Whitespace | Kind::Newline))
                 {
                     value.clone_from(default);
                 }
@@ -342,8 +356,8 @@ type Formals = (Vec<String>, Vec<Option<Vec<Token>>>);
 /// Unlike upstream, which takes the token right after `=` for the default, white space may
 /// surround `=`, and the default runs to the next `,` or `)` outside parentheses, brackets, and
 /// braces, without trailing white space.
-/// Like upstream, the first token after `=` and its white space belongs to the default even if
-/// it is a `,` or `)`.
+/// A default may be empty, as in `(a=, b=)` (IEEE 1800 22.5.1); upstream takes the `,` or `)`
+/// for the default.
 fn parse_formals(lpar: Token, stream: &mut TokenStream) -> Result<Formals, Eof> {
     let mut args = Vec::new();
     let mut defaults = Vec::new();
@@ -356,19 +370,17 @@ fn parse_formals(lpar: Token, stream: &mut TokenStream) -> Result<Formals, Eof> 
             let mut default = None;
             if token.kind == Kind::Equal {
                 stream.skip_while(&[Kind::Whitespace]);
-                let first = stream.pop()?;
-                let mut depth = nesting(first.kind);
-                let mut value = vec![first];
+                let mut depth = 0_i32;
+                let mut value = Vec::new();
                 token = stream.pop()?;
                 while depth > 0 || !matches!(token.kind, Kind::Comma | Kind::RPar) {
                     depth += nesting(token.kind);
                     value.push(token);
                     token = stream.pop()?;
                 }
-                while value.len() > 1
-                    && value
-                        .last()
-                        .is_some_and(|last| last.kind == Kind::Whitespace)
+                while value
+                    .last()
+                    .is_some_and(|last| last.kind == Kind::Whitespace)
                 {
                     value.pop();
                 }
@@ -446,6 +458,8 @@ enum Stop {
     Problem(Problem),
     /// The end of the stream.
     Eof,
+    /// The token budget was exceeded before, which was a problem then.
+    Exhausted,
 }
 
 impl From<Problem> for Stop {
@@ -496,6 +510,10 @@ pub(crate) struct Preprocessor<'a, R> {
     include_trace: Vec<Point>,
     /// How deeply macro expansions, includes, and conditional blocks nest.
     depth: usize,
+    /// How many more tokens macro expansions and included files may produce.
+    pub(crate) budget: usize,
+    /// Whether the budget was exceeded.
+    exhausted: bool,
 }
 
 impl<'a, R> Preprocessor<'a, R>
@@ -520,6 +538,8 @@ where
             macro_trace: Vec::new(),
             include_trace: Vec::new(),
             depth: 0,
+            budget: MAX_TOKENS,
+            exhausted: false,
         }
     }
 
@@ -536,6 +556,7 @@ where
             match self.directive(&token, &mut stream, current) {
                 Ok(output) => result.extend(output),
                 Err(Stop::Problem(problem)) => self.problems.push(problem),
+                Err(Stop::Exhausted) => {},
                 Err(Stop::Eof) => self.problems.push(Problem::warning(
                     format!("EOF reached when parsing `{}", token.value()),
                     &token.location,
@@ -582,7 +603,7 @@ where
             // `resetall doesn't affect macros (IEEE 1800 22.3).
             "resetall" | "celldefine" | "endcelldefine" | "nounconnected_drive" => {},
             name if self.defines.contains(name) => {
-                return Ok(self.expand_macro(token, stream, current)?);
+                return self.expand_macro(token, stream, current);
             },
             _ => {
                 return Err(Problem::debug("Verilog undefined name", &token.location).into());
@@ -605,19 +626,35 @@ where
         Ok(())
     }
 
+    /// Takes `count` tokens of a macro expansion or included file at `token` from the budget.
+    ///
+    /// Only the first failure is a problem.
+    fn spend(&mut self, count: usize, token: &Token) -> Result<(), Stop> {
+        if let Some(rest) = self.budget.checked_sub(count) {
+            self.budget = rest;
+            return Ok(());
+        }
+        if self.exhausted {
+            return Err(Stop::Exhausted);
+        }
+        self.exhausted = true;
+        Err(Problem::error(
+            "Macro expansions and includes produce too many tokens",
+            &token.location,
+        )
+        .into())
+    }
+
     /// Expands the macro call `macro_token`, and preprocesses the expansion.
     fn expand_macro(
         &mut self,
         macro_token: &Token,
         stream: &mut TokenStream,
         current: &Source,
-    ) -> Result<Vec<Token>, Problem> {
+    ) -> Result<Vec<Token>, Stop> {
         let name = macro_token.value();
         let Some(macro_) = self.defines.get(&name).map(Arc::clone) else {
-            return Err(Problem::debug(
-                "Verilog undefined name",
-                &macro_token.location,
-            ));
+            return Err(Problem::debug("Verilog undefined name", &macro_token.location).into());
         };
         let point = Point {
             location: macro_token.location.clone(),
@@ -627,10 +664,12 @@ where
             return Err(Problem::error(
                 format!("Circular macro expansion of {name} detected"),
                 &macro_token.location,
-            ));
+            )
+            .into());
         }
         let previous = Arc::new(macro_token.location.clone());
         let expanded = macro_.expand_from_stream(macro_token, stream, &previous)?;
+        self.spend(expanded.len(), macro_token)?;
         self.enter(macro_token)?;
         self.macro_trace.push(point);
         let tokens = self.preprocess(expanded, current);
@@ -720,14 +759,15 @@ where
             )
             .into());
         }
-        self.enter(token)?;
-        self.include_trace.push(point);
         let source = Arc::new(Source {
             path: Some(path),
             contents,
         });
         let previous = Arc::new(token.location.clone());
         let tokens = tokenize(&source, self.keywords, Some(&previous));
+        self.spend(tokens.len(), token)?;
+        self.enter(token)?;
+        self.include_trace.push(point);
         let tokens = self.preprocess(tokens, &source);
         self.include_trace.pop();
         self.depth -= 1;
@@ -846,11 +886,7 @@ fn if_statement(
     defines: &Defines,
 ) -> Result<Vec<Token>, Stop> {
     let mut result = Vec::new();
-    stream.skip_while(&[Kind::Whitespace]);
-    let arg = stream.pop()?;
-    check_if_argument(if_token, &arg, stream)?;
-
-    let mut taken = is_taken(if_token, &arg, defines);
+    let mut taken = condition(if_token, stream, defines)?;
     let mut any_taken = taken;
     let mut count = 1_usize;
     loop {
@@ -871,16 +907,9 @@ fn if_statement(
             taken = !any_taken;
             any_taken = true;
         } else if count == 1 && next.is_directive("elsif") {
-            stream.skip_while(&[Kind::Whitespace]);
-            let elsif_arg = stream.pop()?;
-            check_if_argument(&next, &elsif_arg, stream)?;
-            stream.skip_while(&[Kind::Newline]);
-            if any_taken {
-                taken = false;
-            } else {
-                taken = is_taken(&next, &elsif_arg, defines);
-                any_taken = taken;
-            }
+            let holds = condition(&next, stream, defines)?;
+            taken = holds && !any_taken;
+            any_taken |= taken;
         } else if taken {
             result.push(next);
         }
@@ -889,32 +918,197 @@ fn if_statement(
     Ok(result)
 }
 
-/// Checks the argument `arg` of the conditional directive `directive`, and skips the newlines
-/// after it.
-fn check_if_argument(
-    directive: &Token,
-    arg: &Token,
-    stream: &mut TokenStream,
-) -> Result<(), Problem> {
-    if arg.kind != Kind::Identifier {
-        return Err(Problem::warning(
+/// Reads the condition of the conditional directive `directive`, skips the newlines after it,
+/// and returns `true` if the branch of the directive is taken.
+///
+/// The condition is a macro name, or an `ifdef_macro_expression` in parentheses (IEEE 1800-2023
+/// 22.6), such as `(A && !(B || C))`; upstream knows only names.
+fn condition(directive: &Token, stream: &mut TokenStream, defines: &Defines) -> Result<bool, Stop> {
+    stream.skip_while(&[Kind::Whitespace]);
+    let arg = stream.pop()?;
+    let bad_argument = || {
+        Problem::warning(
             format!("Bad argument to `{}", directive.value()),
             &arg.location,
-        ));
-    }
+        )
+    };
+    let holds = match arg.kind {
+        Kind::Identifier => defines.contains(&arg.value()),
+        Kind::LPar => condition_operands(stream, defines)?
+            .and_then(|operands| evaluate_condition(&operands))
+            .ok_or_else(bad_argument)?,
+        _ => return Err(bad_argument().into()),
+    };
     stream.skip_while(&[Kind::Newline]);
-    Ok(())
+    Ok(holds != directive.is_directive("ifndef"))
 }
 
-/// Returns `true` if the branch of the conditional directive `directive` with the argument `arg`
-/// is taken.
-fn is_taken(directive: &Token, arg: &Token, defines: &Defines) -> bool {
-    let is_defined = defines.contains(&arg.value());
-    if directive.is_directive("ifndef") {
-        !is_defined
-    } else {
-        is_defined
+/// An operand or operator of an `ifdef_macro_expression`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Condition {
+    /// A macro name, and whether the macro is defined.
+    Name(bool),
+    /// `!`
+    Not,
+    /// `&&`
+    And,
+    /// `||`
+    Or,
+    /// `->`
+    Implies,
+    /// `<->`
+    Equivalent,
+    /// `(`
+    Open,
+    /// `)`
+    Close,
+}
+
+/// Reads an `ifdef_macro_expression` after its `(` up to the matching `)`, and returns its
+/// operands and operators, starting with the `(`.
+///
+/// Returns `None`, without consuming the newline, if the expression has a token that can't be in
+/// it, ends at a newline, or nests parentheses more than [`MAX_DEPTH`] deep.
+fn condition_operands(
+    stream: &mut TokenStream,
+    defines: &Defines,
+) -> Result<Option<Vec<Condition>>, Eof> {
+    /// Pops the next token if it is the punctuation `text`, and returns `true` if it was.
+    fn next_is(stream: &mut TokenStream, text: &[u8]) -> Result<bool, Eof> {
+        let token = stream.pop()?;
+        let is = token.kind == Kind::Other && token.text() == text;
+        if !is {
+            stream.unpop();
+        }
+        Ok(is)
     }
+
+    let mut operands = vec![Condition::Open];
+    let mut depth = 1_usize;
+    while depth > 0 {
+        let token = stream.pop()?;
+        let operand = match token.kind {
+            Kind::Whitespace | Kind::Comment | Kind::MultiComment => continue,
+            Kind::Identifier => Condition::Name(defines.contains(&token.value())),
+            Kind::LPar if depth < MAX_DEPTH => {
+                depth += 1;
+                Condition::Open
+            },
+            Kind::RPar => {
+                depth -= 1;
+                Condition::Close
+            },
+            Kind::Other => match token.text() {
+                b"!" => Condition::Not,
+                b"&" if next_is(stream, b"&")? => Condition::And,
+                b"|" if next_is(stream, b"|")? => Condition::Or,
+                b"-" if next_is(stream, b">")? => Condition::Implies,
+                b"<" if next_is(stream, b"-")? && next_is(stream, b">")? => Condition::Equivalent,
+                _ => return Ok(None),
+            },
+            Kind::Newline => {
+                stream.unpop();
+                return Ok(None);
+            },
+            _ => return Ok(None),
+        };
+        operands.push(operand);
+    }
+    Ok(Some(operands))
+}
+
+/// Evaluates the parenthesized `ifdef_macro_expression` `operands`, or returns `None` if it is
+/// malformed.
+///
+/// The operators bind as in IEEE 1800 11.3.2: `!` most tightly, then `&&`, then `||`, then `->`
+/// and `<->`, which are right associative.
+/// Only parentheses recurse, and [`condition_operands`] limits their nesting.
+fn evaluate_condition(operands: &[Condition]) -> Option<bool> {
+    /// A parser and evaluator of the operands.
+    struct Evaluator<'a> {
+        /// The operands and operators.
+        operands: &'a [Condition],
+        /// The index of the next one.
+        position: usize,
+    }
+
+    impl Evaluator<'_> {
+        /// Returns the next operand or operator.
+        fn peek(&self) -> Option<Condition> {
+            self.operands.get(self.position).copied()
+        }
+
+        /// Evaluates `or { (-> | <->) or }`, right associative.
+        fn implication(&mut self) -> Option<bool> {
+            let mut values = vec![self.or()?];
+            let mut operators = Vec::new();
+            while let Some(operator @ (Condition::Implies | Condition::Equivalent)) = self.peek() {
+                self.position += 1;
+                operators.push(operator);
+                values.push(self.or()?);
+            }
+            let mut value = values.pop()?;
+            while let (Some(operator), Some(left)) = (operators.pop(), values.pop()) {
+                value = if operator == Condition::Implies {
+                    !left || value
+                } else {
+                    left == value
+                };
+            }
+            Some(value)
+        }
+
+        /// Evaluates `and { || and }`.
+        fn or(&mut self) -> Option<bool> {
+            let mut value = self.and()?;
+            while self.peek() == Some(Condition::Or) {
+                self.position += 1;
+                value |= self.and()?;
+            }
+            Some(value)
+        }
+
+        /// Evaluates `unary { && unary }`.
+        fn and(&mut self) -> Option<bool> {
+            let mut value = self.unary()?;
+            while self.peek() == Some(Condition::And) {
+                self.position += 1;
+                value &= self.unary()?;
+            }
+            Some(value)
+        }
+
+        /// Evaluates `{ ! } ( name | ( implication ) )`.
+        fn unary(&mut self) -> Option<bool> {
+            let mut negate = false;
+            while self.peek() == Some(Condition::Not) {
+                self.position += 1;
+                negate = !negate;
+            }
+            let operand = self.peek()?;
+            self.position += 1;
+            let value = match operand {
+                Condition::Name(defined) => defined,
+                Condition::Open => {
+                    let value = self.implication()?;
+                    if self.peek() != Some(Condition::Close) {
+                        return None;
+                    }
+                    self.position += 1;
+                    value
+                },
+                _ => return None,
+            };
+            Some(value != negate)
+        }
+    }
+
+    let mut evaluator = Evaluator {
+        operands,
+        position: 0,
+    };
+    let value = evaluator.unary()?;
+    (evaluator.position == operands.len()).then_some(value)
 }
 
 /// Skips a protected region up to `` `pragma protect end_protected ``.

@@ -99,8 +99,10 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
   - Interfaces, programs, primitives, and `macromodule` are definitions too.
   - Upstream uses one keyword set for all files; the scanner has a second one (`KeywordSet::Verilog1364`), with the keywords of IEEE 1364-2005, for Verilog files (`.v`, `.vo`) and `keywords = "1364-…"`, in which SystemVerilog-only keywords such as `package`, `import`, and `interface` are identifiers.
   - The scan returns the macros at the end of the file, so that a library that is one compilation unit (`compilation-unit = "library"`) carries them into its next file.
-  - `` `resetall `` doesn't undefine macros (IEEE 1800 22.3), a default of a formal argument may have several tokens and white space around `=`, and an empty actual argument takes the default (IEEE 1800 22.5.1).
-  - `import a::x, b::y;` imports `b` too, a package reference `p::x` right after an identifier is found, `name.modport port` is an instance of `name`, and a few inputs on which upstream raises an uncaught exception are skipped instead.
+  - `` `resetall `` doesn't undefine macros (IEEE 1800 22.3), a default of a formal argument may have several tokens and white space around `=` or be empty, and an empty actual argument takes the default (IEEE 1800 22.5.1).
+  - `` `ifdef ``, `` `ifndef ``, and `` `elsif `` also take an expression in parentheses, such as `` `ifdef (A && !B) `` (IEEE 1800-2023 22.6).
+  - `import a::x, b::y;` imports `b` too, a package reference `p::x` right after an identifier is found, `name.modport port` is an instance of `name`, and the name of a parameter is the last identifier before its default, not the type in `parameter int unsigned N`.
+  - A few inputs on which upstream raises an uncaught exception are skipped instead, and macro expansions and includes stop at nesting and token limits.
 - The include directories and macros of SystemVerilog and Verilog files are options of the project or of a library (`include-dirs` and `defines` of `[options]` and `[libraries.NAME.options]`), not of each file (`add_source_file(…, include_dirs=…, defines=…)`), since `risim analyze` takes them per call.
 - com is always added from VHDL-2008 on, and left out for older standards instead of raising an error.
 - In file patterns, `*` also matches hidden files, and `risim-out/` and `.git/` directories are never searched. Files with unknown extensions are skipped with a warning instead of raising an error.

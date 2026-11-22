@@ -22,6 +22,8 @@
 //! - A package reference `p::x` right after an identifier is found; upstream skips it.
 //! - `name.modport port`, an interface port with a modport, is an instance of `name`; upstream
 //!   takes the modport for the instance.
+//! - The name of a parameter is the last identifier of its declaration before its default, not
+//!   the first or second token after `parameter`, which may be the type.
 //! - At the end of the tokens, the finders stop instead of failing.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
@@ -159,19 +161,33 @@ pub(crate) fn find_definitions(tokens: &[Token], top: &Arc<Source>) -> Vec<SvDef
     results
 }
 
+/// How many tokens after `parameter` [`parse_parameter`] looks at.
+const MAX_PARAMETER_TOKENS: usize = 64;
+
 /// Returns the name of the parameter declared at `index`
 /// (upstream's `VerilogModule.parse_parameter`).
 ///
-/// The name is the second token after `parameter` if that is an identifier, else the first.
+/// The name is the last identifier before the first `=`, `,`, `;`, or `)` outside parentheses
+/// and brackets, within [`MAX_PARAMETER_TOKENS`] tokens.
+/// Upstream takes the second token after `parameter` if that is an identifier, else the first,
+/// which gives the type in `parameter int unsigned N`, `parameter logic [7:0] N`, and
+/// `parameter p::t N`.
 fn parse_parameter(tokens: &[Token], index: usize) -> Option<String> {
     if tokens[index].kind != Kind::Keyword(Keyword::Parameter) {
         return None;
     }
-    let name = match tokens.get(index + 2) {
-        Some(token) if token.kind == Kind::Identifier => token,
-        _ => tokens.get(index + 1)?,
-    };
-    name.kind.is_name().then(|| name.value().into_owned())
+    let mut depth = 0_i32;
+    let mut name = None;
+    for token in tokens.iter().skip(index + 1).take(MAX_PARAMETER_TOKENS) {
+        match token.kind {
+            Kind::LPar | Kind::LBracket => depth += 1,
+            Kind::RPar | Kind::RBracket if depth > 0 => depth -= 1,
+            Kind::Equal | Kind::Comma | Kind::SemiColon | Kind::RPar if depth == 0 => break,
+            Kind::Identifier if depth == 0 => name = Some(token),
+            _ => {},
+        }
+    }
+    name.map(|name| name.value().into_owned())
 }
 
 /// Finds the packages (upstream's `VerilogPackage.find`).
