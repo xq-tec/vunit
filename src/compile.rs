@@ -30,7 +30,9 @@
 //!   together.
 //! - **Scheduling:** libraries that depend on each other are merged into scheduling units. A
 //!   unit starts once the units it depends on have finished, among them those of the libraries
-//!   that its `--sv-library` arguments name, and units run in parallel. Within a unit, files
+//!   that its `--sv-library` arguments name, and units run in parallel. These arguments leave
+//!   out the libraries that have neither files to compile nor a precompiled archive: they have
+//!   nothing for SystemVerilog to find, and maybe no archive to load. Within a unit, files
 //!   compile in compile order. The consecutive files of one library that need compiling compile
 //!   in one batch, one `risim analyze` with all of them, because every call loads and saves the
 //!   archives of the libraries; the reports are mapped back to the files by their locations, a
@@ -174,7 +176,8 @@ pub struct PlannedFile {
     pub output_file: Utf8PathBuf,
     library_dir: Utf8PathBuf,
     /// The `risim analyze` arguments of the library ([`Project::analyze_args`]), shared by its
-    /// files.
+    /// files, without the `--sv-library` libraries that have neither files in the plan nor
+    /// precompiled archives.
     analyze_args: Arc<[String]>,
     /// Direct dependencies, as indices into [`CompilePlan::files`].
     dependencies: Vec<usize>,
@@ -348,6 +351,16 @@ impl CompilePlan {
             .enumerate()
             .flat_map(|(group, members)| members.iter().map(move |&member| (member, group)))
             .collect();
+        // `risim analyze` fails on a library of `--sv-library` without an archive. A precompiled
+        // library has one, and a library with files in the plan is compiled first
+        // ([`Self::schedule`]). Any other, which only an `sv-libraries` option can name, may have
+        // none, but it has nothing that SystemVerilog searches for: its SystemVerilog and Verilog
+        // files would be in the plan, and so would an entity that an SV file instantiates.
+        let planned: FxHashSet<LibraryId> =
+            order.iter().map(|&id| project.file(id).library).collect();
+        let searched = |library: LibraryId| {
+            planned.contains(&library) || project.library(library).is_external()
+        };
 
         let mut position = 0;
         while position < order.len() {
@@ -357,11 +370,11 @@ impl CompilePlan {
             position += members.len();
             let file = project.file(id);
             let library = &project.library(file.library).name;
-            let library_args = Arc::clone(
-                analyze_args
-                    .entry(file.library)
-                    .or_insert_with(|| project.analyze_args(file.library).into()),
-            );
+            let library_args = Arc::clone(analyze_args.entry(file.library).or_insert_with(|| {
+                project
+                    .analyze_args_searching(file.library, searched)
+                    .into()
+            }));
             // The dependencies of all members, without those between them.
             let mut dependencies: Vec<usize> = Vec::new();
             for &member in members {

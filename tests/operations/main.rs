@@ -1106,7 +1106,6 @@ async fn detect_rejects_other_programs() {
     }
 }
 
-/// `lib` with a testbench with three explicit tests and one without explicit tests.
 /// The SystemVerilog files compile with the arguments of their library, after `vunit_lib`,
 /// whose `vunit_pkg.sv` the project gets; a VHDL-only library gets no SystemVerilog arguments.
 async fn sv_files_compile_with_their_library_options() {
@@ -1302,6 +1301,7 @@ async fn up_to_date_sv_files_are_not_compiled() {
     assert_eq!(workspace.take_calls(), Vec::<String>::new());
 }
 
+/// `lib` with a testbench with three explicit tests and one without explicit tests.
 fn simulation_project(workspace: &mut Workspace) {
     workspace.write(
         "tb/tb_tests.vhd",

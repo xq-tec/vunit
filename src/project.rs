@@ -844,6 +844,16 @@ impl Project {
     /// [SystemVerilog dependencies](Library::sv_dependencies) as `sv-libraries`; any other gets
     /// only those that apply to VHDL ([`Options::without_sv_keys`]).
     pub fn analyze_args(&self, library: LibraryId) -> Vec<String> {
+        self.analyze_args_searching(library, |_| true)
+    }
+
+    /// [`Self::analyze_args`], with only those SystemVerilog dependencies for which `searched`
+    /// is true as `sv-libraries`.
+    pub fn analyze_args_searching(
+        &self,
+        library: LibraryId,
+        mut searched: impl FnMut(LibraryId) -> bool,
+    ) -> Vec<String> {
         let library = self.library(library);
         if !library.has_sv {
             return library.options.without_sv_keys().analyze_args();
@@ -852,6 +862,7 @@ impl Project {
         options.sv_libraries = Some(
             library
                 .sv_dependencies()
+                .filter(|&dependency| searched(dependency))
                 .map(|dependency| self.library(dependency).name.clone())
                 .collect(),
         );

@@ -277,10 +277,12 @@ fn compile_keys_depend_on_options_and_simulator() {
 fn sv_files_compile_with_their_library_arguments() {
     let mut fixture = Fixture::new();
     fixture.library("vunit_lib").library("pkgs").library("rtl");
-    fixture.add(
+    let vunit_pkg = fixture.temp.root.join("vunit_pkg.sv");
+    add_sv(
+        &mut fixture.project,
         "vunit_lib",
-        "run_pkg.vhd",
-        "package run_pkg is end package;",
+        &vunit_pkg,
+        "package vunit_pkg;\nendpackage\n",
     );
     let pkg_path = fixture.temp.root.join("types_pkg.sv");
     add_sv(
@@ -322,13 +324,19 @@ fn sv_files_compile_with_their_library_arguments() {
 
     let discovery = crate::discovery::discover(&fixture.project, &[]);
     let mut targets = targets(&fixture.project, &discovery);
-    assert_eq!(targets.len(), 3);
+    assert_eq!(targets.len(), 4);
     targets.push(top);
     let plan = fixture.plan(&targets, &CompileState::default());
     assert_eq!(plan.errors, []);
     assert_eq!(
         names(&plan),
-        ["types_pkg.sv", "unused.sv", "counter.sv", "top.vhd"]
+        [
+            "vunit_pkg.sv",
+            "types_pkg.sv",
+            "unused.sv",
+            "counter.sv",
+            "top.vhd"
+        ]
     );
     for (index, file) in plan.files().iter().enumerate() {
         let command = plan.compile_command(&[index]);
@@ -336,19 +344,85 @@ fn sv_files_compile_with_their_library_arguments() {
             .iter()
             .filter_map(|arg| arg.strip_prefix("--sv-library="))
             .collect();
-        if file.library == "rtl" {
-            assert!(command.iter().any(|arg| arg == "--include-dir=/inc"));
-            assert_eq!(sv_libraries, ["pkgs", "vunit_lib"]);
-        } else {
-            assert_eq!(sv_libraries, ["vunit_lib"]);
+        match file.library.as_str() {
+            "rtl" => {
+                assert!(command.iter().any(|arg| arg == "--include-dir=/inc"));
+                assert_eq!(sv_libraries, ["pkgs", "vunit_lib"]);
+            },
+            "pkgs" => assert_eq!(sv_libraries, ["vunit_lib"]),
+            _ => assert_eq!(sv_libraries, Vec::<&str>::new()),
         }
     }
     // A batch of VHDL and SystemVerilog files of one library is one call.
-    let command = plan.compile_command(&[2, 3]);
+    let command = plan.compile_command(&[3, 4]);
     assert_eq!(
         command[command.len() - 2..],
-        [sv_path.as_str(), plan.files()[3].path.as_str()]
+        [sv_path.as_str(), plan.files()[4].path.as_str()]
     );
+}
+
+/// A library that `sv-libraries` names is left out of the `--sv-library` arguments while it has
+/// no files in the plan, since it may have no archive: a VHDL library whose files no testbench
+/// needs, and an empty one.
+#[test]
+fn sv_libraries_without_files_to_compile_are_left_out() {
+    let mut fixture = Fixture::new();
+    fixture
+        .library("vunit_lib")
+        .library("vhdl_lib")
+        .library("empty_lib")
+        .library("rtl");
+    let vunit_pkg = fixture.temp.root.join("vunit_pkg.sv");
+    add_sv(
+        &mut fixture.project,
+        "vunit_lib",
+        &vunit_pkg,
+        "package vunit_pkg;\nendpackage\n",
+    );
+    let pkg = fixture.add("vhdl_lib", "pkg.vhd", PKG);
+    let module = fixture.temp.root.join("m.sv");
+    add_sv(
+        &mut fixture.project,
+        "rtl",
+        &module,
+        "module m;\nendmodule\n",
+    );
+    let rtl = fixture.project.find_library("rtl").unwrap();
+    fixture.project.set_library_options(
+        rtl,
+        Options {
+            sv_libraries: Some(vec!["vhdl_lib".to_owned(), "empty_lib".to_owned()]),
+            ..Options::default()
+        },
+    );
+    fixture.project.finish();
+    let sv_libraries = |args: &[String]| -> Vec<String> {
+        args.iter()
+            .filter_map(|arg| arg.strip_prefix("--sv-library="))
+            .map(str::to_owned)
+            .collect()
+    };
+    // The language server searches all of them.
+    assert_eq!(
+        sv_libraries(&fixture.project.analyze_args(rtl)),
+        ["vhdl_lib", "empty_lib", "vunit_lib"]
+    );
+
+    let discovery = crate::discovery::discover(&fixture.project, &[]);
+    let mut targets = targets(&fixture.project, &discovery);
+    let plan = fixture.plan(&targets, &CompileState::default());
+    assert_eq!(names(&plan), ["vunit_pkg.sv", "m.sv"]);
+    assert_eq!(sv_libraries(&plan.compile_command(&[1])), ["vunit_lib"]);
+
+    targets.push(pkg);
+    let with_pkg = fixture.plan(&targets, &CompileState::default());
+    assert_eq!(names(&with_pkg), ["vunit_pkg.sv", "pkg.vhd", "m.sv"]);
+    assert_eq!(
+        sv_libraries(&with_pkg.compile_command(&[2])),
+        ["vhdl_lib", "vunit_lib"]
+    );
+    // `rtl` waits for `vhdl_lib`, whose archive it loads.
+    assert_eq!(with_pkg.unit_dependencies[2], [0, 1]);
 }
 
 /// A library is scheduled after the libraries that its `--sv-library` arguments name, here
