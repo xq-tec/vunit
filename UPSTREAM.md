@@ -8,53 +8,66 @@ AI NOTICE: Generated, minimally reviewed.
 
 # Upstream sync
 
-The VHDL and Verilog trees match upstream VUnit commit `44736ccfb1a89ffdc53638a2bc42a33e9f02eb46` (`Start of next release candidate 5.0.0.dev14`, 2026-09-26).
+The VHDL and Verilog trees match upstream VUnit commit `5d6ff35471fcd9e1441aadbc4717358c6b558984` (`fix(docs): sort release notes by version`, 2026-11-16).
 
 The fork adds `2ad0add1c51798c4c7d117e585125221ea337ff7`, which rewrites the OSVVM submodule URL from the relative `../../OSVVM/OSVVM.git` to `https://github.com/OSVVM/OSVVM`. Keep that URL on later syncs.
+
+Upstream has removed OSVVM as a submodule in favor of its separate `vunit-osvvm` package (`b8da9ecf`).
+The fork embeds OSVVM in its builtins (`build.rs`, `builtins.rs`), so it keeps the submodule `vunit/vhdl/osvvm` at OSVVM 2023.04 (`2104430dbbd2c7c1fff2ee02e1996944c59b62c2`), its entry in `.gitmodules`, and the OSVVM paragraph of `LICENSE.rst`.
+The selection of the OSVVM files in `builtins.rs` ports `_add_osvvm` of `vunit/builtins.py` as it was before `b8da9ecf`.
 
 The fork also fixes seven testcases of `vunit/vhdl/verification_components/test` (`tb_axi_read_slave.vhd`, `tb_axi_write_slave.vhd`, `tb_axi_stream_protocol_checker.vhd`). Each called `check_only_log` in the same delta cycle in which a process of the verification component logs the expected item to the mocked logger, so it passed only when the simulator resumed that process first (§ 14.7.5.3 leaves the order open). They now wait one delta cycle for the item first (`wait until mock_queue_length > 0 for 0 ns;`), like their sibling testcases, and still fail when nothing is logged. Keep these fixes on later syncs until upstream has them.
 
 ## Sync procedure
 
 1. Merge upstream `master` into the fork.
-2. Keep `vunit/vhdl/**` and `vunit/verilog/**` from upstream, including their unused `run.py` and `tools/*.py` files, except for the testbench fixes above.
+2. Keep `vunit/vhdl/**` and `vunit/verilog/**` from upstream, including their unused `run.py` and `tools/*.py` files, except for the testbench fixes and the OSVVM submodule above.
 3. Resolve conflicts on deleted files (the Python package outside `vunit/vhdl` and `vunit/verilog`, the Python tests, `docs/`, `examples/`, `tools/`, `setup.py`, `pyproject.toml` and the Python workflows) by keeping the deletion. Keep this fork's `README.md`, `.gitignore` and `.github/workflows/ci.yml`.
+   Files that upstream adds outside `vunit/vhdl` and `vunit/verilog` don't conflict, or are moved by git's directory rename detection (for example from `tests/unit/` to the root), so delete them too, wherever they land.
+   Keep the OSVVM submodule, `.gitmodules`, and the OSVVM paragraph of `LICENSE.rst` (see above).
+   Since the merge of `b8da9ecf`, merges keep them unless upstream changes these paths again.
+   If a merge changes `LICENSE.rst`, keep upstream's changes together with the OSVVM paragraph; if it deletes `.gitmodules` or the gitlink, restore them:
+
+   ```bash
+   git checkout HEAD -- .gitmodules
+   git update-index --add --cacheinfo 160000,2104430dbbd2c7c1fff2ee02e1996944c59b62c2,vunit/vhdl/osvvm
+   ```
 4. Review `git diff <recorded>..<new> -- vunit/*.py vunit/**/*.py` for logic to port, using the mapping below. Review the changes to `vunit/vhdl/*/run.py` and `tests/acceptance/test_artificial.py` too, and update their translations in `tests/acceptance/`.
 5. Run the acceptance tests with `RISIM_RUNNER` and `RISIM_ANALYZER` set, and update the expected failures and the risim deviations.
 6. Update the recorded commit in this file.
 
 ## Tests
 
-The `acceptance` test target ports VUnit's `tests/acceptance` (artificial VHDL testbenches and the package body dependency test) and the `run.py` of every VUnit VHDL library with a test directory. It leaves out what needs unsupported features: Verilog, `add_package`, test history, the check and location preprocessors, com codec generation, and the testbenches that `run.py` generates with Python. The expected outcomes follow VUnit, adapted to the deviations below; `tests/acceptance/vhdl_libraries.rs` lists the tests that fail only because every test runs in its own simulation.
+The `acceptance` test target ports VUnit's `tests/acceptance` (artificial VHDL testbenches and the package body dependency test) and the `run.py` of every VUnit VHDL library with a test directory. Verilog's acceptance testbenches (`tests/acceptance/artificial/verilog`) are compiled only, since riSim doesn't simulate SystemVerilog yet. It leaves out what needs unsupported features: simulating Verilog, `add_package`, test history, the check and location preprocessors, com codec generation, and the testbenches that `run.py` generates with Python. The expected outcomes follow VUnit, adapted to the deviations below; `tests/acceptance/vhdl_libraries.rs` lists the tests that fail only because every test runs in its own simulation.
 
 ## Module mapping
 
 Rust modules are added as the frontend is implemented. Paths are relative to the upstream `vunit/` Python package unless noted.
 
-| Module                      | Ported from                                                         | Responsibility                                                              |
-| --------------------------- | ------------------------------------------------------------------- | --------------------------------------------------------------------------- |
-| `config`                    | — (new)                                                             | `risim-config.toml` → `ProjectSpec`, with spans for diagnostics             |
-| `spec`                      | `ui/__init__.py`, `ui/library.py`, `ui/testbench.py` (setters only) | Programmatic `ProjectSpec` (libraries, options, configurations, features)   |
-| `sources`                   | `ui/common.py` (globs), `ostools.py` (file reading), `cached.py`    | Glob expansion, file reading (Latin-1), content hashing, parse cache        |
-| `vhdl_parser`               | `vhdl_parser.py`                                                    | Regex-based design-unit/reference/generic extraction                        |
-| `vhdl_standard`             | `vhdl_standard.py`                                                  | `VhdlStandard` and file-name tags (`2008p`, `93m`, …)                       |
-| `project`                   | `project.py`, `library.py`, `source_file.py`, `design_unit.py`      | Libraries, source files, design units, dependency extraction                |
-| `dependency_graph`          | `dependency_graph.py`                                               | Graph, toposort, dependents/dependencies, cycle reporting                   |
-| `builtins`                  | `builtins.py`                                                       | Selection of VUnit/OSVVM files from the generated table                     |
-| `discovery`                 | `test/bench.py`, `test/bench_list.py`, `test/list.py`               | Testbenches, tests, attributes, pragmas, locations                          |
-| `configuration`             | `configuration.py`                                                  | Configurations (generics, sim options, attributes, VHDL configuration name) |
-| `pattern`                   | `fnmatch` usage in `ui/__init__.py`                                 | Testcase pattern matching                                                   |
-| `simulator`                 | `sim_if/__init__.py`, `sim_if/ghdl.py`, `sim_if/risim_ghdl.py` (\*) | risim-runner command lines and version                                      |
-| `compile`                   | `sim_if/__init__.py` (`compile_source_files`), `project.py`         | Compile set, recompile decision, library scheduling, cancellation           |
-| `runner`                    | `test/suites.py`, `test/runner.py`, `ui/__init__.py` (output paths) | `runner_cfg`, seed, output directories, `vunit_results` parsing, outcomes   |
-| `diagnostics`               | — (new)                                                             | `Diagnostic` type, parsing of the JSON reports of `risim analyze`           |
-| `process`                   | — (new)                                                             | Spawning, output capture, process-tree termination                          |
-| `store`                     | `database.py`, `hashing.py` (replaced)                              | `risim-out/` layout, JSON state files, atomic writes, lock                  |
-| `watch`                     | — (new)                                                             | `notify` watcher, debouncing, change classification                         |
-| `workspace`                 | — (new)                                                             | Per-workspace actor: state, request merging, operations, events             |
-| `runtime`                   | — (new)                                                             | Shared limits, risim-runner detection across workspaces                     |
-| `threads`                   | — (new)                                                             | Thread budget, shares, operation thread cap, leases, held simulators        |
-| `verilog_parser` (deferred) | `parsing/verilog/*`                                                 | Deferred                                                                    |
+| Module             | Ported from                                                         | Responsibility                                                                                 |
+| ------------------ | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| `config`           | — (new)                                                             | `risim-config.toml` → `ProjectSpec`, with spans for diagnostics                                |
+| `spec`             | `ui/__init__.py`, `ui/library.py`, `ui/testbench.py` (setters only) | Programmatic `ProjectSpec` (libraries, options, configurations, features)                      |
+| `sources`          | `ui/common.py` (globs), `ostools.py` (file reading), `cached.py`    | Glob expansion, file kinds, content hashing, parse cache, SystemVerilog scan cache             |
+| `vhdl_parser`      | `vhdl_parser.py`                                                    | Regex-based design-unit/reference/generic extraction                                           |
+| `vhdl_standard`    | `vhdl_standard.py`                                                  | `VhdlStandard` and file-name tags (`2008p`, `93m`, …)                                          |
+| `project`          | `project.py`, `library.py`, `source_file.py`, `design_unit.py`      | Libraries, source files, design units, dependency extraction                                   |
+| `dependency_graph` | `dependency_graph.py`                                               | Graph, toposort, dependents/dependencies, cycle reporting                                      |
+| `builtins`         | `builtins.py`                                                       | Selection of VUnit/OSVVM VHDL files and the Verilog builtins from the generated table          |
+| `discovery`        | `test/bench.py`, `test/bench_list.py`, `test/list.py`               | Testbenches, tests, attributes, pragmas, locations                                             |
+| `configuration`    | `configuration.py`                                                  | Configurations (generics, sim options, attributes, VHDL configuration name)                    |
+| `pattern`          | `fnmatch` usage in `ui/__init__.py`                                 | Testcase pattern matching                                                                      |
+| `simulator`        | `sim_if/__init__.py`, `sim_if/ghdl.py`, `sim_if/risim_ghdl.py` (\*) | risim-runner command lines and version                                                         |
+| `compile`          | `sim_if/__init__.py` (`compile_source_files`), `project.py`         | Compile set, recompile decision, library scheduling, cancellation                              |
+| `runner`           | `test/suites.py`, `test/runner.py`, `ui/__init__.py` (output paths) | `runner_cfg`, seed, output directories, `vunit_results` parsing, outcomes                      |
+| `diagnostics`      | — (new)                                                             | `Diagnostic` type, parsing of the JSON reports of `risim analyze`                              |
+| `process`          | — (new)                                                             | Spawning, output capture, process-tree termination                                             |
+| `store`            | `database.py`, `hashing.py` (replaced)                              | `risim-out/` layout, JSON state files, atomic writes, lock                                     |
+| `watch`            | — (new)                                                             | `notify` watcher, debouncing, change classification                                            |
+| `workspace`        | — (new)                                                             | Per-workspace actor: state, request merging, operations, events                                |
+| `runtime`          | — (new)                                                             | Shared limits, risim-runner detection across workspaces                                        |
+| `threads`          | — (new)                                                             | Thread budget, shares, operation thread cap, leases, held simulators                           |
+| `verilog_parser`   | `parsing/verilog/*`, `parsing/tokenizer.py`                         | Token-level preprocessing and scanning of SV design elements, imports, instances, and includes |
 
 (\*) Only on the fork's `risim` branch, which held the Python risim-ghdl support.
 
@@ -69,19 +82,41 @@ Rust modules are added as the frontend is implemented. Paths are relative to the
 - Recompilation uses compile keys instead of timestamps. Independent libraries compile in parallel and continue after unrelated failures.
 - Duplicate tests, invalid attributes, and testbenches with no or several architectures disable only the affected testbench instead of aborting. Configuration errors (duplicate or empty names, invalid attributes) skip only that configuration.
 - riSim analyses with its CLI (`risim analyze`) and simulates with its runner (`risim-runner run`), VHDL-2008 only.
-  The runner takes the options of a simulation as one JSON object; instead of the simulator flags of VUnit (`ghdl.elab_flags`, `ghdl.sim_flags`), a configuration sets run options, keys of that object (`SimOptions::run_options`), over those of the project by the layer rule of riSim's `risim-run-options`; the `options` of `risim-config.toml` set `relaxed`, and its `[run]` table the optimization and snapshot keys.
+  The runner takes the options of a simulation as one JSON object; instead of the simulator flags of VUnit (`ghdl.elab_flags`, `ghdl.sim_flags`), a configuration sets run options, keys of that object (`SimOptions::run_options`), over those of the project by the layer rule of riSim's `risim-run-options`; `[options]` of `risim-config.toml` sets `relaxed`, `opt-level`, `opt`, and the snapshot keys.
   Run options can't set the keys that every simulation sets (`SIMULATION_KEYS`), among them `paused`, which GUI mode sets; with GUI mode, they must not set `pause-after` or `websocket: disable` either, which the runner rejects.
   The consecutive files of one library that need compiling are analysed by one process.
 - Testcase patterns are case-insensitive on all platforms (Python's `fnmatch` is case-insensitive only on Windows).
 - Compile and simulation processes run with the workspace root as working directory.
 - Files that are independent of each other compile in the order they were added. VUnit sorts them by path. Both orders respect the dependencies.
 - An ambiguous direct entity instantiation is an error for the instantiating file instead of aborting. Dependency cycles are reported only when they involve files that a testbench needs.
-- Standards other than VHDL-2008 are checked among the files to compile, not among all files of the project.
+- Standards other than VHDL-2008 are checked among the VHDL files to compile, not among all files of the project.
 - Compiler warnings and notes in the files of VUnit and OSVVM themselves are dropped; errors are kept.
 - A compile that fails without a parsable error message gets an error diagnostic with the compiler output, even if it printed parsable warnings.
 - Library directories are `risim-out/libraries/<lowercase library name>`, each with the archive `<lowercase library name>.hlib`.
 - The VHDL parser skips enumeration, record and array types, which VUnit only uses for com codec generation. Word boundaries (`\b`) only treat ASCII characters as word characters.
 - The files of a user library named `vunit_lib` are added to the VUnit library, like `ui.library("vunit_lib").add_source_files(…)`; a precompiled library can't be named `vunit_lib`. A user library named `osvvm` replaces the builtin OSVVM library, with a warning. Library names, including `work`, are compared case-insensitively.
+- The scanner of SystemVerilog and Verilog files (`verilog_parser`) has no parse cache of its own: `sources::SvScanCache` keeps its results in memory only (not in `parse_cache.json`), and reuses a scan while the file, its options, and every file that its includes tried to read are unchanged, as upstream's `_lookup_parse_cache` checks.
+  The scanner deviates from `parsing/verilog/*` in these points:
+  - A quoted `` `include `` searches the directory of the including file first, then the include directories, as hydrolyze does; upstream searches the directory of the top file, then the include directories.
+  - Interfaces, programs, primitives, and `macromodule` are definitions too.
+  - Upstream uses one keyword set for all files; the scanner has a second one (`KeywordSet::Verilog1364`), with the keywords of IEEE 1364-2005, for Verilog files (`.v`, `.vo`) and `keywords = "1364-…"`, in which SystemVerilog-only keywords such as `package`, `import`, and `interface` are identifiers.
+  - The scan returns the macros at the end of the file, so that a library that is one compilation unit (`compilation-unit = "library"`) carries them into its next file.
+  - `` `resetall `` doesn't undefine macros (IEEE 1800 22.3), a default of a formal argument may have several tokens and white space around `=` or be empty, and an empty actual argument takes the default (IEEE 1800 22.5.1).
+  - `` `ifdef ``, `` `ifndef ``, and `` `elsif `` also take an expression in parentheses, such as `` `ifdef (A && !B) `` (IEEE 1800-2023 22.6).
+  - `import a::x, b::y;` imports `b` too, a package reference `p::x` right after an identifier is found, `name.modport port` is an instance of `name`, and the name of a parameter is the last identifier before its default, not the type in `parameter int unsigned N`.
+  - A few inputs on which upstream raises an uncaught exception are skipped instead, and macro expansions and includes stop at nesting and token limits.
+- The include directories and macros of SystemVerilog and Verilog files are options of the project or of a library (`include-dirs` and `defines` of `[options]` and `[libraries.NAME.options]`), not of each file (`add_source_file(…, include_dirs=…, defines=…)`), since `risim analyze` takes them per call.
+- File kinds come from one table of extensions, a copy of hydrolyze's that riSim's tests check against it (`sources::FileKind`): `.sv` (SystemVerilog), `.v` and `.vo` (Verilog) are sources; `.svh` and `.vh` are include files, which a pattern may match without a warning; `.svp`, `.vp` (encrypted), and `.vams` (Verilog-AMS) are skipped with a warning that names the reason.
+  Upstream adds every Verilog extension as a source.
+- The libraries that a library's SystemVerilog files search for packages and definitions are derived from the packages they import or refer to, and the interfaces they use, in other libraries, in the order of their first use, with `vunit_lib` last; `sv-libraries` of `[libraries.NAME.options]` replaces the derived list.
+  They become `--sv-library` arguments of `risim analyze`, and libraries that depend on each other in a cycle are a project error, since riSim can't load them.
+  Upstream has no such list, since its simulators resolve these names across all libraries.
+- The Verilog builtins (`vunit_pkg.sv` in `vunit_lib`, and the `verilog/include` directory before the include directories of each library with SystemVerilog or Verilog files) are added only when the project has such files, rather than by a call to `add_verilog_builtins`.
+- SystemVerilog and Verilog testbenches (definitions with a `runner_cfg` parameter) aren't discovered: each gets a warning that riSim doesn't simulate SystemVerilog yet.
+- The compile set has every SystemVerilog and Verilog file of the libraries that aren't precompiled, `vunit_pkg.sv` included, also those that no testbench needs; a VHDL component that names an SV module makes its file a dependency of the instantiating file for recompiles, as an SV instance of a definition or entity does.
+- A compile key hashes the contents of the files that a file's includes found (or that an include found none) instead of upstream's content hash with the includes, so that editing an include file recompiles its includers, and creating a missing one recompiles too.
+- The SystemVerilog and Verilog files of a library with `compilation-unit = "library"` are one compile item: they are ordered as one node of the dependency graph, in the order of collection, share one compile key, and are compiled, or skipped, together in one `risim analyze`, which needs all of them for the compilation unit.
+- A report in an include file goes to the file of the batch that includes it, from its `included from here` notes or the includes of the scan, and keeps its location in the include file.
 - com is always added from VHDL-2008 on, and left out for older standards instead of raising an error.
 - In file patterns, `*` also matches hidden files, and `risim-out/` and `.git/` directories are never searched. Files with unknown extensions are skipped with a warning instead of raising an error.
 - Testcase names keep the case of the entity declaration; VUnit uses the lowercase entity name. Test names that differ only in case produce a warning.

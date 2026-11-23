@@ -11,7 +11,9 @@
 //! AI NOTICE: Generated, minimally reviewed.
 
 use super::*;
+use crate::diagnostics::Position;
 use crate::diagnostics::Severity;
+use crate::test_support::add_sv;
 use crate::test_support::add_vhdl;
 
 struct TestProject {
@@ -88,6 +90,25 @@ impl TestProject {
             .iter()
             .map(ToString::to_string)
             .collect()
+    }
+
+    fn add_sv(&mut self, library: &str, path: &str, code: &str) -> FileId {
+        add_sv(&mut self.project, library, Utf8Path::new(path), code)
+    }
+
+    /// The names of the SV dependencies of `library`, after [`Project::finish`].
+    fn sv_dependencies(&self, library: &str) -> Vec<&str> {
+        self.library(library)
+            .sv_dependencies()
+            .map(|dependency| self.project.library(dependency).name.as_str())
+            .collect()
+    }
+
+    fn set_sv_libraries(&mut self, library: &str, names: &[&str]) {
+        let id = self.project.find_library(library).unwrap();
+        let mut options = self.project.library(id).options.clone();
+        options.sv_libraries = Some(names.iter().map(|&name| name.to_owned()).collect());
+        self.project.set_library_options(id, options);
     }
 }
 
@@ -1325,4 +1346,363 @@ fn component_matches_entities_in_own_and_used_library() {
     let top = cells.add_top("library cells;\nuse cells.cells_pkg.all;", "cell");
     assert!(cells.includes_cell(top));
     assert!(cells.includes_all(top, &own_cell));
+}
+
+// -------------------------------------------------------------------------------------------------
+// SystemVerilog
+// -------------------------------------------------------------------------------------------------
+
+#[test]
+fn sv_names_are_case_sensitive() {
+    let mut test = TestProject::new();
+    test.add_library("lib");
+    let upper = test.add_sv(
+        "lib",
+        "upper.sv",
+        "module Top;\nendmodule\npackage Pkg;\nendpackage\n",
+    );
+    let lower = test.add_sv(
+        "lib",
+        "lower.sv",
+        "module top;\nendmodule\npackage pkg;\nendpackage\n",
+    );
+    test.project.finish();
+    let library = test.library("lib");
+    assert_eq!(
+        library.sv_definition("Top"),
+        Some((SvDefinitionKind::Module, upper))
+    );
+    assert_eq!(
+        library.sv_definition("top"),
+        Some((SvDefinitionKind::Module, lower))
+    );
+    assert_eq!(library.sv_package("Pkg"), Some(upper));
+    assert_eq!(library.sv_package("pkg"), Some(lower));
+    assert_eq!(library.sv_definition("TOP"), None);
+    assert_eq!(test.project.diagnostics(), []);
+    assert_eq!(test.project.file(upper).kind, FileKind::SystemVerilog);
+    assert!(test.project.file(upper).design_units.is_empty());
+}
+
+#[test]
+fn entity_and_module_of_the_same_name_coexist() {
+    let mut test = TestProject::new();
+    test.add_library("lib");
+    let entity = test.add("lib", "e.vhd", "entity counter is end;");
+    let module = test.add_sv("lib", "m.sv", "module counter;\nendmodule\n");
+    test.project.finish();
+    let library = test.library("lib");
+    assert_eq!(library.primary_unit("counter").unwrap().file, entity);
+    assert_eq!(
+        library.sv_definition("counter"),
+        Some((SvDefinitionKind::Module, module))
+    );
+    assert_eq!(test.project.diagnostics(), []);
+}
+
+#[test]
+fn duplicate_sv_definitions_and_packages_are_reported() {
+    let mut test = TestProject::new();
+    test.add_library("lib");
+    test.add_sv(
+        "lib",
+        "a.sv",
+        "module m;\nendmodule\npackage p;\nendpackage\n",
+    );
+    let second = test.add_sv(
+        "lib",
+        "b.sv",
+        "interface m;\nendinterface\npackage p;\nendpackage\n",
+    );
+    // A package and a module of the same name are in different name spaces.
+    test.add_sv("lib", "c.sv", "module p;\nendmodule\n");
+    test.project.finish();
+    let range = |line, start, end| Range {
+        start: Position::new(line, start),
+        end: Position::new(line, end),
+    };
+    assert_eq!(
+        test.project.diagnostics(),
+        [
+            Diagnostic::warning("interface 'm' previously defined in a.sv")
+                .in_file("b.sv")
+                .at(Some(range(1, 11, 11))),
+            Diagnostic::warning("package 'p' previously defined in a.sv")
+                .in_file("b.sv")
+                .at(Some(range(3, 9, 9))),
+        ]
+    );
+    // The later one wins, as for VHDL.
+    assert_eq!(
+        test.library("lib").sv_definition("m"),
+        Some((SvDefinitionKind::Interface, second))
+    );
+}
+
+#[test]
+fn import_in_another_library_is_an_analysis_dependency() {
+    let mut test = TestProject::new();
+    test.add_library("pkgs");
+    test.add_library("rtl");
+    let pkg = test.add_sv("pkgs", "types_pkg.sv", "package types_pkg;\nendpackage\n");
+    let other = test.add_sv("pkgs", "other_pkg.sv", "package other_pkg;\nendpackage\n");
+    let import = test.add_sv(
+        "rtl",
+        "a.sv",
+        "module a;\n  import types_pkg::*;\nendmodule\n",
+    );
+    let reference = test.add_sv("rtl", "b.sv", "module b;\n  other_pkg::t x;\nendmodule\n");
+    test.project.finish();
+    test.assert_compiles(pkg, import);
+    test.assert_compiles(other, reference);
+    test.assert_not_compiles(pkg, reference);
+    assert_eq!(test.sv_dependencies("rtl"), ["pkgs"]);
+    assert_eq!(test.sv_dependencies("pkgs"), [] as [&str; 0]);
+}
+
+#[test]
+fn interface_port_is_an_analysis_dependency() {
+    let mut test = TestProject::new();
+    test.add_library("ifs");
+    test.add_library("rtl");
+    let interface = test.add_sv("ifs", "bus_if.sv", "interface bus_if;\nendinterface\n");
+    let module = test.add_sv("ifs", "sub.sv", "module sub;\nendmodule\n");
+    let user = test.add_sv(
+        "rtl",
+        "user.sv",
+        "module user(bus_if.master bus, bus_if other);\n  sub u_sub();\nendmodule\n",
+    );
+    test.project.finish();
+    test.assert_compiles(interface, user);
+    // An instance of a module is an implementation dependency only.
+    test.assert_not_compiles(module, user);
+    assert!(test.depends_on(user, module, true));
+    // Only the interface adds a library.
+    assert_eq!(test.sv_dependencies("rtl"), ["ifs"]);
+}
+
+#[test]
+fn instances_and_components_are_implementation_dependencies_across_languages() {
+    let mut test = TestProject::new();
+    test.add_library("lib");
+    let entity = test.add("lib", "leaf.vhd", "entity Leaf is end;");
+    let architecture = test.add("lib", "leaf_a.vhd", "architecture a of leaf is begin end;");
+    let module = test.add_sv("lib", "counter.sv", "module Counter;\nendmodule\n");
+    let sv_top = test.add_sv(
+        "lib",
+        "sv_top.sv",
+        "module sv_top;\n  LEAF u_leaf();\nendmodule\n",
+    );
+    let vhdl_top = test.add(
+        "lib",
+        "vhdl_top.vhd",
+        "entity vhdl_top is end;\narchitecture a of vhdl_top is\n  component counter is end \
+         component;\nbegin\n  u_counter : counter port map (q => q);\nend;",
+    );
+    test.project.finish();
+    // SV to VHDL, matched case-insensitively.
+    assert!(test.depends_on(sv_top, entity, true));
+    assert!(test.depends_on(sv_top, architecture, true));
+    assert!(!test.depends_on(sv_top, entity, false));
+    // VHDL to SV.
+    assert!(test.depends_on(vhdl_top, module, true));
+    assert!(!test.depends_on(vhdl_top, module, false));
+}
+
+#[test]
+fn derived_sv_dependencies_in_first_use_order_with_vunit_lib_last() {
+    let mut test = TestProject::new();
+    test.add_library("vunit_lib");
+    test.add_library("a");
+    test.add_library("b");
+    test.add_library("c");
+    test.add_library("vhdl");
+    test.add_sv(
+        "vunit_lib",
+        "vunit_pkg.sv",
+        "package vunit_pkg;\nendpackage\n",
+    );
+    test.add_sv("a", "pa.sv", "package pa;\nendpackage\n");
+    test.add_sv("b", "ib.sv", "interface ib;\nendinterface\n");
+    test.add_sv("c", "pc.sv", "package pc;\nendpackage\n");
+    test.add_sv(
+        "c",
+        "top.sv",
+        "module top(ib port);\n  import pa::*;\n  pc::t x;\n  import pa::y;\nendmodule\n",
+    );
+    test.add("vhdl", "e.vhd", "entity e is end;");
+    test.project.finish();
+    // The interface port comes after the imports and references of the same file.
+    assert_eq!(test.sv_dependencies("c"), ["a", "b", "vunit_lib"]);
+    assert_eq!(test.sv_dependencies("a"), ["vunit_lib"]);
+    assert_eq!(test.sv_dependencies("vunit_lib"), [] as [&str; 0]);
+    assert_eq!(test.sv_dependencies("vhdl"), [] as [&str; 0]);
+}
+
+#[test]
+fn an_import_of_vunit_pkg_keeps_vunit_lib_last_and_once() {
+    let mut test = TestProject::new();
+    test.add_library("vunit_lib");
+    test.add_library("a");
+    test.add_library("b");
+    test.add_sv(
+        "vunit_lib",
+        "vunit_pkg.sv",
+        "package vunit_pkg;\nendpackage\n",
+    );
+    test.add_sv("b", "pb.sv", "package pb;\nendpackage\n");
+    test.add_sv(
+        "a",
+        "tb.sv",
+        "module tb;\n  import vunit_pkg::*;\n  import pb::*;\nendmodule\n",
+    );
+    test.project.finish();
+    // `vunit_lib` stays last, also when a file imports from it first.
+    assert_eq!(test.sv_dependencies("a"), ["b", "vunit_lib"]);
+}
+
+#[test]
+fn explicit_sv_libraries_replace_the_derived_ones() {
+    let mut test = TestProject::new();
+    test.add_library("vunit_lib");
+    test.add_library("a");
+    test.add_library("b");
+    test.add_library("c");
+    test.add_sv(
+        "vunit_lib",
+        "vunit_pkg.sv",
+        "package vunit_pkg;\nendpackage\n",
+    );
+    test.add_sv("b", "pb.sv", "package pb;\nendpackage\n");
+    test.add_sv("a", "a.sv", "module a;\n  import pb::*;\nendmodule\n");
+    test.add_sv("c", "c.sv", "module c;\n  import pb::*;\nendmodule\n");
+    test.set_sv_libraries("a", &["C"]);
+    test.set_sv_libraries("c", &["vunit_lib", "b"]);
+    test.project.finish();
+    assert_eq!(test.sv_dependencies("a"), ["c", "vunit_lib"]);
+    // Naming `vunit_lib` is redundant, and doesn't add it twice.
+    assert_eq!(test.sv_dependencies("c"), ["vunit_lib", "b"]);
+    assert_eq!(test.project.diagnostics(), []);
+    let library_a = test.project.find_library("a").unwrap();
+    assert_eq!(
+        test.project.analyze_args(library_a),
+        ["--sv-library=c", "--sv-library=vunit_lib"]
+    );
+}
+
+#[test]
+fn a_cycle_of_derived_sv_dependencies_is_an_error() {
+    let mut test = TestProject::new();
+    test.add_library("a");
+    test.add_library("b");
+    test.add_sv(
+        "a",
+        "a.sv",
+        "package pa;\nendpackage\nmodule ma;\n  import pb::*;\nendmodule\n",
+    );
+    test.add_sv(
+        "b",
+        "b.sv",
+        "package pb;\nendpackage\nmodule mb;\n  import pa::*;\nendmodule\n",
+    );
+    test.project.finish();
+    let errors = test.project.sv_library_cycle_errors();
+    assert_eq!(
+        errors,
+        [Diagnostic::error(
+            "SystemVerilog libraries depend on each other in a cycle, which can't be compiled: \
+             a -> b -> a; library 'a' depends on 'b': a.sv imports package 'pb' of 'b'; library \
+             'b' depends on 'a': b.sv imports package 'pa' of 'a'; an explicit 'sv-libraries' \
+             list in [libraries.NAME.options] breaks the cycle"
+        )
+        .in_file("a.sv")]
+    );
+    assert_eq!(test.project.diagnostics(), errors);
+}
+
+#[test]
+fn an_explicit_list_breaks_a_cycle() {
+    let mut test = TestProject::new();
+    test.add_library("a");
+    test.add_library("b");
+    test.add_sv(
+        "a",
+        "a.sv",
+        "package pa;\nendpackage\nmodule ma;\n  import pb::*;\nendmodule\n",
+    );
+    test.add_sv(
+        "b",
+        "b.sv",
+        "package pb;\nendpackage\nmodule mb;\n  import pa::*;\nendmodule\n",
+    );
+    test.set_sv_libraries("b", &[]);
+    test.project.finish();
+    assert_eq!(test.project.diagnostics(), []);
+}
+
+#[test]
+fn a_cycle_through_an_explicit_list_is_an_error() {
+    let mut test = TestProject::new();
+    test.add_library("a");
+    test.add_library("b");
+    test.add_sv("a", "a.sv", "package pa;\nendpackage\n");
+    test.add_sv("b", "b.sv", "module mb;\n  pa::t x;\nendmodule\n");
+    test.set_sv_libraries("a", &["b"]);
+    test.project.finish();
+    assert_eq!(
+        test.project.sv_library_cycle_errors(),
+        [Diagnostic::error(
+            "SystemVerilog libraries depend on each other in a cycle, which can't be compiled: \
+             a -> b -> a; library 'a' depends on 'b': its 'sv-libraries' list names 'b'; library \
+             'b' depends on 'a': b.sv refers to package 'pa' of 'a'; an explicit 'sv-libraries' \
+             list in [libraries.NAME.options] breaks the cycle"
+        )
+        .in_file("b.sv")]
+    );
+}
+
+#[test]
+fn analyze_args_of_a_library_without_sv_files_have_no_sv_keys() {
+    use std::collections::BTreeMap;
+
+    use crate::spec::Define;
+    use crate::spec::IncludeDir;
+
+    let mut test = TestProject::new();
+    test.add_library("vunit_lib");
+    test.add_library("vhdl");
+    test.add_library("rtl");
+    test.add_sv(
+        "vunit_lib",
+        "vunit_pkg.sv",
+        "package vunit_pkg;\nendpackage\n",
+    );
+    test.add("vhdl", "e.vhd", "entity e is end;");
+    test.add_sv("rtl", "m.sv", "module m;\nendmodule\n");
+    let options = Options {
+        relaxed: true,
+        include_dirs: Some(vec![IncludeDir::new("/inc")]),
+        defines: BTreeMap::from([("W".to_owned(), Define::text("8"))]),
+        ..Options::default()
+    };
+    for name in ["vhdl", "rtl"] {
+        let id = test.project.find_library(name).unwrap();
+        test.project.set_library_options(id, options.clone());
+    }
+    test.project.finish();
+    let args = |name: &str| {
+        test.project
+            .analyze_args(test.project.find_library(name).unwrap())
+    };
+    assert_eq!(args("vhdl"), ["--relaxed"]);
+    assert_eq!(
+        args("rtl"),
+        [
+            "--relaxed",
+            "--include-dir=/inc",
+            "--define=W=8",
+            "--sv-library=vunit_lib"
+        ]
+    );
+    assert_eq!(args("vunit_lib"), [] as [&str; 0]);
 }

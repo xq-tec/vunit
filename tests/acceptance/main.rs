@@ -7,8 +7,9 @@
 //! VHDL libraries.
 //!
 //! The trials use the risim-runner named by `RISIM_RUNNER` and the analyzer named by
-//! `RISIM_ANALYZER`, and are ignored without either. With
-//! `ACCEPTANCE_KEEP` set, the temporary workspaces aren't deleted, for debugging.
+//! `RISIM_ANALYZER`, and are ignored without either.
+//! The runners have a free plan and a slot directory of their own ([`harness::isolate_slots`]).
+//! With `ACCEPTANCE_KEEP` set, the temporary workspaces aren't deleted, for debugging.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -28,9 +29,12 @@ use libtest_mimic::Arguments;
 use libtest_mimic::Trial;
 
 fn main() -> ExitCode {
+    // SAFETY: No other threads exist yet.
+    let _slots = unsafe { harness::isolate_slots() };
     let args = Arguments::from_args();
     let trials = [
         trials("artificial_vhdl", artificial::artificial),
+        trials("artificial_verilog", artificial::artificial_verilog),
         trials("component_binding", component_binding::component_binding),
         trials(
             "package_body_dependencies",

@@ -15,14 +15,17 @@
 //!     `--message-format=json` does); an error makes the exit code 1;
 //!   - `-- fake: obsolete <file>`: print the warning `obsolete-design-unit` at the start of
 //!     `file`;
+//!   - `-- fake: include-error <header> <message>`: print an error at line 1 of `header`, with a
+//!     note `included from here` at the directive's line, as for an error in an include file;
 //!   - `-- fake: output <text>`: print `text` to stderr;
 //!   - `-- fake: exit <code>`: set the exit code;
 //!   - `-- fake: sleep <ms>`: sleep;
 //!   - `-- fake: hang`: append `hang` to the log, then sleep for an hour;
 //!   - `-- fake: spawn-sleeper <file>`: start a sleeping grandchild and write its PID to `file`.
 //!
-//!   Each call also appends `<work> <file name>…` to `fake-calls.log`, and at its end writes the
-//!   archive `<workdir>/<work>.hlib`.
+//!   The directives may follow `//` too, as in a SystemVerilog file.
+//!   Each call also appends `<work> <file name>…` to `fake-calls.log` and its arguments, as a JSON
+//!   array, to `fake-args.log`, and at its end writes the archive `<workdir>/<work>.hlib`.
 //! - `run <options>` "simulates" the testcase that the key `name` of the JSON object `options`
 //!   names: it appends `simstart <testcase>` and `simend <testcase>` to the log, writes the
 //!   options to `options.json` in the output path from `runner_cfg` (of the key `generics`), and
@@ -66,6 +69,10 @@ pub const LOG: &str = "fake-risim.log";
 
 /// The log of the `analyze` calls in the working directory.
 pub const CALLS: &str = "fake-calls.log";
+
+/// The log of the arguments of the `analyze` calls in the working directory, one JSON array per
+/// call.
+pub const ARGS: &str = "fake-args.log";
 
 /// The simulation directives in the working directory.
 pub const SIM_DIRECTIVES: &str = "fake-sim.txt";
@@ -127,6 +134,10 @@ fn analyse(args: &[String]) -> ExitCode {
     }
     let names: Vec<&str> = files.iter().map(|file| file_name(file)).collect();
     append(CALLS, &format!("{work} {}", names.join(" ")));
+    append(
+        ARGS,
+        &serde_json::to_string(args).expect("serialize the arguments"),
+    );
     let mut code = 0;
     for file in files {
         analyse_file(work, file, &mut code);
@@ -192,6 +203,29 @@ fn analyse_file(work: &str, file: &str, code: &mut u8) {
                     "location": {"file": argument, "start": start, "end": start},
                 });
                 println!("{report}");
+            },
+            "include-error" => {
+                let (header, message) = argument.split_once(' ').unwrap_or((argument, ""));
+                let header_start = serde_json::json!({"line": 1, "column": 1, "offset": 0});
+                let position = |column: usize, at: usize| serde_json::json!({"line": line_number, "column": column, "offset": at});
+                let report = serde_json::json!({
+                    "type": "diagnostic",
+                    "severity": "error",
+                    "code": "fake",
+                    "message": message,
+                    "relaxable": false,
+                    "location": {"file": header, "start": header_start, "end": header_start},
+                    "notes": [{
+                        "message": "included from here",
+                        "location": {
+                            "file": file,
+                            "start": position(1, line_offset),
+                            "end": position(line.chars().count() + 1, line_offset + line.len()),
+                        },
+                    }],
+                });
+                println!("{report}");
+                *code = 1;
             },
             "output" => eprintln!("{argument}"),
             "spawn-sleeper" => {

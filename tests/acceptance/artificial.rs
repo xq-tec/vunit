@@ -2,13 +2,18 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! `tests/acceptance/artificial/vhdl`, ported from `test_artificial.py`.
+//! `tests/acceptance/artificial/vhdl`, ported from `test_artificial.py`, and
+//! `tests/acceptance/artificial/verilog`, compiled only, since riSim doesn't simulate
+//! SystemVerilog yet.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
+use risim_vunit_frontend::DiagnosticSource;
 use risim_vunit_frontend::TestOutcome;
+use risim_vunit_frontend::diagnostics::Severity;
 use risim_vunit_frontend::spec::AssertLevel;
 use risim_vunit_frontend::spec::ConfigurationSpec;
+use risim_vunit_frontend::spec::Define;
 use risim_vunit_frontend::spec::ProjectSpec;
 use risim_vunit_frontend::spec::SimOptions;
 use risim_vunit_frontend::spec::TestConfigSpec;
@@ -31,6 +36,63 @@ pub async fn artificial() {
         RisimDeviations::None,
     );
 }
+
+/// Compiles `tests/acceptance/artificial/verilog` as its `run.py` adds it: the testbenches
+/// compile, and each gets the warning that it isn't run.
+pub async fn artificial_verilog() {
+    let runtime = harness::runtime().await;
+    let root = harness::Root::new();
+    let dir = harness::fixtures_dir().join("artificial/verilog");
+    let parameter_config = dir.join("tb_with_parameter_config.sv");
+    let lib: Vec<String> = harness::files_with_extension(&dir, "sv")
+        .into_iter()
+        .filter(|path| *path != parameter_config)
+        .map(String::from)
+        .collect();
+    let mut spec = ProjectSpec::new();
+    spec.options.defines = [("DEFINE_FROM_RUN_PY".to_owned(), Define::text(""))].into();
+    spec.add_library("lib", lib)
+        .add_library("lib2", [parameter_config.to_string()]);
+    let compiled = harness::compile_all(&runtime, &root.path, &spec).await;
+
+    let mut not_run = Vec::new();
+    let mut problems = Vec::new();
+    for (source, diagnostic) in &compiled.diagnostics {
+        let testbench = diagnostic
+            .message
+            .strip_prefix("SystemVerilog testbench '")
+            .and_then(|rest| rest.split_once('\''))
+            .map(|(name, _)| name);
+        match testbench {
+            Some(name) if *source == DiagnosticSource::Project => not_run.push(name),
+            _ if diagnostic.severity != Severity::Note => {
+                problems.push(format!("{source:?}: {diagnostic}"));
+            },
+            _ => {},
+        }
+    }
+    assert_eq!(problems, Vec::<String>::new(), "diagnostics");
+    assert!(compiled.success, "the compile failed");
+    not_run.sort_unstable();
+    assert_eq!(not_run, VERILOG_TESTBENCHES);
+}
+
+/// The testbenches of `tests/acceptance/artificial/verilog`: the modules with a `runner_cfg`
+/// parameter.
+const VERILOG_TESTBENCHES: &[&str] = &[
+    "tb_fail_on_fatal_and_early_finish",
+    "tb_fail_on_warning",
+    "tb_fail_on_warning_from_python",
+    "tb_magic_paths",
+    "tb_other_file_tests",
+    "tb_same_sim_all_pass",
+    "tb_same_sim_from_python_all_pass",
+    "tb_same_sim_from_python_some_fail",
+    "tb_same_sim_some_fail",
+    "tb_with_define",
+    "tb_with_parameter_config",
+    "tb_with_runner",
+];
 
 /// `tests/acceptance/artificial/vhdl/run.py` as a project spec, without hooks, test history,
 /// `scan_tests_from_file` and `add_package`.

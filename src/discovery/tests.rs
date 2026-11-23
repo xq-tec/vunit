@@ -13,6 +13,7 @@ use std::collections::BTreeMap;
 
 use super::*;
 use crate::spec::ConfigurationSpec;
+use crate::test_support::add_sv;
 use crate::test_support::add_vhdl;
 
 struct TestProject {
@@ -897,4 +898,30 @@ fn testcases_and_lookup() {
         Some("a")
     );
     assert!(discovery.run("lib.tb_entity.c").is_none());
+}
+
+#[test]
+fn sv_testbenches_get_a_warning() {
+    let mut test = TestProject::new();
+    let tb = add_sv(
+        &mut test.project,
+        "lib",
+        Utf8Path::new("tb_x.sv"),
+        "module tb_x;\n  parameter string runner_cfg = \"\";\nendmodule\n\nmodule not_a_tb;\n  \
+         parameter int width = 8;\nendmodule\n",
+    );
+    test.add("tb_vhdl.vhd", &testbench("tb_vhdl", ""));
+    let discovery = test.discover();
+    assert_eq!(names(&discovery), ["lib.tb_vhdl.all"]);
+    assert_eq!(
+        discovery.project_diagnostics,
+        [Diagnostic::warning(
+            "SystemVerilog testbench 'tb_x' isn't run: riSim doesn't simulate SystemVerilog yet"
+        )
+        .in_file(&test.project.file(tb).path)
+        .at(Some(Range {
+            start: Position::new(1, 8),
+            end: Position::new(1, 11)
+        }))]
+    );
 }

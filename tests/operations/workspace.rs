@@ -1713,15 +1713,15 @@ fn reject_bad(options: &RunOptions) -> Result<(), String> {
     }
 }
 
-/// The `[run]` table of the configuration sets run options over the runtime's, by the layer
+/// The `[options]` table of the configuration sets run options over the runtime's, by the layer
 /// rule, without the keys that the runtime's check rejects, which are configuration errors.
 async fn workspace_checks_the_run_options_of_the_config() {
     let mut fixture = Workspace::new().await;
     simulation_project(&mut fixture);
     fixture.write(
         CONFIG,
-        "[libraries.lib]\nfiles = [\"tb/*.vhd\"]\n\n[run]\nopt-level = \"off\"\n\n\
-         [run.opt]\nwake-guards = \"on\"\nbad = \"on\"\n",
+        "[libraries.lib]\nfiles = [\"tb/*.vhd\"]\n\n[options]\nopt-level = \"off\"\n\n\
+         [options.opt]\nwake-guards = \"on\"\nbad = \"on\"\n",
     );
     let runtime = runtime_with_check(
         RunOptions::from_iter([
@@ -1743,7 +1743,7 @@ async fn workspace_checks_the_run_options_of_the_config() {
         .collect();
     assert_eq!(
         messages,
-        ["invalid 'bad' in [run.opt]: unknown optimization `bad`"]
+        ["invalid 'bad' in [options.opt]: unknown optimization `bad`"]
     );
 
     session

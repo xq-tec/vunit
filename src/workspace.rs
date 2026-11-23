@@ -87,6 +87,10 @@ use crate::store::TestResult;
 use crate::threads::ThreadState;
 
 /// Where the project of a workspace comes from.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a workspace has one project source, which is moved rarely"
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProjectSource {
     /// A `risim-config.toml`, relative to the workspace root or absolute. The file is watched

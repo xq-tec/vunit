@@ -8,6 +8,12 @@
 //! `ui/testbench.py`). A `risim-config.toml` is turned into a [`ProjectSpec`] by the `config`
 //! module; tests and other embedders can build one directly.
 //!
+//! [`Options`] are the options of analysis, of the project and of each library: a library's key
+//! replaces the project's, except `defines`, which merge by name ([`Options::for_library`]).
+//! The builtin libraries take `relaxed` only ([`Options::for_builtins`]), and a library without
+//! SystemVerilog or Verilog files takes `relaxed` and `encoding` only
+//! ([`Options::without_sv_keys`]).
+//!
 //! AI NOTICE: Generated, minimally reviewed.
 
 use std::collections::BTreeMap;
@@ -34,8 +40,8 @@ pub struct ProjectSpec {
     pub features: BTreeSet<Feature>,
     /// User libraries, in the order they are added to the project.
     pub libraries: Vec<LibrarySpec>,
-    /// Options for analysis.
-    pub compile_options: CompileOptions,
+    /// The options of the project (`[options]`), over which each library's own options go.
+    pub options: Options,
     /// Options for elaboration and simulation.
     pub sim_options: SimOptions,
     /// Configurations of testbenches and tests.
@@ -58,6 +64,7 @@ impl ProjectSpec {
             name: name.into(),
             files: patterns.into_iter().map(FilePattern::new).collect(),
             vhdl_standard: None,
+            options: Options::default(),
         });
         self
     }
@@ -141,6 +148,9 @@ pub enum LibrarySpec {
         files: Vec<FilePattern>,
         /// The standard of the library's files, if it differs from the project's.
         vhdl_standard: Option<VhdlStandard>,
+        /// The library's own options (`[libraries.NAME.options]`), unmerged; those of the
+        /// library's files are [`Options::for_library`] of the project's with them.
+        options: Options,
     },
     /// A precompiled library. It is never compiled, only passed to the simulator with `-L`.
     External {
@@ -182,8 +192,8 @@ impl FilePattern {
     }
 }
 
-/// The location of a [`FilePattern`] in a configuration file.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The location of a [`FilePattern`] or an [`IncludeDir`] in a configuration file.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PatternLocation {
     /// The configuration file.
     pub file: Utf8PathBuf,
@@ -191,11 +201,318 @@ pub struct PatternLocation {
     pub range: Range,
 }
 
-/// Options for analysis (`risim analyze`).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct CompileOptions {
-    /// Extra options of `risim analyze`.
-    pub a_flags: Vec<String>,
+/// The options of the project (`[options]`) or of a library (`[libraries.NAME.options]`).
+///
+/// They hold what analysis needs; the run options of the same table, such as `opt-level`, are
+/// in [`SimOptions::run_options`].
+/// Apart from `relaxed` and `encoding`, they are options of SystemVerilog and Verilog files
+/// only, which reach `risim analyze` only for libraries with such files
+/// ([`Options::without_sv_keys`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Options {
+    /// Relaxed analysis (`--relaxed`); project level only.
+    ///
+    /// Elaboration takes the run option `relaxed` instead: a [`ProjectSpec`] built in code sets
+    /// that too for relaxed elaboration, as reading `relaxed = true` from `[options]` does.
+    pub relaxed: bool,
+    /// The directories that a quoted `` `include `` searches (`include-dirs`), in order; a
+    /// library's replace the project's.
+    pub include_dirs: Option<Vec<IncludeDir>>,
+    /// The macros defined at the start of every compilation unit (`defines`), by their names
+    /// without formal arguments; a library's go over the project's by name.
+    pub defines: BTreeMap<String, Define>,
+    /// How the library's files form compilation units (`compilation-unit`).
+    pub compilation_unit: Option<CompilationUnit>,
+    /// The keywords that the files start with (`keywords`), instead of those of their
+    /// extension.
+    pub keywords: Option<KeywordVersion>,
+    /// The encoding of the library's files of both languages and of their include files
+    /// (`encoding`).
+    pub encoding: Option<Encoding>,
+    /// The libraries that the library's SystemVerilog files search for packages and
+    /// definitions (`sv-libraries`), in order; library level only.
+    pub sv_libraries: Option<Vec<String>>,
+}
+
+impl Options {
+    /// The arguments of `risim analyze` for these options, in their single-argument long forms,
+    /// without those of the defaults.
+    ///
+    /// The order is fixed, so that equal options give equal arguments: `--relaxed`,
+    /// `--encoding`, `--keywords`, `--compilation-unit`, each include directory, each define
+    /// by name (without the removed ones), and each SystemVerilog library.
+    pub fn analyze_args(&self) -> Vec<String> {
+        let Self {
+            relaxed,
+            include_dirs,
+            defines,
+            compilation_unit,
+            keywords,
+            encoding,
+            sv_libraries,
+        } = self;
+        let mut args = Vec::new();
+        if *relaxed {
+            args.push("--relaxed".to_owned());
+        }
+        if let Some(encoding) = encoding {
+            args.push(format!("--encoding={}", encoding.name()));
+        }
+        if let Some(keywords) = keywords {
+            args.push(format!("--keywords={keywords}"));
+        }
+        if *compilation_unit == Some(CompilationUnit::Library) {
+            args.push("--compilation-unit=library".to_owned());
+        }
+        for directory in include_dirs.iter().flatten() {
+            args.push(format!("--include-dir={}", directory.path));
+        }
+        for (name, define) in defines {
+            match define {
+                Define::Defined { formals, text } => {
+                    let formals = formals.as_deref().unwrap_or_default();
+                    if text.is_empty() {
+                        args.push(format!("--define={name}{formals}"));
+                    } else {
+                        args.push(format!("--define={name}{formals}={text}"));
+                    }
+                },
+                Define::Removed => {},
+            }
+        }
+        for library in sv_libraries.iter().flatten() {
+            args.push(format!("--sv-library={library}"));
+        }
+        args
+    }
+
+    /// The options of a library whose own options are `library`, with these as the project's.
+    ///
+    /// A key of the library replaces the project's, except `defines`, which go over the
+    /// project's by name, where [`Define::Removed`] drops the project's define of that name.
+    /// `relaxed` is the project's, and `sv_libraries` the library's, since each is set at one
+    /// level only.
+    #[must_use]
+    pub fn for_library(&self, library: &Self) -> Self {
+        let Self {
+            relaxed: _,
+            include_dirs,
+            defines,
+            compilation_unit,
+            keywords,
+            encoding,
+            sv_libraries,
+        } = library;
+        let mut merged = self.defines.clone();
+        for (name, define) in defines {
+            match define {
+                Define::Defined { .. } => {
+                    merged.insert(name.clone(), define.clone());
+                },
+                Define::Removed => {
+                    merged.remove(name);
+                },
+            }
+        }
+        Self {
+            relaxed: self.relaxed,
+            include_dirs: include_dirs.clone().or_else(|| self.include_dirs.clone()),
+            defines: merged,
+            compilation_unit: compilation_unit.or(self.compilation_unit),
+            keywords: keywords.or(self.keywords),
+            encoding: encoding.or(self.encoding),
+            sv_libraries: sv_libraries.clone(),
+        }
+    }
+
+    /// The options of the builtin libraries (VUnit's and OSVVM) with these as the project's:
+    /// `relaxed` only.
+    #[must_use]
+    pub fn for_builtins(&self) -> Self {
+        Self {
+            relaxed: self.relaxed,
+            ..Self::default()
+        }
+    }
+
+    /// These options without the keys of SystemVerilog and Verilog files: `relaxed` and
+    /// `encoding` only.
+    ///
+    /// A library without such files is analyzed with these, so that its arguments, and with
+    /// them its compile keys, don't depend on the other keys.
+    #[must_use]
+    pub fn without_sv_keys(&self) -> Self {
+        Self {
+            relaxed: self.relaxed,
+            encoding: self.encoding,
+            ..Self::default()
+        }
+    }
+}
+
+/// A directory of `include-dirs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncludeDir {
+    /// The directory, as written, relative to the workspace root, or resolved against it in the
+    /// options of a collected library.
+    pub path: Utf8PathBuf,
+    /// Where the directory is written in the configuration file, for diagnostics.
+    pub location: Option<PatternLocation>,
+}
+
+impl IncludeDir {
+    /// Creates a directory that isn't from a configuration file.
+    pub fn new(path: impl Into<Utf8PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            location: None,
+        }
+    }
+}
+
+/// A macro of `defines`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Define {
+    /// A defined macro: `true` or `""` for an empty one, or its text.
+    Defined {
+        /// The formal arguments in their parentheses, such as `(a,b)`, if the macro has them.
+        formals: Option<String>,
+        /// The text of the macro, empty for an empty one.
+        text: String,
+    },
+    /// `false` in a library: the project's macro of the name isn't defined for it.
+    Removed,
+}
+
+impl Define {
+    /// Creates a macro without formal arguments, with the text `text`.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Defined {
+            formals: None,
+            text: text.into(),
+        }
+    }
+}
+
+/// How the SystemVerilog files of a library form compilation units (`compilation-unit`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompilationUnit {
+    /// Each file is a compilation unit of its own; the default.
+    File,
+    /// The files of the library form one compilation unit, in the order of collection.
+    Library,
+}
+
+impl CompilationUnit {
+    /// All modes.
+    pub const ALL: [Self; 2] = [Self::File, Self::Library];
+
+    /// The name used in configuration files and by `--compilation-unit`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Library => "library",
+        }
+    }
+}
+
+/// The encoding of source files (`encoding`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Encoding {
+    /// UTF-8, the default of SystemVerilog and Verilog files.
+    Utf8,
+    /// ISO 8859-1, the default of VHDL files.
+    Latin1,
+}
+
+impl Encoding {
+    /// All encodings.
+    pub const ALL: [Self; 2] = [Self::Utf8, Self::Latin1];
+
+    /// The name used in configuration files and by `--encoding`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Utf8 => "utf-8",
+            Self::Latin1 => "latin-1",
+        }
+    }
+}
+
+/// The version specifiers of `` `begin_keywords `` (IEEE 1800 22.14), the values of `keywords`.
+pub const KEYWORD_VERSIONS: [&str; 9] = [
+    "1364-1995",
+    "1364-2001",
+    "1364-2001-noconfig",
+    "1364-2005",
+    "1800-2005",
+    "1800-2009",
+    "1800-2012",
+    "1800-2017",
+    "1800-2023",
+];
+
+/// The directives of IEEE 1800-2023 clause 22, as 22.1 lists them, without `` ` ``; no macro
+/// of `defines` may be named after one (22.5.1).
+///
+/// A copy of hydrolyze's list (`hydrolyze::is_sv_directive`), since this crate builds without
+/// hydrolyze; riSim's tests check that the two agree.
+pub const SV_DIRECTIVES: [&str; 22] = [
+    "__FILE__",
+    "__LINE__",
+    "begin_keywords",
+    "celldefine",
+    "default_nettype",
+    "define",
+    "else",
+    "elsif",
+    "end_keywords",
+    "endcelldefine",
+    "endif",
+    "ifdef",
+    "ifndef",
+    "include",
+    "line",
+    "nounconnected_drive",
+    "pragma",
+    "resetall",
+    "timescale",
+    "unconnected_drive",
+    "undef",
+    "undefineall",
+];
+
+/// A version of `keywords`, one of [`KEYWORD_VERSIONS`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KeywordVersion(&'static str);
+
+impl KeywordVersion {
+    /// The version specifier, such as `1800-2017`.
+    pub const fn text(self) -> &'static str {
+        self.0
+    }
+}
+
+impl fmt::Display for KeywordVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.0)
+    }
+}
+
+/// A string that isn't one of [`KEYWORD_VERSIONS`].
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("unknown keyword version '{0}'")]
+pub struct UnknownKeywordVersion(pub String);
+
+impl FromStr for KeywordVersion {
+    type Err = UnknownKeywordVersion;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        KEYWORD_VERSIONS
+            .into_iter()
+            .find(|version| *version == text)
+            .map(Self)
+            .ok_or_else(|| UnknownKeywordVersion(text.to_owned()))
+    }
 }
 
 /// Options for elaboration and simulation (`risim-runner run`).
@@ -371,6 +688,157 @@ mod tests {
                 .overridden_by(&configuration)
                 .run_options,
             configuration.run_options
+        );
+    }
+
+    fn relaxed() -> Options {
+        Options {
+            relaxed: true,
+            ..Options::default()
+        }
+    }
+
+    /// Options with every key set, `library` level ones included.
+    fn every_key() -> Options {
+        Options {
+            relaxed: true,
+            include_dirs: Some(vec![IncludeDir::new("/inc/b"), IncludeDir::new("/inc/a")]),
+            defines: BTreeMap::from([
+                ("WIDTH".to_owned(), Define::text("8")),
+                ("DEBUG".to_owned(), Define::text("")),
+                (
+                    "MAX".to_owned(),
+                    Define::Defined {
+                        formals: Some("(a,b)".to_owned()),
+                        text: "((a)>(b)?(a):(b))".to_owned(),
+                    },
+                ),
+                ("GONE".to_owned(), Define::Removed),
+            ]),
+            compilation_unit: Some(CompilationUnit::Library),
+            keywords: Some("1800-2017".parse().unwrap()),
+            encoding: Some(Encoding::Latin1),
+            sv_libraries: Some(vec!["b".to_owned(), "a".to_owned()]),
+        }
+    }
+
+    #[test]
+    fn options_become_analyze_args() {
+        assert_eq!(Options::default().analyze_args(), Vec::<String>::new());
+        assert_eq!(relaxed().analyze_args(), ["--relaxed"]);
+        assert_eq!(
+            every_key().analyze_args(),
+            [
+                "--relaxed",
+                "--encoding=latin-1",
+                "--keywords=1800-2017",
+                "--compilation-unit=library",
+                "--include-dir=/inc/b",
+                "--include-dir=/inc/a",
+                "--define=DEBUG",
+                "--define=MAX(a,b)=((a)>(b)?(a):(b))",
+                "--define=WIDTH=8",
+                "--sv-library=b",
+                "--sv-library=a",
+            ]
+        );
+        // The defaults are omitted.
+        let defaults = Options {
+            include_dirs: Some(Vec::new()),
+            compilation_unit: Some(CompilationUnit::File),
+            sv_libraries: Some(Vec::new()),
+            ..Options::default()
+        };
+        assert_eq!(defaults.analyze_args(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn libraries_and_builtins_keep_relaxed() {
+        assert_eq!(relaxed().for_builtins(), relaxed());
+        assert_eq!(every_key().for_builtins(), relaxed());
+        assert_eq!(relaxed().for_library(&Options::default()), relaxed());
+        assert_eq!(
+            Options::default().for_library(&Options::default()),
+            Options::default()
+        );
+    }
+
+    #[test]
+    fn library_keys_go_over_the_project() {
+        let project = Options {
+            relaxed: true,
+            include_dirs: Some(vec![IncludeDir::new("project")]),
+            defines: BTreeMap::from([
+                ("WIDTH".to_owned(), Define::text("8")),
+                ("DEBUG".to_owned(), Define::text("")),
+                ("KEEP".to_owned(), Define::text("1")),
+            ]),
+            compilation_unit: Some(CompilationUnit::Library),
+            keywords: Some("1800-2017".parse().unwrap()),
+            encoding: Some(Encoding::Latin1),
+            sv_libraries: None,
+        };
+
+        // Without keys of its own, a library takes the project's.
+        assert_eq!(project.for_library(&Options::default()), project);
+
+        let library = Options {
+            include_dirs: Some(vec![IncludeDir::new("library")]),
+            defines: BTreeMap::from([
+                ("WIDTH".to_owned(), Define::text("16")),
+                ("DEBUG".to_owned(), Define::Removed),
+                ("UNKNOWN".to_owned(), Define::Removed),
+                ("NEW".to_owned(), Define::text("")),
+            ]),
+            keywords: Some("1364-2005".parse().unwrap()),
+            sv_libraries: Some(vec!["other".to_owned()]),
+            ..Options::default()
+        };
+        assert_eq!(
+            project.for_library(&library),
+            Options {
+                relaxed: true,
+                include_dirs: Some(vec![IncludeDir::new("library")]),
+                defines: BTreeMap::from([
+                    ("WIDTH".to_owned(), Define::text("16")),
+                    ("KEEP".to_owned(), Define::text("1")),
+                    ("NEW".to_owned(), Define::text("")),
+                ]),
+                compilation_unit: Some(CompilationUnit::Library),
+                keywords: Some("1364-2005".parse().unwrap()),
+                encoding: Some(Encoding::Latin1),
+                sv_libraries: Some(vec!["other".to_owned()]),
+            }
+        );
+
+        // `relaxed` stays the project's.
+        assert!(!Options::default().for_library(&relaxed()).relaxed);
+    }
+
+    #[test]
+    fn without_sv_keys_keeps_relaxed_and_encoding() {
+        assert_eq!(
+            every_key().without_sv_keys(),
+            Options {
+                relaxed: true,
+                encoding: Some(Encoding::Latin1),
+                ..Options::default()
+            }
+        );
+        assert_eq!(
+            every_key().without_sv_keys().analyze_args(),
+            ["--relaxed", "--encoding=latin-1"]
+        );
+    }
+
+    #[test]
+    fn keyword_versions_parse() {
+        for version in KEYWORD_VERSIONS {
+            assert_eq!(version.parse::<KeywordVersion>().unwrap().text(), version);
+        }
+        assert_eq!(
+            "1800-2020".parse::<KeywordVersion>(),
+            Err(UnknownKeywordVersion("1800-2020".to_owned()))
         );
     }
 

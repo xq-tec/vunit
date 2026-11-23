@@ -596,7 +596,6 @@ impl Actor {
                     layout: &layout,
                     project: &model.project,
                     targets: &targets,
-                    compile_options: &model.spec.compile_options,
                     simulator: runtime.simulator(),
                 };
                 let report = compile::compile(&input, &mut state, &context).await;

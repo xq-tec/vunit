@@ -11,7 +11,8 @@
 //! # Crate organization
 //!
 //! - configuration: [`config`], [`spec`]
-//! - collecting and parsing sources: [`sources`], [`vhdl_parser`], [`vhdl_standard`]
+//! - collecting and parsing sources: [`sources`], [`vhdl_parser`], [`vhdl_standard`],
+//!   [`verilog_parser`]
 //! - builtin libraries: [`builtins`]
 //! - project model with dependency analysis: [`project`], [`dependency_graph`]
 //! - test discovery with configurations and testcase patterns: [`discovery`], [`configuration`], [`pattern`]
@@ -48,6 +49,7 @@ mod sync;
 #[cfg(test)]
 mod test_support;
 pub mod threads;
+pub mod verilog_parser;
 pub mod vhdl_parser;
 pub mod vhdl_standard;
 pub mod watch;

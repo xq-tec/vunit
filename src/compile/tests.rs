@@ -8,7 +8,18 @@
 //! AI NOTICE: Generated, minimally reviewed.
 
 use super::*;
+use crate::builtins;
+use crate::sources::SourceCache;
+use crate::sources::build_project;
+use crate::spec::CompilationUnit;
+use crate::spec::Define;
+use crate::spec::Encoding;
+use crate::spec::IncludeDir;
+use crate::spec::Options;
+use crate::spec::ProjectSpec;
 use crate::test_support::TempRoot;
+use crate::test_support::add_sv;
+use crate::test_support::add_sv_including;
 use crate::test_support::add_vhdl;
 use crate::test_support::simulator;
 
@@ -17,7 +28,6 @@ struct Fixture {
     layout: OutputLayout,
     project: Project,
     simulator: Simulator,
-    options: CompileOptions,
 }
 
 impl Fixture {
@@ -29,7 +39,6 @@ impl Fixture {
             layout,
             project: Project::new(),
             simulator: simulator(),
-            options: CompileOptions::default(),
         }
     }
 
@@ -53,7 +62,6 @@ impl Fixture {
                 layout: &self.layout,
                 project: &self.project,
                 targets,
-                compile_options: &self.options,
                 simulator: &self.simulator,
             },
             state,
@@ -186,20 +194,524 @@ fn compile_keys_change_with_dependencies() {
 #[test]
 fn compile_keys_depend_on_options_and_simulator() {
     let mut fixture = Fixture::new();
-    fixture.library("lib");
-    let pkg = fixture.add("lib", "pkg.vhd", PKG);
-    let plan = fixture.plan(&[pkg], &CompileState::default());
+    fixture.library("lib").library("user_lib").library("other");
+    fixture.add("lib", "pkg.vhd", PKG);
+    let user = fixture.add(
+        "user_lib",
+        "user.vhd",
+        "library lib;\nuse lib.pkg.all;\npackage user is end package;",
+    );
+    let other = fixture.add("other", "other.vhd", "package other is end package;");
+    let targets = [user, other];
+    let plan = fixture.plan(&targets, &CompileState::default());
     let state = compiled_state(&plan);
-    assert_eq!(fixture.plan(&[pkg], &state).compile_count(), 0);
+    assert_eq!(fixture.plan(&targets, &state).compile_count(), 0);
 
-    fixture.options.a_flags = vec!["-frelaxed".to_owned()];
-    assert_eq!(fixture.plan(&[pkg], &state).compile_count(), 1);
-    fixture.options.a_flags.clear();
+    // The options of a library change its files' keys and those of their dependents, and only
+    // the commands of its batches have their arguments.
+    let lib = fixture.project.find_library("lib").unwrap();
+    fixture.project.set_library_options(
+        lib,
+        Options {
+            relaxed: true,
+            ..Options::default()
+        },
+    );
+    let relaxed_plan = fixture.plan(&targets, &state);
+    let compiled: Vec<_> = relaxed_plan
+        .files()
+        .iter()
+        .filter(|file| file.needs_compile)
+        .map(|file| file.path.file_name().unwrap())
+        .collect();
+    assert_eq!(compiled, ["pkg.vhd", "user.vhd"]);
+    let relaxed: Vec<_> = relaxed_plan
+        .files()
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            let command = relaxed_plan.compile_command(&[*index]);
+            assert!(!command.is_empty());
+            command.iter().any(|arg| arg == "--relaxed")
+        })
+        .map(|(_, file)| file.path.file_name().unwrap())
+        .collect();
+    assert_eq!(relaxed, ["pkg.vhd"]);
+    fixture.project.set_library_options(lib, Options::default());
+    assert_eq!(fixture.plan(&targets, &state).compile_count(), 0);
+
+    // The keys of SystemVerilog files don't reach the arguments of VHDL files; `encoding` does.
+    let sv_options = Options {
+        include_dirs: Some(vec![IncludeDir::new("/inc")]),
+        defines: BTreeMap::from([("WIDTH".to_owned(), Define::text("8"))]),
+        compilation_unit: Some(CompilationUnit::Library),
+        keywords: Some("1800-2017".parse().unwrap()),
+        sv_libraries: Some(vec!["other".to_owned()]),
+        ..Options::default()
+    };
+    fixture.project.set_library_options(lib, sv_options.clone());
+    assert_eq!(fixture.plan(&targets, &state).compile_count(), 0);
+    fixture.project.set_library_options(
+        lib,
+        Options {
+            encoding: Some(Encoding::Utf8),
+            ..sv_options
+        },
+    );
+    let encoded_plan = fixture.plan(&targets, &state);
+    assert_eq!(encoded_plan.compile_count(), 2);
+    let command = encoded_plan.compile_command(&[0]);
+    assert!(command.iter().any(|arg| arg == "--encoding=utf-8"));
+    assert!(!command.iter().any(|arg| arg.starts_with("--define")));
+    fixture.project.set_library_options(lib, Options::default());
 
     let mut identity = fixture.simulator.identity().clone();
     identity.version_output = "risim-runner 0.1.0\nhydrolyze archive format 2\n".to_owned();
     fixture.simulator = Simulator::from_identity(identity).unwrap();
-    assert_eq!(fixture.plan(&[pkg], &state).compile_count(), 1);
+    assert_eq!(fixture.plan(&targets, &state).compile_count(), 3);
+}
+
+/// Every SystemVerilog and Verilog file is compiled, also one that no testbench needs, with the
+/// arguments of its library, which its VHDL files share.
+#[test]
+fn sv_files_compile_with_their_library_arguments() {
+    let mut fixture = Fixture::new();
+    fixture.library("vunit_lib").library("pkgs").library("rtl");
+    let vunit_pkg = fixture.temp.root.join("vunit_pkg.sv");
+    add_sv(
+        &mut fixture.project,
+        "vunit_lib",
+        &vunit_pkg,
+        "package vunit_pkg;\nendpackage\n",
+    );
+    let pkg_path = fixture.temp.root.join("types_pkg.sv");
+    add_sv(
+        &mut fixture.project,
+        "pkgs",
+        &pkg_path,
+        "package types_pkg;\nendpackage\n",
+    );
+    let unused_path = fixture.temp.root.join("unused.sv");
+    add_sv(
+        &mut fixture.project,
+        "rtl",
+        &unused_path,
+        "module unused;\nendmodule\n",
+    );
+    let sv_path = fixture.temp.root.join("counter.sv");
+    add_sv(
+        &mut fixture.project,
+        "rtl",
+        &sv_path,
+        "module counter;\n  import types_pkg::*;\nendmodule\n",
+    );
+    let top = fixture.add(
+        "rtl",
+        "top.vhd",
+        "entity top is end;\narchitecture a of top is\n  component counter is end \
+         component;\nbegin\n  u : counter;\nend;",
+    );
+    let rtl = fixture.project.find_library("rtl").unwrap();
+    fixture.project.set_library_options(
+        rtl,
+        Options {
+            relaxed: true,
+            include_dirs: Some(vec![IncludeDir::new("/inc")]),
+            ..Options::default()
+        },
+    );
+    fixture.project.finish();
+
+    let discovery = crate::discovery::discover(&fixture.project, &[]);
+    let mut targets = targets(&fixture.project, &discovery);
+    assert_eq!(targets.len(), 4);
+    targets.push(top);
+    let plan = fixture.plan(&targets, &CompileState::default());
+    assert_eq!(plan.errors, []);
+    assert_eq!(
+        names(&plan),
+        [
+            "vunit_pkg.sv",
+            "types_pkg.sv",
+            "unused.sv",
+            "counter.sv",
+            "top.vhd"
+        ]
+    );
+    for (index, file) in plan.files().iter().enumerate() {
+        let command = plan.compile_command(&[index]);
+        let sv_libraries: Vec<&str> = command
+            .iter()
+            .filter_map(|arg| arg.strip_prefix("--sv-library="))
+            .collect();
+        match file.library.as_str() {
+            "rtl" => {
+                assert!(command.iter().any(|arg| arg == "--include-dir=/inc"));
+                assert_eq!(sv_libraries, ["pkgs", "vunit_lib"]);
+            },
+            "pkgs" => assert_eq!(sv_libraries, ["vunit_lib"]),
+            _ => assert_eq!(sv_libraries, Vec::<&str>::new()),
+        }
+    }
+    // A batch of VHDL and SystemVerilog files of one library is one call.
+    let command = plan.compile_command(&[3, 4]);
+    assert_eq!(
+        command[command.len() - 2..],
+        [sv_path.as_str(), plan.files()[4].path.as_str()]
+    );
+}
+
+/// A library that `sv-libraries` names is left out of the `--sv-library` arguments while it has
+/// no files in the plan, since it may have no archive: a VHDL library whose files no testbench
+/// needs, and an empty one.
+#[test]
+fn sv_libraries_without_files_to_compile_are_left_out() {
+    let mut fixture = Fixture::new();
+    fixture
+        .library("vunit_lib")
+        .library("vhdl_lib")
+        .library("empty_lib")
+        .library("rtl");
+    let vunit_pkg = fixture.temp.root.join("vunit_pkg.sv");
+    add_sv(
+        &mut fixture.project,
+        "vunit_lib",
+        &vunit_pkg,
+        "package vunit_pkg;\nendpackage\n",
+    );
+    let pkg = fixture.add("vhdl_lib", "pkg.vhd", PKG);
+    let module = fixture.temp.root.join("m.sv");
+    add_sv(
+        &mut fixture.project,
+        "rtl",
+        &module,
+        "module m;\nendmodule\n",
+    );
+    let rtl = fixture.project.find_library("rtl").unwrap();
+    fixture.project.set_library_options(
+        rtl,
+        Options {
+            sv_libraries: Some(vec!["vhdl_lib".to_owned(), "empty_lib".to_owned()]),
+            ..Options::default()
+        },
+    );
+    fixture.project.finish();
+    let sv_libraries = |args: &[String]| -> Vec<String> {
+        args.iter()
+            .filter_map(|arg| arg.strip_prefix("--sv-library="))
+            .map(str::to_owned)
+            .collect()
+    };
+    // The language server searches all of them.
+    assert_eq!(
+        sv_libraries(&fixture.project.analyze_args(rtl)),
+        ["vhdl_lib", "empty_lib", "vunit_lib"]
+    );
+
+    let discovery = crate::discovery::discover(&fixture.project, &[]);
+    let mut targets = targets(&fixture.project, &discovery);
+    let plan = fixture.plan(&targets, &CompileState::default());
+    assert_eq!(names(&plan), ["vunit_pkg.sv", "m.sv"]);
+    assert_eq!(sv_libraries(&plan.compile_command(&[1])), ["vunit_lib"]);
+
+    targets.push(pkg);
+    let with_pkg = fixture.plan(&targets, &CompileState::default());
+    assert_eq!(names(&with_pkg), ["vunit_pkg.sv", "pkg.vhd", "m.sv"]);
+    assert_eq!(
+        sv_libraries(&with_pkg.compile_command(&[2])),
+        ["vhdl_lib", "vunit_lib"]
+    );
+    // `rtl` waits for `vhdl_lib`, whose archive it loads.
+    assert_eq!(with_pkg.unit_dependencies[2], [0, 1]);
+}
+
+/// A library is scheduled after the libraries that its `--sv-library` arguments name, here
+/// `vunit_lib`, also when none of its files depends on them.
+#[test]
+fn sv_libraries_are_scheduled_first() {
+    let mut fixture = Fixture::new();
+    fixture.library("vunit_lib").library("lib");
+    let vunit_pkg = fixture.temp.root.join("vunit_pkg.sv");
+    add_sv(
+        &mut fixture.project,
+        "vunit_lib",
+        &vunit_pkg,
+        "package vunit_pkg;\nendpackage\n",
+    );
+    let module = fixture.temp.root.join("m.sv");
+    add_sv(
+        &mut fixture.project,
+        "lib",
+        &module,
+        "module m;\nendmodule\n",
+    );
+    fixture.project.finish();
+    let discovery = crate::discovery::discover(&fixture.project, &[]);
+    let plan = fixture.plan(
+        &targets(&fixture.project, &discovery),
+        &CompileState::default(),
+    );
+    assert_eq!(names(&plan), ["vunit_pkg.sv", "m.sv"]);
+    // The files don't depend on each other, but `lib`'s unit waits for `vunit_lib`'s.
+    assert!(plan.files().iter().all(|file| file.dependencies.is_empty()));
+    assert_eq!(plan.units(), [vec![0], vec![1]]);
+    assert_eq!(plan.unit_dependencies, [vec![], vec![0]]);
+}
+
+/// A library is scheduled after the libraries that the library clauses of its VHDL files name,
+/// also when none of its files depends on theirs: here a component that a SystemVerilog module
+/// binds to, which is only an implementation dependency.
+#[test]
+fn libraries_of_library_clauses_are_scheduled_first() {
+    let mut fixture = Fixture::new();
+    fixture.library("tb").library("rtl");
+    let tb = fixture.add(
+        "tb",
+        "tb_counter.vhd",
+        "library rtl, work;\n\
+         entity tb_counter is generic (runner_cfg : string); end entity;\n\
+         architecture tb of tb_counter is\n\
+         component counter is end component;\n\
+         begin\n  dut : component counter;\nend architecture;",
+    );
+    let counter = fixture.temp.root.join("counter.sv");
+    add_sv(
+        &mut fixture.project,
+        "rtl",
+        &counter,
+        "module counter;\nendmodule\n",
+    );
+    fixture.project.finish();
+    let discovery = crate::discovery::discover(&fixture.project, &[]);
+    let targets = targets(&fixture.project, &discovery);
+    assert!(targets.contains(&tb));
+    let plan = fixture.plan(&targets, &CompileState::default());
+    // The files don't depend on each other, and compile in the order they were added, but
+    // `tb`'s unit waits for `rtl`'s.
+    assert_eq!(names(&plan), ["tb_counter.vhd", "counter.sv"]);
+    assert!(plan.files().iter().all(|file| file.dependencies.is_empty()));
+    assert_eq!(plan.units(), [vec![0], vec![1]]);
+    assert_eq!(plan.unit_dependencies, [vec![1], vec![]]);
+}
+
+/// The members of a `library`-mode library's group follow each other in collection order, share
+/// one key and their dependencies, and form one batch.
+#[test]
+fn group_members_share_a_key_and_their_dependencies() {
+    let mut fixture = Fixture::new();
+    fixture.library("pkgs").library("rtl");
+    let rtl = fixture.project.find_library("rtl").unwrap();
+    fixture.project.set_library_options(
+        rtl,
+        Options {
+            compilation_unit: Some(CompilationUnit::Library),
+            ..Options::default()
+        },
+    );
+    let sv = |into: &mut Fixture, library: &str, name: &str, code: &str| {
+        let path = into.temp.root.join(name);
+        add_sv(&mut into.project, library, &path, code)
+    };
+    sv(
+        &mut fixture,
+        "rtl",
+        "b.sv",
+        "module b;\n  import a_pkg::*;\nendmodule\n",
+    );
+    sv(&mut fixture, "rtl", "a.sv", "package a_pkg;\nendpackage\n");
+    sv(&mut fixture, "pkgs", "p.sv", "package p;\nendpackage\n");
+    sv(
+        &mut fixture,
+        "rtl",
+        "c.sv",
+        "module c;\n  import p::*;\nendmodule\n",
+    );
+    fixture.project.finish();
+    let discovery = crate::discovery::discover(&fixture.project, &[]);
+    let targets = targets(&fixture.project, &discovery);
+    let plan = fixture.plan(&targets, &CompileState::default());
+    assert_eq!(plan.errors, []);
+    // `b.sv` imports a package of `a.sv`, but the group keeps the order of the collection.
+    assert_eq!(names(&plan), ["p.sv", "b.sv", "a.sv", "c.sv"]);
+    let members = &plan.files()[1..];
+    assert!(members.iter().all(|file| file.group == Some(0)));
+    assert_eq!(plan.files()[0].group, None);
+    assert!(
+        members
+            .iter()
+            .all(|file| file.compile_key == members[0].compile_key && file.dependencies == [0])
+    );
+    assert_eq!(plan.units(), [vec![0], vec![1, 2, 3]]);
+
+    // A change of one member changes the key of all of them.
+    let state = compiled_state(&plan);
+    assert_eq!(fixture.plan(&targets, &state).compile_count(), 0);
+    let mut changed = Fixture {
+        project: Project::new(),
+        ..fixture
+    };
+    changed.library("pkgs").library("rtl");
+    changed.project.set_library_options(
+        rtl,
+        Options {
+            compilation_unit: Some(CompilationUnit::Library),
+            ..Options::default()
+        },
+    );
+    sv(
+        &mut changed,
+        "rtl",
+        "b.sv",
+        "module b;\n  import a_pkg::*;\nendmodule\n",
+    );
+    sv(
+        &mut changed,
+        "rtl",
+        "a.sv",
+        "package a_pkg;\nendpackage\n// changed\n",
+    );
+    sv(&mut changed, "pkgs", "p.sv", "package p;\nendpackage\n");
+    sv(
+        &mut changed,
+        "rtl",
+        "c.sv",
+        "module c;\n  import p::*;\nendmodule\n",
+    );
+    changed.project.finish();
+    let changed_plan = changed.plan(&targets, &state);
+    let recompiled: Vec<&str> = changed_plan
+        .files()
+        .iter()
+        .filter(|file| file.needs_compile)
+        .map(|file| file.path.file_name().unwrap())
+        .collect();
+    assert_eq!(recompiled, ["b.sv", "a.sv", "c.sv"]);
+}
+
+/// A compile key changes with the contents of an included file, with the creation of the file of
+/// an include that found none, with a define, and with the order of the include directories.
+#[test]
+fn compile_keys_change_with_includes_and_sv_options() {
+    let fixture = Fixture::new();
+    let root = &fixture.temp.root;
+    fixture.temp.write("inc_a/defs.svh", "`define A 1\n");
+    fixture.temp.write("inc_b/defs.svh", "`define A 2\n");
+    let code = "`include \"defs.svh\"\n`include \"missing.svh\"\nmodule m;\nendmodule\n";
+    let path = fixture.temp.write("src/m.sv", code);
+    let key = |include_dirs: &[&str], defines: &[(&str, &str)]| {
+        let mut project = Project::new();
+        let library = project
+            .add_library("lib", VhdlStandard::Vhdl2008, None)
+            .unwrap();
+        let include_dirs: Vec<Utf8PathBuf> =
+            include_dirs.iter().map(|dir| root.join(dir)).collect();
+        project.set_library_options(
+            library,
+            Options {
+                include_dirs: Some(include_dirs.iter().map(IncludeDir::new).collect()),
+                defines: defines
+                    .iter()
+                    .map(|&(name, text)| (name.to_owned(), Define::text(text)))
+                    .collect(),
+                ..Options::default()
+            },
+        );
+        let id = add_sv_including(&mut project, "lib", &path, code, &include_dirs);
+        project.finish();
+        let plan = CompilePlan::new(
+            &PlanInput {
+                layout: &fixture.layout,
+                project: &project,
+                targets: &[id],
+                simulator: &fixture.simulator,
+            },
+            &CompileState::default(),
+        );
+        plan.files()[0].compile_key
+    };
+    let original = key(&["inc_a", "inc_b"], &[]);
+    assert_eq!(key(&["inc_a", "inc_b"], &[]), original);
+    assert_ne!(key(&["inc_b", "inc_a"], &[]), original);
+    assert_ne!(key(&["inc_a", "inc_b"], &[("W", "8")]), original);
+    fixture.temp.write("inc_a/defs.svh", "`define A 3\n");
+    let edited = key(&["inc_a", "inc_b"], &[]);
+    assert_ne!(edited, original);
+    fixture.temp.write("inc_b/missing.svh", "");
+    assert_ne!(key(&["inc_a", "inc_b"], &[]), edited);
+}
+
+/// A VHDL-only project gets no SystemVerilog arguments, and no `vunit_pkg.sv`.
+#[test]
+fn vhdl_only_projects_have_no_sv_arguments() {
+    let workspace = TempRoot::new();
+    workspace.write("src/tb.vhd", TB);
+    workspace.write("src/ent.vhd", "entity ent is end entity;");
+    let builtins_dir = builtins::extract(&workspace.root.join("risim-out/builtins")).unwrap();
+    let mut spec = ProjectSpec::new();
+    spec.options.include_dirs = Some(vec![IncludeDir::new("inc")]);
+    spec.add_library("lib", ["src/*.vhd"]);
+    let loaded = build_project(
+        &workspace.root,
+        &spec,
+        &builtins_dir,
+        &mut SourceCache::new(),
+    );
+    let project = &loaded.project;
+    let discovery = crate::discovery::discover(project, &[]);
+    let targets = targets(project, &discovery);
+    let layout = OutputLayout::new(&workspace.root);
+    let plan = CompilePlan::new(
+        &PlanInput {
+            layout: &layout,
+            project,
+            targets: &targets,
+            simulator: &simulator(),
+        },
+        &CompileState::default(),
+    );
+    assert_eq!(plan.errors, []);
+    assert!(!plan.files().is_empty());
+    assert!(plan.files().iter().all(|file| file.kind == FileKind::Vhdl));
+    for index in 0..plan.files().len() {
+        let command = plan.compile_command(&[index]);
+        assert!(
+            !command
+                .iter()
+                .any(|arg| arg.starts_with("--sv-library") || arg.starts_with("--include-dir")),
+            "{command:?}"
+        );
+    }
+}
+
+/// Libraries whose SystemVerilog dependencies form a cycle can't be compiled.
+#[test]
+fn sv_library_cycle_fails_the_plan() {
+    let mut fixture = Fixture::new();
+    fixture.library("a").library("b");
+    let a_path = fixture.temp.root.join("a.sv");
+    add_sv(
+        &mut fixture.project,
+        "a",
+        &a_path,
+        "package a_pkg;\n  import b_pkg::*;\nendpackage\n",
+    );
+    let b_path = fixture.temp.root.join("b.sv");
+    add_sv(
+        &mut fixture.project,
+        "b",
+        &b_path,
+        "package b_pkg;\n  import a_pkg::*;\nendpackage\n",
+    );
+    fixture.project.finish();
+    let discovery = crate::discovery::discover(&fixture.project, &[]);
+    let plan = fixture.plan(
+        &targets(&fixture.project, &discovery),
+        &CompileState::default(),
+    );
+    assert_eq!(plan.errors, []);
+    assert_eq!(plan.project_errors.len(), 1);
+    assert!(plan.project_errors[0].message.contains("cycle"));
+    assert!(plan.files().is_empty());
 }
 
 #[test]

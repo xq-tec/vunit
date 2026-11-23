@@ -2,12 +2,17 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at http://mozilla.org/MPL/2.0/.
 
-//! The VUnit and OSVVM VHDL libraries that every project gets.
+//! The VHDL and Verilog builtins: the VUnit and OSVVM libraries that every project gets.
 //!
 //! The files are embedded at build time (see `build.rs`). [`select`] ports the selection
 //! logic of `builtins.py` for risim, which supports context declarations and package
-//! generics, but not VHDL-2019 call paths or a vendor coverage API. [`extract`] writes the
-//! files to disk so they can be compiled.
+//! generics, but not VHDL-2019 call paths or a vendor coverage API.
+//! A project with SystemVerilog or Verilog files also gets VUnit's SystemVerilog package in
+//! `vunit_lib` (`add_verilog_builtins`); the include directory with its macros is added to the
+//! libraries by `sources::collect`.
+//! For OSVVM, it ports `builtins.py` as it was before upstream moved OSVVM into its
+//! `vunit-osvvm` package (`UPSTREAM.md`).
+//! [`extract`] writes the files to disk so they can be compiled.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -99,10 +104,13 @@ const OSVVM_WITHOUT_PACKAGE_GENERICS: [&str; 4] = [
 ///
 /// The VUnit core libraries are always selected, and so are com (from VHDL-2008 on) and OSVVM
 /// unless `include_osvvm` is false because the project defines its own `osvvm` library.
+/// With `has_sv`, for a project with SystemVerilog or Verilog files, `vunit_lib` also gets
+/// VUnit's SystemVerilog package, last.
 pub fn select(
     standard: VhdlStandard,
     features: &BTreeSet<Feature>,
     include_osvvm: bool,
+    has_sv: bool,
 ) -> Selection {
     let mut diagnostics = Vec::new();
     let mut vunit_lib = Vec::new();
@@ -158,6 +166,11 @@ pub fn select(
         );
     }
 
+    if has_sv {
+        // `add_verilog_builtins`
+        vunit_lib.extend(sv_files_in("verilog"));
+    }
+
     let mut libraries = vec![BuiltinLibrary {
         name: VUNIT_LIB,
         files: vunit_lib,
@@ -203,6 +216,16 @@ fn files_in(dir: &str) -> impl Iterator<Item = &'static BuiltinFile> + '_ {
             && Utf8Path::new(file.rel_path)
                 .extension()
                 .is_some_and(|extension| extension == "vhd")
+    })
+}
+
+/// The SystemVerilog sources directly in `dir`, without include files.
+fn sv_files_in(dir: &str) -> impl Iterator<Item = &'static BuiltinFile> + '_ {
+    BUILTIN_FILES.iter().filter(move |file| {
+        file.dir() == dir
+            && Utf8Path::new(file.rel_path)
+                .extension()
+                .is_some_and(|extension| extension == "sv")
     })
 }
 
@@ -286,7 +309,7 @@ mod tests {
     }
 
     fn select_default(standard: VhdlStandard) -> Selection {
-        select(standard, &BTreeSet::new(), true)
+        select(standard, &BTreeSet::new(), true, false)
     }
 
     #[test]
@@ -366,7 +389,7 @@ mod tests {
     #[test]
     fn features_add_files() {
         let features = BTreeSet::from(Feature::ALL);
-        let selection = select(VhdlStandard::Vhdl2019, &features, false);
+        let selection = select(VhdlStandard::Vhdl2019, &features, false, false);
         assert!(selection.diagnostics.is_empty());
         assert_eq!(selection.libraries.len(), 1);
         let vunit_files = rel_paths(&selection.libraries[0]);
@@ -399,13 +422,42 @@ mod tests {
     #[test]
     fn features_need_vhdl_2008() {
         let features = BTreeSet::from(Feature::ALL);
-        let selection = select(VhdlStandard::Vhdl2002, &features, true);
+        let selection = select(VhdlStandard::Vhdl2002, &features, true, false);
         assert_eq!(selection.diagnostics.len(), 2);
         let vunit_files = rel_paths(&selection.libraries[0]);
         assert!(
             !vunit_files
                 .iter()
                 .any(|path| path.starts_with("vhdl/random/"))
+        );
+    }
+
+    #[test]
+    fn sv_package_only_with_sv_sources() {
+        let sv_files = |has_sv| {
+            let selection = select(VhdlStandard::Vhdl2008, &BTreeSet::new(), true, has_sv);
+            selection
+                .libraries
+                .iter()
+                .flat_map(|library| {
+                    library
+                        .files
+                        .iter()
+                        .filter(|file| file.dir().starts_with("verilog"))
+                        .map(|file| (library.name, file.rel_path))
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sv_files(false), []);
+        assert_eq!(sv_files(true), [(VUNIT_LIB, "verilog/vunit_pkg.sv")]);
+        // It comes after the VHDL files.
+        let selection = select(VhdlStandard::Vhdl2008, &BTreeSet::new(), true, true);
+        assert_eq!(
+            selection.libraries[0]
+                .files
+                .last()
+                .map(|file| file.rel_path),
+            Some("verilog/vunit_pkg.sv")
         );
     }
 
