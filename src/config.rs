@@ -1476,7 +1476,8 @@ files = []
         );
     }
 
-    /// `[libraries.NAME.options]` has no valid keys; the library loads with the default options.
+    /// The project options are errors in `[libraries.NAME.options]`, and so are unknown keys and an
+    /// `options` that isn't a table; the library loads with the default options.
     #[test]
     fn library_options() {
         let config = parse_str(
