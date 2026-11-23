@@ -14,9 +14,15 @@
 //!   closed. Cancelling terminates the job. A grandchild spawned before the assignment escapes,
 //!   which is acceptable because risim-runner doesn't spawn children.
 //!
+//! A simulator may end its simulation without exiting, held for a waveform viewer: it reports
+//! the end to whoever holds it (riSim's hub), and [`run_to_file_held`] then hands the running
+//! [`Process`] over to the caller instead of waiting for its exit ([`HeldOutcome::Held`]).
+//! A cancel no longer reaches a process that was handed over; its new owner ends it.
+//!
 //! AI NOTICE: Generated, minimally reviewed.
 
 use std::ffi::OsStr;
+use std::fmt;
 use std::fs;
 use std::fs::File;
 use std::io;
@@ -36,6 +42,7 @@ use tokio::io::BufReader;
 use tokio::process::Child;
 use tokio::process::Command;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 /// How long a cancelled process may take to exit after `SIGTERM` before it is killed.
@@ -48,6 +55,21 @@ pub enum Outcome {
     Exited(ExitStatus),
     /// The process was cancelled and terminated.
     Cancelled,
+}
+
+/// How a process that may be held ended, or that it was held.
+#[derive(Debug)]
+pub enum HeldOutcome {
+    /// The process exited, or was cancelled, before it was held.
+    Ended(Outcome),
+    /// The simulation ended with `status` while the process was held; the process lives on, and
+    /// the caller owns it.
+    Held {
+        /// The exit status that the simulation reported.
+        status: i32,
+        /// The running process.
+        process: Process,
+    },
 }
 
 /// Creates a command for `program` without a console window on Windows.
@@ -101,6 +123,56 @@ pub async fn run_to_file(
     header: &[u8],
     cancel: &CancellationToken,
 ) -> io::Result<Outcome> {
+    let mut process = spawn_to_file(command_line, cwd, output_file, header)?;
+    process.wait_or_cancel(cancel).await
+}
+
+/// Runs `command_line` as [`run_to_file`] does, but hands the process over once `ended` yields
+/// the exit status of a simulation that ended while it was held.
+///
+/// The process exiting comes first, then a cancel, then `ended`; a dropped sender of `ended`
+/// leaves the process to exit or be cancelled.
+///
+/// # Errors
+///
+/// Fails if the output file can't be created or the process can't be spawned or waited for.
+pub async fn run_to_file_held(
+    command_line: &[String],
+    cwd: &Utf8Path,
+    output_file: &Utf8Path,
+    header: &[u8],
+    cancel: &CancellationToken,
+    ended: Option<oneshot::Receiver<i32>>,
+) -> io::Result<HeldOutcome> {
+    let mut process = spawn_to_file(command_line, cwd, output_file, header)?;
+    let ended = async {
+        match ended {
+            Some(ended) => match ended.await {
+                Ok(status) => status,
+                Err(_closed) => std::future::pending().await,
+            },
+            None => std::future::pending().await,
+        }
+    };
+    tokio::select! {
+        biased;
+        status = process.child.wait() => Ok(HeldOutcome::Ended(Outcome::Exited(status?))),
+        () = cancel.cancelled() => {
+            process.terminate().await?;
+            Ok(HeldOutcome::Ended(Outcome::Cancelled))
+        },
+        status = ended => Ok(HeldOutcome::Held { status, process }),
+    }
+}
+
+/// Spawns `command_line` in `cwd` with stdout and stderr redirected to `output_file`, which
+/// starts with `header`.
+fn spawn_to_file(
+    command_line: &[String],
+    cwd: &Utf8Path,
+    output_file: &Utf8Path,
+    header: &[u8],
+) -> io::Result<Process> {
     let (program, args) = split_command_line(command_line)?;
     let mut stdout = create_output_file(output_file)?;
     stdout.write_all(header)?;
@@ -108,8 +180,7 @@ pub async fn run_to_file(
     let mut command = command(program, args, Some(cwd));
     command.stdout(stdout).stderr(stderr);
     tracing::debug!(?command_line, %output_file, "spawning");
-    let mut process = Supervised::spawn(command)?;
-    process.wait(cancel).await
+    Process::spawn(command)
 }
 
 /// Runs `command_line` in `cwd`, copies stdout and stderr to `output_file`, and calls
@@ -133,7 +204,7 @@ pub async fn run_piped(
     let mut command = command(program, args, Some(cwd));
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     tracing::debug!(?command_line, %output_file, "spawning");
-    let mut process = Supervised::spawn(command)?;
+    let mut process = Process::spawn(command)?;
 
     let (sender, mut lines) = mpsc::unbounded_channel();
     if let Some(stdout) = process.child.stdout.take() {
@@ -160,7 +231,7 @@ pub async fn run_piped(
         }
     }
     output.flush()?;
-    process.wait(cancel).await
+    process.wait_or_cancel(cancel).await
 }
 
 async fn forward_lines(
@@ -186,7 +257,10 @@ async fn forward_lines(
 }
 
 /// A child process in its own process tree.
-struct Supervised {
+///
+/// Dropping it kills the process, and on Windows the rest of its tree;
+/// [`terminate`](Self::terminate) ends the whole tree.
+pub struct Process {
     child: Child,
     #[cfg(unix)]
     process_group: Option<nix::unistd::Pid>,
@@ -194,7 +268,7 @@ struct Supervised {
     job: Option<job::Job>,
 }
 
-impl Supervised {
+impl Process {
     fn spawn(mut command: Command) -> io::Result<Self> {
         #[cfg(unix)]
         {
@@ -253,8 +327,22 @@ impl Supervised {
         }
     }
 
+    /// The OS identifier of the process, or `None` once it has been waited for.
+    pub fn id(&self) -> Option<u32> {
+        self.child.id()
+    }
+
+    /// Waits for the process to exit.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the process can't be waited for.
+    pub async fn wait(&mut self) -> io::Result<ExitStatus> {
+        self.child.wait().await
+    }
+
     /// Waits for the process to exit, terminating it if `cancel` fires first.
-    async fn wait(&mut self, cancel: &CancellationToken) -> io::Result<Outcome> {
+    async fn wait_or_cancel(&mut self, cancel: &CancellationToken) -> io::Result<Outcome> {
         tokio::select! {
             status = self.child.wait() => Ok(Outcome::Exited(status?)),
             () = cancel.cancelled() => {
@@ -265,7 +353,13 @@ impl Supervised {
     }
 
     /// Terminates the whole process tree and waits for the process to exit.
-    async fn terminate(&mut self) -> io::Result<()> {
+    ///
+    /// On Unix, the tree gets `SIGTERM`, and `SIGKILL` after [`KILL_GRACE_PERIOD`].
+    ///
+    /// # Errors
+    ///
+    /// Fails if the process can't be waited for.
+    pub async fn terminate(&mut self) -> io::Result<()> {
         #[cfg(unix)]
         if let Some(group) = self.process_group {
             use nix::sys::signal::Signal;
@@ -295,6 +389,14 @@ impl Supervised {
         }
         self.child.wait().await?;
         Ok(())
+    }
+}
+
+impl fmt::Debug for Process {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Process")
+            .field("id", &self.id())
+            .finish_non_exhaustive()
     }
 }
 
@@ -410,6 +512,64 @@ mod tests {
         assert!(contents.starts_with("header\n"), "{contents}");
         assert!(contents.contains("hello") && contents.contains("oops"));
         assert!(!contents.contains("old contents"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_held_process_is_handed_over() {
+        let temp = TempRoot::new();
+        let root = &temp.root;
+        let output = root.join("out.txt");
+        let (sender, ended) = oneshot::channel();
+        sender.send(3).unwrap();
+        let outcome = run_to_file_held(
+            &shell("echo held && sleep 30"),
+            root,
+            &output,
+            b"",
+            &CancellationToken::new(),
+            Some(ended),
+        )
+        .await
+        .unwrap();
+        let HeldOutcome::Held {
+            status,
+            mut process,
+        } = outcome
+        else {
+            panic!("{outcome:?}")
+        };
+        assert_eq!(status, 3);
+        assert!(process.id().is_some());
+        // The process lives on until its new owner ends it.
+        tokio::time::timeout(Duration::from_millis(200), process.wait())
+            .await
+            .unwrap_err();
+        process.terminate().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_exit_comes_before_a_held_end() {
+        let temp = TempRoot::new();
+        let root = &temp.root;
+        let output = root.join("out.txt");
+        let (sender, ended) = oneshot::channel();
+        // A dropped sender leaves the process to exit.
+        drop(sender);
+        let outcome = run_to_file_held(
+            &shell("exit 2"),
+            root,
+            &output,
+            b"",
+            &CancellationToken::new(),
+            Some(ended),
+        )
+        .await
+        .unwrap();
+        let HeldOutcome::Ended(Outcome::Exited(status)) = outcome else {
+            panic!("{outcome:?}")
+        };
+        assert_eq!(status.code(), Some(2));
     }
 
     #[tokio::test]

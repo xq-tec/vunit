@@ -51,8 +51,8 @@ pub struct RuntimeOptions {
     /// environment.
     pub run_defaults: RunOptions,
     /// Checks the run options of the `[options]` table of `risim-config.toml` (`relaxed`,
-    /// `opt-level`, and `opt`), one key at a time; an error becomes a configuration diagnostic,
-    /// and the key is left out
+    /// `opt-level`, `opt`, and the snapshot keys), one key at a time; an error becomes a
+    /// configuration diagnostic, and the key is left out
     /// ([`config::load`](crate::config::load)).
     ///
     /// `None` takes them unchecked, for the runner to check.

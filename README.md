@@ -37,11 +37,13 @@ A workspace is opened from a `risim-config.toml`:
 
 ```toml
 # The options of the project: relaxed analysis and elaboration, the optimization preset, and rows
-# or groups of optimizations over it; then the options of SystemVerilog and Verilog files, and the
-# encoding of all files. Only tables follow the header.
+# or groups of optimizations over it, and the snapshots; then the options of SystemVerilog and
+# Verilog files, and the encoding of all files. Only tables follow the header.
 [options]
 relaxed = true
 opt-level = "full"
+snapshots = "on"
+snapshot-interval = 0.5
 include-dirs = ["inc"]
 defines = { WIDTH = "8", DEBUG = true, "MAX(a,b)" = "((a)>(b)?(a):(b))" }
 encoding = "utf-8"
@@ -68,6 +70,7 @@ version = "1.4"
 
 - `relaxed = true` is `--relaxed` for analysis (`Options::analyze_args`) and the run option `relaxed` for elaboration; `relaxed = false` is the same as no key.
 - `opt-level` is the run option `opt-level`, a preset name or its number.
+- `snapshots`, `snapshot-interval`, `snapshot-keep`, and `snapshot-memory` are the run options of the same name: `snapshots` is a string, `snapshot-interval` a number of seconds, and `snapshot-keep` and `snapshot-memory` integers.
 - Each key `NAME` of `[options.opt]` (or `opt = { … }`) is the run option `opt.NAME`, with a string mode.
   A dotted name is quoted (`"mir.cse" = "off"`); a table in `[options.opt]`, such as `mir.cse = "off"` or `[options.opt.mir]`, is an error that names the quoted form.
 
@@ -81,7 +84,7 @@ version = "1.4"
 The table can also be written inline, `options = { relaxed = true }`, which avoids the TOML pitfall that bare and dotted keys after the `[options]` header belong to it.
 
 `[libraries.NAME.options]` holds a library's own options, over the project's (`Options::for_library`): a key of the library replaces the project's, except `defines`, which merge by name, and where `false` removes the project's macro of that name.
-`relaxed`, `opt-level`, and `opt` are project level only.
+`relaxed`, `opt-level`, `opt`, and the snapshot keys are project level only.
 `sv-libraries` is library level only: the libraries, in order, that the library's SystemVerilog files search for packages and definitions after their own library.
 It can't name the library itself, and accepts `vunit_lib`, a library of every project.
 Without it, the libraries are derived from the packages that the library's files import or refer to, and the interfaces they use, that other libraries define, in the order of their first use; `vunit_lib` is added last either way, so naming it is optional.
@@ -141,15 +144,19 @@ Simulations share a budget of threads (`RuntimeOptions::threads`, resizable), an
 Each simulation takes a share of the free threads, up to the threads that it can use (`RuntimeOptions::max_threads_per_test`), and asks the `LeaseProvider` of the runtime for a lease of them, whose run options go over the run options of the configuration and the defaults, but not over the keys that every simulation sets; a test waiting for threads reports it as `TestThreads`.
 The `threads` module documents the rules.
 
+A lease can hold its simulator at the end of the simulation (`Lease::with_ended`), so that riSim's hub can keep an ended simulation alive for its waveform viewer.
+The test then finishes with the exit status that the simulation reported, with its results complete, while the simulator lives on; the `LeaseProvider` adopts the simulator with the lease's guard and one thread of the budget (`LeaseProvider::adopt`, which by default terminates it), and the operation's other tests no longer wait for it.
+Before a test of the same testcase recreates its output directory, the provider ends that simulator (`LeaseProvider::release_held`), and `ThreadBudget::waiters` tells it when tests wait for threads, which held simulators may keep.
+
 A simulation runs `risim-runner run <options>`, with its options as one JSON object, whose keys are the long option names of `risim run` (riSim's `risim-run-options`).
-The object has the keys that every simulation sets (`simulator::SIMULATION_KEYS`: the libraries, the top-level unit, the generics, the assertion and GUI options, and the testcase name), the run options of the configuration (`SimOptions::run_options`, such as the run keys `relaxed`, `opt-level`, and `opt` of the `[options]` of `risim-config.toml`), and the defaults of the runtime that these don't set (`RuntimeOptions::run_defaults`, such as those that riSim's hub takes from its environment).
+The object has the keys that every simulation sets (`simulator::SIMULATION_KEYS`: the libraries, the top-level unit, the generics, the assertion and GUI options, and the testcase name), the run options of the configuration (`SimOptions::run_options`, such as the run keys `relaxed`, `opt-level`, `opt`, and the snapshot keys of the `[options]` of `risim-config.toml`), and the defaults of the runtime that these don't set (`RuntimeOptions::run_defaults`, such as those that riSim's hub takes from its environment).
 The run options go over the defaults by the layer rule of riSim's `risim-run-options` (`simulator::overlay_run_options`), and those of a test configuration over the project's by the same rule: a later layer's `opt-level` drops the `opt.*` keys of the earlier ones, and its `opt.<name>` the keys `opt.<name>.*`.
 The run options of a `SimulationRequest` (`options`, such as the optimizations that riSim's GUI chooses) go over those of the configuration by the same rule.
 Simulates whose requests have different run options don't merge, and a testcase that several requests with different run options match runs once, with those of the first, and a warning.
 Run options that set a key of the simulation fail the test.
 The runner names the format of the object in `--version` (`run options format N`); a runner that reads another format than `simulator::RUN_OPTIONS_FORMAT`, or names none, can't be used, and `Runtime::new` fails.
 
-`Runtime::simulation_limit` returns the shared budget of threads as a `SimulationLimit`, so that a simulation that the application runs outside of a workspace, such as a standalone run of riSim's hub, waits for it like a testcase; `Runtime::leases` grants it its lease.
+`Runtime::simulation_limit` returns the shared budget of threads as a `SimulationLimit`, so that a simulation that the application runs outside of a workspace, such as a standalone run of riSim's hub, waits for it like a testcase; `Runtime::leases` grants it its lease, and `process::run_to_file_held` runs a simulator that its lease may hold.
 
 The compile set is what the testbenches need, and every SystemVerilog and Verilog file, since their testbenches don't run yet.
 The consecutive files of one library that need compiling are analysed by one `risim analyze`, with the library's arguments, which prints its reports as JSON lines (`--message-format=json`); a library's batches wait for the libraries of its `--sv-library` arguments, which leave out a library with neither files to compile nor a precompiled archive, since it has nothing for SystemVerilog to find, and for the libraries of the project that the library clauses of its VHDL files name, since analysis needs their archives even when no reference makes a file depend on theirs, as for a component bound to a SystemVerilog module.

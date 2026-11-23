@@ -6,12 +6,14 @@
 //!
 //! ```toml
 //! # The options of the project: relaxed analysis and elaboration, the optimization preset, and
-//! # rows or groups of optimizations over it, where dotted names are quoted; then the options of
-//! # SystemVerilog and Verilog files, and the encoding of all files.
+//! # rows or groups of optimizations over it, where dotted names are quoted, and the snapshots;
+//! # then the options of SystemVerilog and Verilog files, and the encoding of all files.
 //! # Only tables follow, since bare keys after the header would belong to `[options]`.
 //! [options]
 //! relaxed = true
 //! opt-level = "full"
+//! snapshots = "on"
+//! snapshot-interval = 0.5
 //! include-dirs = ["inc"]
 //! defines = { WIDTH = "8", DEBUG = true, "MAX(a,b)" = "((a)>(b)?(a):(b))" }
 //! compilation-unit = "file"
@@ -40,7 +42,8 @@
 //! `[options]` can also be written inline, `options = { relaxed = true }`, which stays correct
 //! anywhere above the tables.
 //! It becomes [`ProjectSpec::options`] for analysis, and the run options `relaxed`, `opt-level`,
-//! and `opt.<name>` of every simulation ([`SimOptions::run_options`]); the run options of a
+//! `snapshots`, `snapshot-interval`, `snapshot-keep`, `snapshot-memory`, and `opt.<name>` of every
+//! simulation ([`SimOptions::run_options`]); the run options of a
 //! configuration go over them ([`SimOptions::overridden_by`]).
 //! `relaxed = false` is the same as no key.
 //!
@@ -131,8 +134,8 @@ pub struct ReadError {
 /// Reads and parses the configuration file at `path`.
 ///
 /// `check_run_options` checks the run options of its `[options]` table (`relaxed`,
-/// `opt-level`, and `opt`), one key at a time; a key that it rejects is an error and isn't
-/// applied.
+/// `opt-level`, `opt`, and the snapshot keys), one key at a time; a key that it rejects is an
+/// error and isn't applied.
 ///
 /// # Errors
 ///
@@ -178,8 +181,16 @@ pub fn parse(path: &Utf8Path, content: &str, check_run_options: Option<CheckRunO
     }
 }
 
-/// The keys of `[options]` that are project level only.
-const PROJECT_KEYS: [&str; 3] = ["relaxed", "opt-level", "opt"];
+/// The keys of `[options]` that are project level only: the run options.
+const PROJECT_KEYS: [&str; 7] = [
+    "relaxed",
+    "opt-level",
+    "opt",
+    "snapshots",
+    "snapshot-interval",
+    "snapshot-keep",
+    "snapshot-memory",
+];
 
 /// The keys of `[options]` that a library can set too.
 const SHARED_KEYS: [&str; 5] = [
@@ -227,6 +238,51 @@ struct RawToolchain {
 struct RawVunit {
     #[serde(default)]
     features: Vec<Spanned<String>>,
+}
+
+/// The type of the value of a snapshot key of `[options]`.
+#[derive(Clone, Copy)]
+enum SnapshotValue {
+    /// A string, such as `"on"`.
+    Text,
+    /// A number, integer or not, such as `10` or `0.5`.
+    Number,
+    /// An integer.
+    Integer,
+}
+
+impl SnapshotValue {
+    /// The type of the snapshot key `key`.
+    fn of(key: &str) -> Self {
+        match key {
+            "snapshots" => Self::Text,
+            "snapshot-interval" => Self::Number,
+            _ => Self::Integer,
+        }
+    }
+
+    /// Returns the JSON value of `value` if it has this type.
+    fn json(self, value: &toml::Value) -> Option<serde_json::Value> {
+        match (self, value) {
+            (Self::Text, toml::Value::String(text)) => Some(text.clone().into()),
+            (Self::Number | Self::Integer, toml::Value::Integer(integer)) => {
+                Some((*integer).into())
+            },
+            (Self::Number, toml::Value::Float(float)) => {
+                serde_json::Number::from_f64(*float).map(Into::into)
+            },
+            _ => None,
+        }
+    }
+
+    /// Describes the type, for the error of a value of another one.
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Text => "a string, such as \"on\"",
+            Self::Number => "a number of seconds, such as 10 or 0.5",
+            Self::Integer => "an integer",
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -398,8 +454,8 @@ impl Parser<'_> {
         if raw.run.is_some() {
             self.diagnostic(
                 Severity::Error,
-                "[run] is part of [options] now: write opt-level there, and [options.opt] for \
-                 [run.opt]"
+                "[run] is part of [options] now: write opt-level and the snapshot keys there, and \
+                 [options.opt] for [run.opt]"
                     .to_owned(),
                 key_span(table, &[PathSegment::Key("run".to_owned())]),
             );
@@ -488,6 +544,9 @@ impl Parser<'_> {
                         );
                     }
                 },
+                "snapshots" | "snapshot-interval" | "snapshot-keep" | "snapshot-memory" => {
+                    self.snapshot_option(key, &entry, value_span, run_options);
+                },
                 "opt" => match entry {
                     toml::Value::Table(modes) => self.opt_modes(modes, table, run_options),
                     _ => self.diagnostic(
@@ -512,6 +571,26 @@ impl Parser<'_> {
             }
         }
         options
+    }
+
+    /// Adds the snapshot key `key` of `[options]` with the value `entry` at `span` to
+    /// `run_options` as the run option of the same name, if it has the key's type and the check
+    /// accepts it.
+    fn snapshot_option(
+        &mut self,
+        key: String,
+        entry: &toml::Value,
+        span: Option<ops::Range<usize>>,
+        run_options: &mut RunOptions,
+    ) {
+        let kind = SnapshotValue::of(&key);
+        let what = format!("'{key}' in [options]");
+        if let Some(json) = kind.json(entry) {
+            self.run_option(key, json, &what, span, run_options);
+        } else {
+            let message = format!("{what} is {}, not {entry}", kind.description());
+            self.diagnostic(Severity::Error, message, span);
+        }
     }
 
     /// Adds the run options `opt.<name>` of the modes `modes` of `[options.opt]` to
@@ -1187,6 +1266,10 @@ files = ["sim/model/*.vhd", "tb/*.vhd"]
         let expected = RunOptions::from_iter([
             ("relaxed".to_owned(), true.into()),
             ("opt-level".to_owned(), "full".into()),
+            ("snapshots".to_owned(), "on".into()),
+            ("snapshot-interval".to_owned(), 0.5.into()),
+            ("snapshot-keep".to_owned(), 4.into()),
+            ("snapshot-memory".to_owned(), 64.into()),
             ("opt.wake-guards".to_owned(), "off".into()),
             ("opt.mir.cse".to_owned(), "off".into()),
         ]);
@@ -1195,6 +1278,10 @@ files = ["sim/model/*.vhd", "tb/*.vhd"]
 [options]
 relaxed = true
 opt-level = "full"
+snapshots = "on"
+snapshot-interval = 0.5
+snapshot-keep = 4
+snapshot-memory = 64
 
 [options.opt]
 wake-guards = "off"
@@ -1256,13 +1343,15 @@ files = []
                 (
                     Severity::Error,
                     "unknown option 'colour' in [options]; expected one of: relaxed, opt-level, \
-                     opt, include-dirs, defines, compilation-unit, keywords, encoding",
+                     opt, snapshots, snapshot-interval, snapshot-keep, snapshot-memory, \
+                     include-dirs, defines, compilation-unit, keywords, encoding",
                     Some(Position::new(2, 1))
                 ),
                 (
                     Severity::Error,
                     "unknown option 'top' in [options]; expected one of: relaxed, opt-level, \
-                     opt, include-dirs, defines, compilation-unit, keywords, encoding",
+                     opt, snapshots, snapshot-interval, snapshot-keep, snapshot-memory, \
+                     include-dirs, defines, compilation-unit, keywords, encoding",
                     Some(Position::new(3, 1))
                 ),
                 (
@@ -1352,8 +1441,9 @@ files = []
             [(
                 Severity::Error,
                 "unknown option 'libraries' in [options]; expected one of: relaxed, opt-level, \
-                 opt, include-dirs, defines, compilation-unit, keywords, encoding; keys after \
-                 the [options] header belong to it, so put them above the header, or write \
+                 opt, snapshots, snapshot-interval, snapshot-keep, snapshot-memory, \
+                 include-dirs, defines, compilation-unit, keywords, encoding; keys after the \
+                 [options] header belong to it, so put them above the header, or write \
                  options = { … }",
                 Some(Position::new(3, 1))
             )]
@@ -1362,13 +1452,15 @@ files = []
 
     #[test]
     fn run_table_is_an_error() {
-        let config = parse_str("[run]\nopt-level = \"off\"\n[run.opt]\nwake-guards = \"off\"\n");
+        let config = parse_str(
+            "[run]\nopt-level = \"off\"\nsnapshots = \"on\"\n[run.opt]\nwake-guards = \"off\"\n",
+        );
         assert_eq!(
             messages(&config),
             [(
                 Severity::Error,
-                "[run] is part of [options] now: write opt-level there, and [options.opt] for \
-                 [run.opt]",
+                "[run] is part of [options] now: write opt-level and the snapshot keys there, and \
+                 [options.opt] for [run.opt]",
                 Some(Position::new(1, 2))
             )]
         );
@@ -1394,6 +1486,7 @@ files = []
 [libraries.lib.options]
 relaxed = true
 opt-level = "full"
+snapshot-interval = 0.5
 include = "inc"
 [libraries.other]
 files = []
@@ -1415,14 +1508,19 @@ options = 1
                 ),
                 (
                     Severity::Error,
-                    "unknown option 'include' in [libraries.lib.options]; expected one of: \
-                     include-dirs, defines, compilation-unit, keywords, encoding, sv-libraries",
+                    "'snapshot-interval' is a project option; set it in [options]",
                     Some(Position::new(7, 1))
                 ),
                 (
                     Severity::Error,
+                    "unknown option 'include' in [libraries.lib.options]; expected one of: \
+                     include-dirs, defines, compilation-unit, keywords, encoding, sv-libraries",
+                    Some(Position::new(8, 1))
+                ),
+                (
+                    Severity::Error,
                     "`options` of library 'other' is a table, such as options = {}",
-                    Some(Position::new(10, 11))
+                    Some(Position::new(11, 11))
                 ),
             ]
         );
@@ -2168,6 +2266,73 @@ wake-guards = "off"
         );
     }
 
+    /// The snapshot keys of `[options]` become the run options of the same name, with their
+    /// JSON types: a string, a number of seconds, also an integer one, and integers.
+    #[test]
+    fn options_table_takes_the_snapshot_keys() {
+        let config = parse_str(
+            "[options]\nsnapshots = \"on\"\nsnapshot-interval = 0.5\nsnapshot-keep = 4\n\
+             snapshot-memory = 64\n",
+        );
+        assert_eq!(messages(&config), []);
+        assert_eq!(
+            config.spec.unwrap().sim_options.run_options,
+            Some(RunOptions::from_iter([
+                ("snapshots".to_owned(), "on".into()),
+                ("snapshot-interval".to_owned(), 0.5.into()),
+                ("snapshot-keep".to_owned(), 4.into()),
+                ("snapshot-memory".to_owned(), 64.into()),
+            ]))
+        );
+        let integer = parse_str("options = { snapshot-interval = 10 }\n");
+        assert_eq!(
+            integer.spec.unwrap().sim_options.run_options,
+            Some(RunOptions::from_iter([(
+                "snapshot-interval".to_owned(),
+                10.into()
+            )]))
+        );
+    }
+
+    /// A snapshot key of another type is an error at the value, in file order, and is left out.
+    #[test]
+    fn options_table_snapshot_errors() {
+        let config = parse_str(
+            "[options]\nsnapshot-memory = \"1 GiB\"\nsnapshots = true\nsnapshot-interval = \"10\"\n\
+             snapshot-keep = 1.5\n",
+        );
+        assert_eq!(
+            messages(&config),
+            [
+                (
+                    Severity::Error,
+                    "'snapshot-memory' in [options] is an integer, not \"1 GiB\"",
+                    Some(Position::new(2, 19))
+                ),
+                (
+                    Severity::Error,
+                    "'snapshots' in [options] is a string, such as \"on\", not true",
+                    Some(Position::new(3, 13))
+                ),
+                (
+                    Severity::Error,
+                    "'snapshot-interval' in [options] is a number of seconds, such as 10 or 0.5, \
+                     not \"10\"",
+                    Some(Position::new(4, 21))
+                ),
+                (
+                    Severity::Error,
+                    "'snapshot-keep' in [options] is an integer, not 1.5",
+                    Some(Position::new(5, 17))
+                ),
+            ]
+        );
+        assert_eq!(
+            config.spec.unwrap().sim_options.run_options,
+            Some(RunOptions::new())
+        );
+    }
+
     /// A table in `[options.opt]` is an error that names the quoted form, also an empty one, and
     /// a mode that isn't a string is an error at the mode; other keys of `[options]` are unknown,
     /// also those of other run options.
@@ -2191,7 +2356,8 @@ loops = "on"
                 (
                     Severity::Error,
                     "unknown option 'finish-after' in [options]; expected one of: relaxed, \
-                     opt-level, opt, include-dirs, defines, compilation-unit, keywords, encoding",
+                     opt-level, opt, snapshots, snapshot-interval, snapshot-keep, \
+                     snapshot-memory, include-dirs, defines, compilation-unit, keywords, encoding",
                     Some(Position::new(3, 1))
                 ),
                 (
@@ -2223,10 +2389,14 @@ loops = "on"
         );
     }
 
-    /// Rejects `opt-level` `o3` and the row `bad`, as riSim's hub rejects unknown values.
+    /// Rejects `opt-level` `o3`, the row `bad` and `snapshot-keep` 0, as riSim's hub rejects
+    /// them.
     fn check(options: &RunOptions) -> Result<(), String> {
         if options.get("opt-level").is_some_and(|level| level == "o3") {
             return Err("unknown variant `o3`".to_owned());
+        }
+        if options.get("snapshot-keep").is_some_and(|keep| keep == 0) {
+            return Err("`snapshot-keep` must be at least 1".to_owned());
         }
         if options.contains_key("opt.bad") {
             return Err("unknown optimization `bad`".to_owned());
@@ -2240,7 +2410,8 @@ loops = "on"
     fn run_options_are_checked() {
         let config = parse(
             Utf8Path::new(PATH),
-            "[options]\nopt-level = \"o3\"\n[options.opt]\nbad = \"on\"\nmir = \"off\"\n",
+            "[options]\nopt-level = \"o3\"\nsnapshot-keep = 0\nsnapshots = \"on\"\n[options.opt]\n\
+             bad = \"on\"\nmir = \"off\"\n",
             Some(check),
         );
         assert_eq!(
@@ -2253,17 +2424,22 @@ loops = "on"
                 ),
                 (
                     Severity::Error,
+                    "invalid 'snapshot-keep' in [options]: `snapshot-keep` must be at least 1",
+                    Some(Position::new(3, 17))
+                ),
+                (
+                    Severity::Error,
                     "invalid 'bad' in [options.opt]: unknown optimization `bad`",
-                    Some(Position::new(4, 1))
+                    Some(Position::new(6, 1))
                 ),
             ]
         );
         assert_eq!(
             config.spec.unwrap().sim_options.run_options,
-            Some(RunOptions::from_iter([(
-                "opt.mir".to_owned(),
-                "off".into()
-            )]))
+            Some(RunOptions::from_iter([
+                ("snapshots".to_owned(), "on".into()),
+                ("opt.mir".to_owned(), "off".into()),
+            ]))
         );
 
         // A rejected `relaxed` makes neither the analysis nor the elaboration relaxed.

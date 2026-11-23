@@ -35,7 +35,9 @@
 //!   - `no-results`: don't write `vunit_results`;
 //!   - `exit <code>`: set the exit code;
 //!   - `print <text>`: print `text` to stdout;
-//!   - `sleep <ms>`, `hang`: as for `analyze`.
+//!   - `sleep <ms>`, `hang`: as for `analyze`;
+//!   - `hold`: after writing the results, append `held <testcase> <exit code>` to the log
+//!     instead of `simend <testcase>`, and sleep for an hour, as a simulator held at the end.
 //!
 //!   Without `fail` or `no-results`, the enabled test passes: `vunit_results` records its start
 //!   and the end of the suite.
@@ -319,6 +321,7 @@ fn simulate(options: &str) -> ExitCode {
     let mut code = 0;
     let mut results = true;
     let mut suite_done = true;
+    let mut hold = false;
     for directive in directives.lines().filter_map(|line| {
         let (testcase, directive) = line.split_once('\t')?;
         (testcase == name).then_some(directive)
@@ -330,6 +333,7 @@ fn simulate(options: &str) -> ExitCode {
                 code = 1;
             },
             "no-results" => results = false,
+            "hold" => hold = true,
             "print" => println!("{argument}"),
             _ if shared_directive(command, argument, &mut code) => {},
             _ => eprintln!("fake risim-runner: unknown directive {directive}"),
@@ -353,6 +357,10 @@ fn simulate(options: &str) -> ExitCode {
             .expect("open vunit_results");
         file.write_all(contents.as_bytes())
             .expect("write vunit_results");
+    }
+    if hold {
+        log(&format!("held {name} {code}"));
+        thread::sleep(Duration::from_secs(3600));
     }
     log(&format!("simend {name}"));
     ExitCode::from(code)
