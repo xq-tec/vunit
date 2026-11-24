@@ -1698,7 +1698,7 @@ async fn workspace_simulates_with_the_compiled_libraries() {
                 .is_some_and(|generic| generic.starts_with("runner_cfg="))),
         "{options}"
     );
-    assert_eq!(options["top"], "tb_tests(tb)");
+    assert_eq!(options["tops"], serde_json::json!(["vhdl:tb_tests(tb)"]));
     assert_eq!(options["jit"], "eager");
     assert_eq!(options["opt.mir"], "off");
     session.handle.close().await;

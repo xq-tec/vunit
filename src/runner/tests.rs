@@ -284,7 +284,7 @@ fn command_of_an_explicit_test() {
             "workdir": "/ws/risim-out/libraries/lib",
             "library-paths": ["/ws/risim-out/libraries/lib", "/ws/risim-out/libraries/other"],
             "relaxed": true,
-            "top": "Tb_A(a)",
+            "tops": ["vhdl:Tb_A(a)"],
             "assert-level": "error",
             "ieee-asserts": "enable",
             "paused": true,
@@ -375,7 +375,7 @@ fn configurations_set_options_seed_and_vhdl_configuration() {
     let vhdl_cfg = &plan.tests[0];
     assert_eq!(vhdl_cfg.seed(), "project-seed");
     let vhdl_cfg_options = run_options(vhdl_cfg, "s");
-    assert_eq!(vhdl_cfg_options["top"], "cfg1");
+    assert_eq!(vhdl_cfg_options["tops"], json!(["vhdl:cfg1"]));
     assert_eq!(vhdl_cfg_options["finish-after"], "1 ms");
     assert_eq!(vhdl_cfg_options["assert-level"], "error");
     assert_eq!(vhdl_cfg_options["ieee-asserts"], "disable");
@@ -383,7 +383,7 @@ fn configurations_set_options_seed_and_vhdl_configuration() {
     let warn = &plan.tests[1];
     assert_eq!(warn.seed(), "config-seed");
     let warn_options = run_options(warn, "s");
-    assert_eq!(warn_options["top"], "tb_cfg(a)");
+    assert_eq!(warn_options["tops"], json!(["vhdl:tb_cfg(a)"]));
     assert_eq!(generic(&warn_options, "value"), Some("7"));
     assert_eq!(warn_options["assert-level"], "warning");
 }

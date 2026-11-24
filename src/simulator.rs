@@ -35,7 +35,7 @@ use crate::vhdl_standard::VhdlStandard;
 ///
 /// risim-runner names the format that it reads in its `--version` output, on the line
 /// `run options format N`.
-pub const RUN_OPTIONS_FORMAT: u32 = 2;
+pub const RUN_OPTIONS_FORMAT: u32 = 3;
 
 /// Options of risim-runner, as keys and values of the JSON object of a run, such as
 /// `{"relaxed": true}`.
@@ -79,7 +79,7 @@ pub const SIMULATION_KEYS: [&str; 10] = [
     "work",
     "workdir",
     "library-paths",
-    "top",
+    "tops",
     "generics",
     "assert-level",
     "ieee-asserts",
@@ -347,12 +347,14 @@ impl Simulator {
         {
             return Err(CommandError::SimulationKey { key });
         }
+        // Tagged as VHDL, so that an SV module of the same name in the library doesn't make the
+        // name ambiguous.
         let top = match args.top {
-            Top::Configuration(name) => name.clone(),
+            Top::Configuration(name) => format!("vhdl:{name}"),
             Top::Entity {
                 entity,
                 architecture,
-            } => format!("{entity}({architecture})"),
+            } => format!("vhdl:{entity}({architecture})"),
         };
         let generics: Vec<String> = args
             .generics
@@ -373,7 +375,7 @@ impl Simulator {
                 ("work", json!(args.library)),
                 ("workdir", json!(args.library_dir)),
                 ("library-paths", json!(args.library_dirs)),
-                ("top", json!(top)),
+                ("tops", json!([top])),
                 ("generics", json!(generics)),
                 ("assert-level", json!(args.assert_level.name())),
                 ("ieee-asserts", json!(ieee_asserts)),
@@ -409,7 +411,10 @@ pub struct CompileArgs<'a> {
     pub files: &'a [&'a Utf8Path],
 }
 
-/// The top-level unit of a simulation.
+/// The top-level unit of a simulation, which is VHDL, since riSim runs VHDL testbenches only.
+///
+/// [`Simulator::simulate_command`] writes it into the run options as the one element of `tops`,
+/// tagged `vhdl:`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Top {
     /// A VHDL configuration.
@@ -732,7 +737,7 @@ mod tests {
                 "work": "lib",
                 "workdir": "/out/libraries/lib",
                 "library-paths": ["/out/libraries/vunit_lib", "/out/libraries/lib"],
-                "top": "tb(a)",
+                "tops": ["vhdl:tb(a)"],
                 "generics": ["a=1", "runner_cfg=x : y,z \"q\""],
                 "assert-level": "error",
                 "ieee-asserts": "disable",
@@ -754,7 +759,7 @@ mod tests {
         args.run_defaults = &no_options;
         args.wait = false;
         let options = options(simulator.simulate_command(&args).unwrap());
-        assert_eq!(options["top"], "cfg");
+        assert_eq!(options["tops"], json!(["vhdl:cfg"]));
         assert_eq!(options["assert-level"], "failure");
         assert_eq!(options["ieee-asserts"], "enable");
         assert_eq!(options["paused"], false);
