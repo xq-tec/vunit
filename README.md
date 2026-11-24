@@ -88,7 +88,8 @@ The table can also be written inline, `options = { relaxed = true }`, which avoi
 `relaxed`, `opt-level`, `opt`, and the snapshot keys are project level only.
 `sv-libraries` is library level only: the libraries, in order, that the library's SystemVerilog files search for packages and definitions after their own library.
 It can't name the library itself, and accepts `vunit_lib`, a library of every project.
-Without it, the libraries are derived from the packages that the library's files import or refer to, and the interfaces they use, that other libraries define, in the order of their first use; `vunit_lib` is added last either way, so naming it is optional.
+Without it, the libraries are derived from the packages that the library's files import or refer to, the interfaces they use, and the modules, programs, primitives, and entities they instantiate, that other libraries define, in the order of their first use; `vunit_lib` is added last either way, so naming it is optional.
+An instantiated name adds a library only if that library is the only other one that defines the name, the library itself defines it neither as a SystemVerilog definition nor as an entity, and the other library's VHDL files don't name the library in a library clause, which would form a cycle; precompiled libraries, whose units aren't scanned, are named in `sv-libraries`.
 Libraries that depend on each other in a cycle are a project error, which names the uses that formed it, and nothing is compiled; an explicit list breaks it.
 Instead of upstream's `include_dirs` and `defines` per file (`add_source_file`), these options are per library, as `risim analyze` takes them per call.
 The builtin libraries take the project's `relaxed` only (`Options::for_builtins`), and the files of a user library `vunit_lib` join VUnit's library and take its options, so `[libraries.vunit_lib.options]` has no valid keys.

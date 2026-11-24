@@ -23,8 +23,8 @@
 //! - Testcase names keep the case of the entity declaration (VUnit lowercases them).
 //! - Test names that differ only in case produce a warning, since patterns can't tell them apart.
 //! - SystemVerilog testbenches, modules and other definitions with a `runner_cfg` parameter
-//!   (which `` `TEST_SUITE `` declares), aren't run, since riSim doesn't simulate SystemVerilog
-//!   yet; each gets a warning.
+//!   (which `` `TEST_SUITE `` declares), aren't run, since riSim doesn't run SystemVerilog
+//!   testbenches yet; each gets a warning.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -664,8 +664,8 @@ fn warn_about_sv_testbenches(project: &Project, diagnostics: &mut Vec<Diagnostic
             {
                 diagnostics.push(
                     Diagnostic::warning(format!(
-                        "SystemVerilog testbench '{}' isn't run: riSim doesn't simulate \
-                         SystemVerilog yet",
+                        "SystemVerilog testbench '{}' isn't run: riSim doesn't run \
+                         SystemVerilog testbenches yet",
                         definition.name
                     ))
                     .in_file(&file.path)

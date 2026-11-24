@@ -1662,6 +1662,173 @@ fn a_cycle_through_an_explicit_list_is_an_error() {
 }
 
 #[test]
+fn an_instance_of_a_definition_of_one_other_library_adds_it_in_first_use_order() {
+    let mut test = TestProject::new();
+    test.add_library("vunit_lib");
+    test.add_library("pkgs");
+    test.add_library("ip");
+    test.add_library("ifs");
+    test.add_library("rtl");
+    test.add_sv(
+        "vunit_lib",
+        "vunit_pkg.sv",
+        "package vunit_pkg;\nendpackage\n",
+    );
+    test.add_sv("pkgs", "p.sv", "package p;\nendpackage\n");
+    let leaf = test.add_sv("ip", "leaf.sv", "module leaf;\nendmodule\n");
+    test.add_sv("ifs", "bus_if.sv", "interface bus_if;\nendinterface\n");
+    let counter = test.add_sv(
+        "rtl",
+        "counter.sv",
+        "module counter(bus_if port);\n  leaf u_leaf();\n  import p::*;\nendmodule\n",
+    );
+    test.project.finish();
+    // In the order of their first use, with a file's imports before its interface ports and
+    // instances.
+    assert_eq!(
+        test.sv_dependencies("rtl"),
+        ["pkgs", "ifs", "ip", "vunit_lib"]
+    );
+    assert!(test.depends_on(counter, leaf, true));
+    assert!(!test.depends_on(counter, leaf, false));
+    assert_eq!(test.project.diagnostics(), []);
+}
+
+#[test]
+fn an_instance_of_an_entity_of_one_other_library_adds_it() {
+    let mut test = TestProject::new();
+    test.add_library("vhdl");
+    test.add_library("rtl");
+    let entity = test.add("vhdl", "leaf.vhd", "entity Leaf is end;");
+    let architecture = test.add("vhdl", "leaf_a.vhd", "architecture a of leaf is begin end;");
+    let top = test.add_sv(
+        "rtl",
+        "top.sv",
+        "module top;\n  LEAF u_leaf();\nendmodule\n",
+    );
+    test.project.finish();
+    assert_eq!(test.sv_dependencies("rtl"), ["vhdl"]);
+    assert!(test.depends_on(top, entity, true));
+    assert!(test.depends_on(top, architecture, true));
+    // A library without SV files has no SV dependencies.
+    assert_eq!(test.sv_dependencies("vhdl"), [] as [&str; 0]);
+}
+
+#[test]
+fn an_instance_of_a_name_of_two_other_libraries_adds_neither() {
+    let mut test = TestProject::new();
+    test.add_library("a");
+    test.add_library("b");
+    test.add_library("c");
+    test.add_library("rtl");
+    test.add_library("ip");
+    let in_a = test.add_sv("a", "leaf.sv", "module leaf;\nendmodule\n");
+    let in_b = test.add("b", "leaf.vhd", "entity LEAF is end;");
+    test.add_sv("c", "sub.sv", "module sub;\nendmodule\n");
+    let sub = test.add_sv("ip", "sub.sv", "program sub;\nendprogram\n");
+    let top = test.add_sv(
+        "rtl",
+        "top.sv",
+        "module top;\n  leaf u_leaf();\n  sub u_sub();\nendmodule\n",
+    );
+    test.project.finish();
+    assert_eq!(test.sv_dependencies("rtl"), [] as [&str; 0]);
+    // Without a derived library, binding doesn't find the instances, nor do recompiles.
+    assert!(!test.depends_on(top, in_a, true));
+    assert!(!test.depends_on(top, in_b, true));
+    assert!(!test.depends_on(top, sub, true));
+}
+
+#[test]
+fn an_instance_of_a_name_of_the_own_library_adds_nothing() {
+    let mut test = TestProject::new();
+    test.add_library("ip");
+    test.add_library("rtl");
+    let other_module = test.add_sv(
+        "ip",
+        "ip.sv",
+        "module leaf;\nendmodule\nmodule sub;\nendmodule\n",
+    );
+    let own_module = test.add_sv("rtl", "leaf.sv", "module leaf;\nendmodule\n");
+    let own_entity = test.add("rtl", "sub.vhd", "entity Sub is end;");
+    let top = test.add_sv(
+        "rtl",
+        "top.sv",
+        "module top;\n  leaf u_leaf();\n  sub u_sub();\nendmodule\n",
+    );
+    test.project.finish();
+    assert_eq!(test.sv_dependencies("rtl"), [] as [&str; 0]);
+    assert!(test.depends_on(top, own_module, true));
+    assert!(test.depends_on(top, own_entity, true));
+    assert!(!test.depends_on(top, other_module, true));
+}
+
+#[test]
+fn an_instance_of_an_interface_name_adds_only_the_interface_library() {
+    let mut test = TestProject::new();
+    test.add_library("ifs");
+    test.add_library("ip");
+    test.add_library("rtl");
+    test.add_sv("ifs", "bus_if.sv", "interface bus_if;\nendinterface\n");
+    test.add_sv("ip", "bus_if.sv", "module bus_if;\nendmodule\n");
+    test.add_sv(
+        "rtl",
+        "top.sv",
+        "module top;\n  bus_if u_bus();\nendmodule\n",
+    );
+    test.project.finish();
+    assert_eq!(test.sv_dependencies("rtl"), ["ifs"]);
+}
+
+#[test]
+fn an_instance_adds_no_library_that_names_the_own_one_in_a_library_clause() {
+    let mut test = TestProject::new();
+    test.add_library("vhdl");
+    test.add_library("rtl");
+    test.add("vhdl", "leaf.vhd", "entity leaf is end;");
+    test.add(
+        "vhdl",
+        "wrap.vhd",
+        "library rtl;\nuse rtl.all;\nentity wrap is end;\narchitecture a of wrap is\n  \
+         component counter is end component;\nbegin\n  u : component counter;\nend;",
+    );
+    test.add_sv(
+        "rtl",
+        "counter.sv",
+        "module counter;\n  leaf u_leaf();\nendmodule\n",
+    );
+    test.project.finish();
+    // `rtl` searching `vhdl` would form a cycle with the library clause, which can't be loaded.
+    assert_eq!(test.sv_dependencies("rtl"), [] as [&str; 0]);
+    assert_eq!(test.project.diagnostics(), []);
+}
+
+#[test]
+fn a_cycle_of_an_instance_and_an_import_is_an_error() {
+    let mut test = TestProject::new();
+    test.add_library("a");
+    test.add_library("b");
+    test.add_sv("a", "a.sv", "module ma;\n  mb u_mb();\nendmodule\n");
+    test.add_sv(
+        "b",
+        "b.sv",
+        "package pb;\nendpackage\nmodule mb;\n  import pa::*;\nendmodule\n",
+    );
+    test.add_sv("a", "pa.sv", "package pa;\nendpackage\n");
+    test.project.finish();
+    assert_eq!(
+        test.project.sv_library_cycle_errors(),
+        [Diagnostic::error(
+            "SystemVerilog libraries depend on each other in a cycle, which can't be compiled: \
+             a -> b -> a; library 'a' depends on 'b': a.sv instantiates 'mb' of 'b'; library 'b' \
+             depends on 'a': b.sv imports package 'pa' of 'a'; an explicit 'sv-libraries' list \
+             in [libraries.NAME.options] breaks the cycle"
+        )
+        .in_file("a.sv")]
+    );
+}
+
+#[test]
 fn analyze_args_of_a_library_without_sv_files_have_no_sv_keys() {
     use std::collections::BTreeMap;
 

@@ -916,7 +916,8 @@ fn sv_testbenches_get_a_warning() {
     assert_eq!(
         discovery.project_diagnostics,
         [Diagnostic::warning(
-            "SystemVerilog testbench 'tb_x' isn't run: riSim doesn't simulate SystemVerilog yet"
+            "SystemVerilog testbench 'tb_x' isn't run: riSim doesn't run SystemVerilog \
+             testbenches yet"
         )
         .in_file(&test.project.file(tb).path)
         .at(Some(Range {

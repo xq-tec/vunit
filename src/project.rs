@@ -18,13 +18,16 @@
 //! SystemVerilog and Verilog files register their definitions (modules, interfaces, programs,
 //! and primitives) and packages in name spaces of their own, which are case-sensitive
 //! (IEEE 1800 3.13), so an entity and a module of the same name coexist.
-//! Each library with such files searches other libraries for the packages it imports and the
-//! interfaces it uses: those of its `sv-libraries` option, or else those that
-//! [`Project::finish`] derives from the scans, and always `vunit_lib` last
-//! ([`Library::sv_dependencies`]).
+//! Each library with such files searches other libraries for the packages it imports, the
+//! interfaces it uses, and the definitions and entities it instantiates: those of its
+//! `sv-libraries` option, or else those that [`Project::finish`] derives from the scans, and
+//! always `vunit_lib` last ([`Library::sv_dependencies`]).
+//! An instance adds a library to the derived ones only if that library is the only other one
+//! that defines the name and the library itself doesn't, so that no library is picked
+//! arbitrarily and an instance of a unit of the library itself keeps binding to it.
 //! Their analysis edges go to imported and referenced packages and used interfaces, searched as
 //! hydrolyze searches them; instances of other definitions and of VHDL entities are
-//! implementation edges only.
+//! implementation edges only, searched as hydrolyze's binding searches them.
 //!
 //! AI NOTICE: Generated, minimally reviewed.
 
@@ -237,6 +240,9 @@ enum SvDependencyUse {
     PackageReference { file: FileId, package: String },
     /// The interface `interface` used in a file, as an instance or a port.
     Interface { file: FileId, interface: String },
+    /// An instance `name` in a file of a module, program, primitive, or VHDL entity that only
+    /// the other library defines.
+    Instance { file: FileId, name: String },
     /// `vunit_lib`, which every library with SystemVerilog or Verilog files searches.
     VunitLib,
 }
@@ -295,14 +301,36 @@ impl Library {
     /// (`--sv-library`).
     ///
     /// They are those of the `sv-libraries` option as written, or else those that the imports,
-    /// package references, and interface uses of the files find in other libraries, in the
-    /// order of their first use.
+    /// package references, interface uses, and instances of the files find in other libraries,
+    /// in the order of their first use: file by file, and in a file the imports, the package
+    /// references, and then the interface uses and instances.
+    /// An instance finds a library only if the name is neither a definition nor an entity of
+    /// this library nor an interface of any library, and exactly one other library than
+    /// `vunit_lib` defines it as a module, program, or primitive (case-sensitive) or as an
+    /// entity (case-insensitive), and that library's VHDL files don't name this one in a
+    /// library clause, which would form a cycle; precompiled libraries, whose units aren't
+    /// scanned, don't count.
     /// In a project with SystemVerilog or Verilog files, `vunit_lib` comes last, also when the
     /// files use its packages, unless the option names it elsewhere; it isn't repeated.
     /// Empty for a library without SystemVerilog or Verilog files, and until
     /// [`Project::finish`].
     pub fn sv_dependencies(&self) -> impl ExactSizeIterator<Item = LibraryId> + '_ {
         self.sv_dependencies.iter().map(|&(library, _)| library)
+    }
+
+    /// Whether the library defines a VHDL entity `name` (lowercase).
+    fn has_entity(&self, name: &str) -> bool {
+        self.primary_unit(name)
+            .is_some_and(|unit| unit.kind == UnitKind::Entity)
+    }
+
+    /// Whether an SV instance `name` binds to a unit of the library: a definition of that name
+    /// other than an interface, or an entity whose name equals it case-insensitively.
+    fn has_instance_target(&self, name: &str) -> bool {
+        matches!(
+            self.sv_definitions.get(name),
+            Some(&(kind, _)) if kind != SvDefinitionKind::Interface
+        ) || self.has_entity(&name.to_ascii_lowercase())
     }
 
     /// The files of the SystemVerilog modules whose names equal `name` case-insensitively.
@@ -637,6 +665,12 @@ impl Project {
     ///
     /// The derivation doesn't search `vunit_lib`, which comes last anyway, so that a name is
     /// attributed to the library that the final search order finds it in.
+    /// An interface use takes the first library that defines the interface; an instance takes a
+    /// library only if it is the only one that defines the name, and none if the own library
+    /// defines it, so that an instance of a unit of the own library keeps binding to it.
+    /// An instance doesn't add a library whose VHDL files name this one in a library clause:
+    /// the two would depend on each other, and [`Self::sv_library_cycles`] doesn't see
+    /// library clauses.
     fn sv_library_dependencies(
         &self,
         library: LibraryId,
@@ -677,6 +711,7 @@ impl Project {
                     })
                     .map(|(other, _)| other)
             };
+            let naming_libraries = self.libraries_naming(library);
             for (file_id, file) in self.files() {
                 let Some(sv_file) = file.sv_file.as_deref().filter(|_| file.library == library)
                 else {
@@ -711,14 +746,26 @@ impl Project {
                     }
                 }
                 for name in &sv_file.instances {
-                    if !own.sv_definitions.contains_key(name)
-                        && let Some(dependency) = interface_library(name)
-                    {
+                    if own.sv_definitions.contains_key(name) {
+                        continue;
+                    }
+                    if let Some(dependency) = interface_library(name) {
                         add(
                             dependency,
                             SvDependencyUse::Interface {
                                 file: file_id,
                                 interface: name.clone(),
+                            },
+                        );
+                    } else if !own.has_entity(&name.to_ascii_lowercase())
+                        && let Some(dependency) =
+                            self.sv_instance_library(library, vunit_lib, &naming_libraries, name)
+                    {
+                        add(
+                            dependency,
+                            SvDependencyUse::Instance {
+                                file: file_id,
+                                name: name.clone(),
                             },
                         );
                     }
@@ -729,6 +776,46 @@ impl Project {
             add(vunit_lib, SvDependencyUse::VunitLib);
         }
         dependencies
+    }
+
+    /// The libraries other than `library` whose VHDL files name it in a library clause.
+    fn libraries_naming(&self, library: LibraryId) -> FxHashSet<LibraryId> {
+        let name = self.library(library).name.to_ascii_lowercase();
+        self.files()
+            .filter(|(_, file)| file.library != library && file.library_clauses().contains(&name))
+            .map(|(_, file)| file.library)
+            .collect()
+    }
+
+    /// The library that an SV instance `name` in `library` adds to the derived SystemVerilog
+    /// dependencies ([`Self::sv_library_dependencies`]): the only library other than `library`
+    /// and `vunit_lib` that has a unit the instance can bind to, unless a library other than
+    /// `library` defines an interface `name`, or the library is among `naming_libraries`, those
+    /// whose VHDL files name `library` in a library clause, since the two libraries would then
+    /// depend on each other in a cycle, which hydrolyze can't load.
+    fn sv_instance_library(
+        &self,
+        library: LibraryId,
+        vunit_lib: Option<LibraryId>,
+        naming_libraries: &FxHashSet<LibraryId>,
+        name: &str,
+    ) -> Option<LibraryId> {
+        if self.libraries().any(|(other, candidate)| {
+            other != library
+                && matches!(
+                    candidate.sv_definitions.get(name),
+                    Some((SvDefinitionKind::Interface, _))
+                )
+        }) {
+            return None;
+        }
+        let mut candidates = self.libraries().filter(|&(other, candidate)| {
+            other != library && Some(other) != vunit_lib && candidate.has_instance_target(name)
+        });
+        match (candidates.next(), candidates.next()) {
+            (Some((other, _)), None) if !naming_libraries.contains(&other) => Some(other),
+            _ => None,
+        }
     }
 
     /// The cycles between the SystemVerilog dependencies of the libraries, each as the libraries
@@ -811,6 +898,16 @@ impl Project {
                     first_file.get_or_insert(*file);
                     format!(
                         "{} uses interface '{interface}' of '{next_name}'",
+                        file_path(file)
+                    )
+                },
+                Some(SvDependencyUse::Instance {
+                    file,
+                    name: instance,
+                }) => {
+                    first_file.get_or_insert(*file);
+                    format!(
+                        "{} instantiates '{instance}' of '{next_name}'",
                         file_path(file)
                     )
                 },
@@ -1170,9 +1267,12 @@ impl Project {
 
     /// The implementation dependencies of the instances of an SV file
     /// (`_find_verilog_module_dependencies`): the first definition of each name, searched in the
-    /// file's library, its SystemVerilog dependencies, and then all libraries; and the first
-    /// VHDL entity whose name equals it case-insensitively, searched the same way, with its
+    /// file's library and then in its SystemVerilog dependencies, in order; and the first VHDL
+    /// entity whose name equals it case-insensitively, searched the same way, with its
     /// architectures.
+    ///
+    /// These are the units that hydrolyze's binding searches, so an edge exists exactly where an
+    /// instance may bind; unlike VUnit, other libraries aren't searched.
     fn sv_implementation_dependencies(&self, file: &SourceFile) -> Vec<FileId> {
         let Some(sv_file) = &file.sv_file else {
             return Vec::new();
@@ -1182,10 +1282,7 @@ impl Project {
         }
         let own = self.library(file.library);
         let mut search = vec![file.library];
-        for library in own
-            .sv_dependencies()
-            .chain(self.libraries().map(|(id, _)| id))
-        {
+        for library in own.sv_dependencies() {
             if !search.contains(&library) {
                 search.push(library);
             }

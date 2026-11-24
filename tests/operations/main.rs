@@ -218,6 +218,10 @@ fn sv_trials() -> Vec<Trial> {
             "up_to_date_sv_files_are_not_compiled",
             up_to_date_sv_files_are_not_compiled,
         ),
+        trial(
+            "editing_an_sv_module_recompiles_it_before_its_vhdl_testbench",
+            editing_an_sv_module_recompiles_it_before_its_vhdl_testbench,
+        ),
     ]
 }
 
@@ -1335,6 +1339,89 @@ async fn up_to_date_sv_files_are_not_compiled() {
         ["vunit_pkg.sv", "a.sv"]
     );
     assert_eq!(workspace.take_calls(), Vec::<String>::new());
+}
+
+/// A VHDL testbench whose component binds to an SV module of another library, which
+/// instantiates a module of a third library: `rtl` searches `ip`, and editing either SV file
+/// compiles it again before the testbench runs.
+async fn editing_an_sv_module_recompiles_it_before_its_vhdl_testbench() {
+    let mut workspace = Workspace::new().await;
+    workspace.write("ip/leaf.sv", "module leaf;\nendmodule\n");
+    workspace.write(
+        "rtl/counter.sv",
+        "module counter;\n  leaf u_leaf();\nendmodule\n",
+    );
+    workspace.write(
+        "tb/tb_counter.vhd",
+        &format!(
+            "library rtl;\nuse rtl.all;\n{}",
+            testbench("tb_counter", "dut : component counter;").replacen(
+                "begin\n",
+                "  component counter is end component;\nbegin\n",
+                1
+            )
+        ),
+    );
+    workspace.spec.add_library("ip", ["ip/*.sv"]);
+    workspace.spec.add_library("rtl", ["rtl/*.sv"]);
+    workspace.spec.add_library("tb", ["tb/*.vhd"]);
+    let mut state = CompileState::default();
+    let results = Arc::new(ResultStore::load(&workspace.layout));
+    let first = workspace.compile(&mut state).await;
+    assert_eq!(first.report.status, CompileStatus::Succeeded);
+    let calls = workspace.take_args();
+    let (_, rtl_args) = calls
+        .iter()
+        .find(|(work, _)| work == "rtl")
+        .expect("a call of rtl");
+    let sv_libraries: Vec<&str> = rtl_args
+        .iter()
+        .map(String::as_str)
+        .filter(|arg| arg.starts_with("--sv-library"))
+        .collect();
+    assert_eq!(sv_libraries, ["--sv-library=ip", "--sv-library=vunit_lib"]);
+    let run = workspace
+        .simulate(&[("tb.tb_counter.all", false)], &results)
+        .await;
+    assert_eq!(run.report.counts().passed, 1);
+    workspace.take_calls();
+    workspace.take_log();
+
+    for (edited, library) in [("ip/leaf.sv", "ip"), ("rtl/counter.sv", "rtl")] {
+        let contents = fs::read_to_string(workspace.root.join(edited)).expect("read the file");
+        workspace.write(edited, &format!("// edited\n{contents}"));
+        let compiled = workspace.compile(&mut state).await;
+        assert_eq!(compiled.report.status, CompileStatus::Succeeded);
+        let name = file_name(edited);
+        assert!(
+            compiled.with_status(FileStatus::Compiled).contains(&name),
+            "{edited}: {:?}",
+            compiled.statuses()
+        );
+        let edit_calls = workspace.take_calls();
+        assert!(
+            edit_calls.contains(&format!("{library} {name}")),
+            "{edited}: {edit_calls:?}"
+        );
+        // The VHDL testbench isn't compiled again.
+        assert!(
+            edit_calls.iter().all(|call| !call.starts_with("tb ")),
+            "{edited}: {edit_calls:?}"
+        );
+        let rerun = workspace
+            .simulate(&[("tb.tb_counter.all", false)], &results)
+            .await;
+        assert_eq!(rerun.report.counts().passed, 1);
+        let log = workspace.take_log();
+        let compiled_at = log
+            .iter()
+            .position(|line| *line == format!("end {library} {name}"));
+        let started_at = log.iter().position(|line| line.starts_with("simstart"));
+        assert!(
+            compiled_at.is_some() && compiled_at < started_at,
+            "{edited}: {log:?}"
+        );
+    }
 }
 
 /// `lib` with a testbench with three explicit tests and one without explicit tests.
