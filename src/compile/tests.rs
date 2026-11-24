@@ -246,6 +246,7 @@ fn compile_keys_depend_on_options_and_simulator() {
         defines: BTreeMap::from([("WIDTH".to_owned(), Define::text("8"))]),
         compilation_unit: Some(CompilationUnit::Library),
         keywords: Some("1800-2017".parse().unwrap()),
+        default_timescale: Some("1ns/1ps".parse().unwrap()),
         sv_libraries: Some(vec!["other".to_owned()]),
         ..Options::default()
     };
@@ -598,7 +599,7 @@ fn compile_keys_change_with_includes_and_sv_options() {
     fixture.temp.write("inc_b/defs.svh", "`define A 2\n");
     let code = "`include \"defs.svh\"\n`include \"missing.svh\"\nmodule m;\nendmodule\n";
     let path = fixture.temp.write("src/m.sv", code);
-    let key = |include_dirs: &[&str], defines: &[(&str, &str)]| {
+    let key_with = |include_dirs: &[&str], defines: &[(&str, &str)], time_scale: Option<&str>| {
         let mut project = Project::new();
         let library = project
             .add_library("lib", VhdlStandard::Vhdl2008, None)
@@ -613,6 +614,7 @@ fn compile_keys_change_with_includes_and_sv_options() {
                     .iter()
                     .map(|&(name, text)| (name.to_owned(), Define::text(text)))
                     .collect(),
+                default_timescale: time_scale.map(|time_scale| time_scale.parse().unwrap()),
                 ..Options::default()
             },
         );
@@ -629,7 +631,14 @@ fn compile_keys_change_with_includes_and_sv_options() {
         );
         plan.files()[0].compile_key
     };
+    let key =
+        |include_dirs: &[&str], defines: &[(&str, &str)]| key_with(include_dirs, defines, None);
     let original = key(&["inc_a", "inc_b"], &[]);
+    let dirs = ["inc_a", "inc_b"];
+    let picoseconds = key_with(&dirs, &[], Some("1ns/1ps"));
+    assert_ne!(picoseconds, original);
+    assert_eq!(key_with(&dirs, &[], Some("1 ns / 1 ps")), picoseconds);
+    assert_ne!(key_with(&dirs, &[], Some("1ns/10ps")), picoseconds);
     assert_eq!(key(&["inc_a", "inc_b"], &[]), original);
     assert_ne!(key(&["inc_b", "inc_a"], &[]), original);
     assert_ne!(key(&["inc_a", "inc_b"], &[("W", "8")]), original);

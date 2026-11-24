@@ -226,6 +226,9 @@ pub struct Options {
     /// The keywords that the files start with (`keywords`), instead of those of their
     /// extension.
     pub keywords: Option<KeywordVersion>,
+    /// The time unit and precision of the design elements that set none
+    /// (`default-timescale`), instead of 1ns/1ns.
+    pub default_timescale: Option<TimeScale>,
     /// The encoding of the library's files of both languages and of their include files
     /// (`encoding`).
     pub encoding: Option<Encoding>,
@@ -239,8 +242,9 @@ impl Options {
     /// without those of the defaults.
     ///
     /// The order is fixed, so that equal options give equal arguments: `--relaxed`,
-    /// `--encoding`, `--keywords`, `--compilation-unit`, each include directory, each define
-    /// by name (without the removed ones), and each SystemVerilog library.
+    /// `--encoding`, `--keywords`, `--compilation-unit`, `--default-timescale`, each include
+    /// directory, each define by name (without the removed ones), and each SystemVerilog
+    /// library.
     pub fn analyze_args(&self) -> Vec<String> {
         let Self {
             relaxed,
@@ -248,6 +252,7 @@ impl Options {
             defines,
             compilation_unit,
             keywords,
+            default_timescale,
             encoding,
             sv_libraries,
         } = self;
@@ -263,6 +268,9 @@ impl Options {
         }
         if *compilation_unit == Some(CompilationUnit::Library) {
             args.push("--compilation-unit=library".to_owned());
+        }
+        if let Some(time_scale) = default_timescale {
+            args.push(format!("--default-timescale={time_scale}"));
         }
         for directory in include_dirs.iter().flatten() {
             args.push(format!("--include-dir={}", directory.path));
@@ -300,6 +308,7 @@ impl Options {
             defines,
             compilation_unit,
             keywords,
+            default_timescale,
             encoding,
             sv_libraries,
         } = library;
@@ -320,6 +329,7 @@ impl Options {
             defines: merged,
             compilation_unit: compilation_unit.or(self.compilation_unit),
             keywords: keywords.or(self.keywords),
+            default_timescale: default_timescale.or(self.default_timescale),
             encoding: encoding.or(self.encoding),
             sv_libraries: sv_libraries.clone(),
         }
@@ -335,8 +345,8 @@ impl Options {
         }
     }
 
-    /// These options without the keys of SystemVerilog and Verilog files: `relaxed` and
-    /// `encoding` only.
+    /// These options without the keys of SystemVerilog and Verilog files, such as `keywords`
+    /// and `default-timescale`: `relaxed` and `encoding` only.
     ///
     /// A library without such files is analyzed with these, so that its arguments, and with
     /// them its compile keys, don't depend on the other keys.
@@ -512,6 +522,104 @@ impl FromStr for KeywordVersion {
             .find(|version| *version == text)
             .map(Self)
             .ok_or_else(|| UnknownKeywordVersion(text.to_owned()))
+    }
+}
+
+/// The time units of `` `timescale `` (IEEE 1800 22.7), from the coarsest.
+pub const TIME_UNITS: [&str; 6] = ["s", "ms", "us", "ns", "ps", "fs"];
+
+/// A time unit and precision of `default-timescale`, such as `1ns/1ps`: each 1, 10, or 100 of
+/// one of [`TIME_UNITS`], the precision not coarser than the unit (IEEE 1800 3.14, 22.7).
+///
+/// [`FromStr`] takes the arguments of `` `timescale ``, also with spaces between number and
+/// unit and around the `/`, as in `1 ns / 1 ps`; [`Display`](fmt::Display) writes the
+/// normalized form without spaces, which `--default-timescale` gets.
+/// It is a copy of hydrolyze's grammar (`hydrolyze::TimeScale`), since this crate builds
+/// without hydrolyze; riSim's tests check that the two agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TimeScale {
+    /// The time unit.
+    unit: TimeValue,
+    /// The time precision.
+    precision: TimeValue,
+}
+
+/// A time unit or precision: a magnitude of 1, 10, or 100 and a unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct TimeValue {
+    /// 1, 10, or 100.
+    magnitude: u8,
+    /// The index of the unit in [`TIME_UNITS`].
+    unit: u8,
+}
+
+impl TimeValue {
+    /// Parses a time value with optional spaces around it and between number and unit, such
+    /// as ` 10 ns`.
+    fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        let split = text.find(|char: char| char.is_ascii_alphabetic())?;
+        let (magnitude, unit) = text.split_at(split);
+        let magnitude = match magnitude.trim_end() {
+            "1" => 1,
+            "10" => 10,
+            "100" => 100,
+            _ => return None,
+        };
+        let unit = TIME_UNITS.iter().position(|known| *known == unit)?;
+        Some(Self {
+            magnitude,
+            unit: u8::try_from(unit).ok()?,
+        })
+    }
+
+    /// The power of ten of the value in seconds, such as -8 for `10ns`.
+    fn exponent(self) -> i32 {
+        let digits = match self.magnitude {
+            100 => 2,
+            10 => 1,
+            _ => 0,
+        };
+        // the units are a factor of 1000 apart, from 1 s
+        digits - 3 * i32::from(self.unit)
+    }
+}
+
+impl fmt::Display for TimeValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}{}",
+            self.magnitude,
+            TIME_UNITS[usize::from(self.unit)]
+        )
+    }
+}
+
+impl fmt::Display for TimeScale {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.unit, self.precision)
+    }
+}
+
+/// A string that isn't a [`TimeScale`]: no time unit and precision as `` `timescale `` takes
+/// them, or a precision coarser than the unit.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("invalid time scale '{0}'")]
+pub struct InvalidTimeScale(pub String);
+
+impl FromStr for TimeScale {
+    type Err = InvalidTimeScale;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let invalid = || InvalidTimeScale(text.to_owned());
+        let (unit, precision) = text.split_once('/').ok_or_else(invalid)?;
+        let unit = TimeValue::parse(unit).ok_or_else(invalid)?;
+        let precision = TimeValue::parse(precision).ok_or_else(invalid)?;
+        if precision.exponent() > unit.exponent() {
+            return Err(invalid());
+        }
+        Ok(Self { unit, precision })
     }
 }
 
@@ -717,6 +825,7 @@ mod tests {
             ]),
             compilation_unit: Some(CompilationUnit::Library),
             keywords: Some("1800-2017".parse().unwrap()),
+            default_timescale: Some("10ns/1ps".parse().unwrap()),
             encoding: Some(Encoding::Latin1),
             sv_libraries: Some(vec!["b".to_owned(), "a".to_owned()]),
         }
@@ -733,6 +842,7 @@ mod tests {
                 "--encoding=latin-1",
                 "--keywords=1800-2017",
                 "--compilation-unit=library",
+                "--default-timescale=10ns/1ps",
                 "--include-dir=/inc/b",
                 "--include-dir=/inc/a",
                 "--define=DEBUG",
@@ -775,6 +885,7 @@ mod tests {
             ]),
             compilation_unit: Some(CompilationUnit::Library),
             keywords: Some("1800-2017".parse().unwrap()),
+            default_timescale: Some("1ns/1ps".parse().unwrap()),
             encoding: Some(Encoding::Latin1),
             sv_libraries: None,
         };
@@ -791,6 +902,7 @@ mod tests {
                 ("NEW".to_owned(), Define::text("")),
             ]),
             keywords: Some("1364-2005".parse().unwrap()),
+            default_timescale: Some("10ns/10ps".parse().unwrap()),
             sv_libraries: Some(vec!["other".to_owned()]),
             ..Options::default()
         };
@@ -806,6 +918,7 @@ mod tests {
                 ]),
                 compilation_unit: Some(CompilationUnit::Library),
                 keywords: Some("1364-2005".parse().unwrap()),
+                default_timescale: Some("10ns/10ps".parse().unwrap()),
                 encoding: Some(Encoding::Latin1),
                 sv_libraries: Some(vec!["other".to_owned()]),
             }
@@ -840,6 +953,45 @@ mod tests {
             "1800-2020".parse::<KeywordVersion>(),
             Err(UnknownKeywordVersion("1800-2020".to_owned()))
         );
+    }
+
+    #[test]
+    fn time_scales_parse_and_normalize() {
+        for (text, normalized) in [
+            ("1ns/1ps", "1ns/1ps"),
+            ("1 ns / 1 ps", "1ns/1ps"),
+            (" 100us/10fs ", "100us/10fs"),
+            ("10ms/10ms", "10ms/10ms"),
+            ("1s/1fs", "1s/1fs"),
+            ("100ps/1ps", "100ps/1ps"),
+        ] {
+            assert_eq!(
+                text.parse::<TimeScale>().unwrap().to_string(),
+                normalized,
+                "{text}"
+            );
+        }
+        for invalid in [
+            "",
+            "1ns",
+            "1ns/",
+            "/1ns",
+            "2ns/1ns",
+            "1000ps/1ps",
+            "1.0ns/1ps",
+            "1ns/1us",
+            "10ns/100ns",
+            "1 0ns/1ns",
+            "1NS/1ps",
+            "1ns/1ps/1fs",
+            "1min/1s",
+        ] {
+            assert_eq!(
+                invalid.parse::<TimeScale>(),
+                Err(InvalidTimeScale(invalid.to_owned())),
+                "{invalid}"
+            );
+        }
     }
 
     #[test]

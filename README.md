@@ -79,6 +79,7 @@ version = "1.4"
   A macro named like a directive, and an integer as text, are errors.
 - `compilation-unit` is `"file"` (the default: each file is a compilation unit) or `"library"` (the files of a library form one, in the order of collection).
 - `keywords` is a version specifier of `` `begin_keywords `` (IEEE 1800 22.14), such as `"1800-2017"`, which replaces the default of the file's extension.
+- `default-timescale` is a time unit and precision in the form of the arguments of `` `timescale ``, such as `"1ns/1ps"`, for the design elements that set none, instead of 1ns/1ns; it reaches `risim analyze` normalized (`--default-timescale=1ns/1ps`), so equal values give equal compile keys.
 - `encoding` is `"utf-8"` or `"latin-1"`, the encoding of the library's files of both languages and of their include files; by default, VHDL files are Latin-1 and the others UTF-8.
 
 The table can also be written inline, `options = { relaxed = true }`, which avoids the TOML pitfall that bare and dotted keys after the `[options]` header belong to it.

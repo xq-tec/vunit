@@ -18,6 +18,7 @@
 //! defines = { WIDTH = "8", DEBUG = true, "MAX(a,b)" = "((a)>(b)?(a):(b))" }
 //! compilation-unit = "file"
 //! keywords = "1800-2017"
+//! default-timescale = "1ns/1ps"
 //! encoding = "utf-8"
 //!
 //! [options.opt]
@@ -47,14 +48,17 @@
 //! configuration go over them ([`SimOptions::overridden_by`]).
 //! `relaxed = false` is the same as no key.
 //!
-//! `include-dirs`, `defines`, `compilation-unit`, `keywords`, and `encoding` can be set in
-//! `[libraries.NAME.options]` too, where they go over the project's ([`Options::for_library`]):
+//! `include-dirs`, `defines`, `compilation-unit`, `keywords`, `default-timescale`, and `encoding`
+//! can be set in `[libraries.NAME.options]` too, where they go over the project's
+//! ([`Options::for_library`]):
 //! - `include-dirs` is a list of directories relative to the workspace root;
 //! - `defines` is a table of macros by name, optionally with formal arguments (`"MAX(a,b)"`),
 //!   whose values are their texts, or `true` for an empty one; `false` in a library removes the
 //!   project's macro, and is an error in `[options]`;
 //! - `compilation-unit` is `"file"` or `"library"`, `keywords` one of [`KEYWORD_VERSIONS`], and
-//!   `encoding` `"utf-8"` or `"latin-1"`.
+//!   `encoding` `"utf-8"` or `"latin-1"`;
+//! - `default-timescale` is a time unit and precision as `` `timescale `` takes them, such as
+//!   `"1ns/1ps"` ([`TimeScale`]).
 //!
 //! `sv-libraries`, a list of the project's libraries, is library level only, and the other keys
 //! of `[options]` are project level only.
@@ -110,6 +114,7 @@ use crate::spec::PatternLocation;
 use crate::spec::ProjectSpec;
 use crate::spec::SV_DIRECTIVES;
 use crate::spec::SimOptions;
+use crate::spec::TimeScale;
 
 /// The result of reading a configuration file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -193,11 +198,12 @@ const PROJECT_KEYS: [&str; 7] = [
 ];
 
 /// The keys of `[options]` that a library can set too.
-const SHARED_KEYS: [&str; 5] = [
+const SHARED_KEYS: [&str; 6] = [
     "include-dirs",
     "defines",
     "compilation-unit",
     "keywords",
+    "default-timescale",
     "encoding",
 ];
 
@@ -777,6 +783,18 @@ impl Parser<'_> {
                     self.diagnostic(Severity::Error, message, value_span);
                 }
             },
+            "default-timescale" => {
+                if let Some(Ok(time_scale)) = entry.as_str().map(str::parse::<TimeScale>) {
+                    options.default_timescale = Some(time_scale);
+                } else {
+                    let message = format!(
+                        "{what} is a time unit and precision such as \"1ns/1ps\", each 1, 10, or \
+                         100 s, ms, us, ns, ps, or fs, the precision not coarser than the unit; \
+                         not {entry}"
+                    );
+                    self.diagnostic(Severity::Error, message, value_span);
+                }
+            },
             "encoding" => {
                 let encoding = Encoding::ALL
                     .into_iter()
@@ -1344,14 +1362,16 @@ files = []
                     Severity::Error,
                     "unknown option 'colour' in [options]; expected one of: relaxed, opt-level, \
                      opt, snapshots, snapshot-interval, snapshot-keep, snapshot-memory, \
-                     include-dirs, defines, compilation-unit, keywords, encoding",
+                     include-dirs, defines, compilation-unit, keywords, default-timescale, \
+                     encoding",
                     Some(Position::new(2, 1))
                 ),
                 (
                     Severity::Error,
                     "unknown option 'top' in [options]; expected one of: relaxed, opt-level, \
                      opt, snapshots, snapshot-interval, snapshot-keep, snapshot-memory, \
-                     include-dirs, defines, compilation-unit, keywords, encoding",
+                     include-dirs, defines, compilation-unit, keywords, default-timescale, \
+                     encoding",
                     Some(Position::new(3, 1))
                 ),
                 (
@@ -1442,9 +1462,9 @@ files = []
                 Severity::Error,
                 "unknown option 'libraries' in [options]; expected one of: relaxed, opt-level, \
                  opt, snapshots, snapshot-interval, snapshot-keep, snapshot-memory, \
-                 include-dirs, defines, compilation-unit, keywords, encoding; keys after the \
-                 [options] header belong to it, so put them above the header, or write \
-                 options = { … }",
+                 include-dirs, defines, compilation-unit, keywords, default-timescale, \
+                 encoding; keys after the [options] header belong to it, so put them above \
+                 the header, or write options = { … }",
                 Some(Position::new(3, 1))
             )]
         );
@@ -1515,7 +1535,8 @@ options = 1
                 (
                     Severity::Error,
                     "unknown option 'include' in [libraries.lib.options]; expected one of: \
-                     include-dirs, defines, compilation-unit, keywords, encoding, sv-libraries",
+                     include-dirs, defines, compilation-unit, keywords, default-timescale, \
+                     encoding, sv-libraries",
                     Some(Position::new(8, 1))
                 ),
                 (
@@ -1556,6 +1577,7 @@ include-dirs = ["inc", "/abs/inc"]
 defines = { WIDTH = "8", DEBUG = true, EMPTY = "", "MAX(a,b)" = "((a)>(b)?(a):(b))" }
 compilation-unit = "library"
 keywords = "1800-2017"
+default-timescale = "1 ns / 1 ps"
 encoding = "latin-1"
 
 [libraries.a]
@@ -1568,6 +1590,7 @@ include-dirs = []
 defines = { WIDTH = "16", DEBUG = false, "MIN(a, b=0)" = true }
 compilation-unit = "file"
 keywords = "1364-2005"
+default-timescale = "10ns/10ns"
 encoding = "utf-8"
 sv-libraries = ["A", "vunit_lib"]
 "#,
@@ -1611,6 +1634,7 @@ sv-libraries = ["A", "vunit_lib"]
                 ]),
                 compilation_unit: Some(CompilationUnit::Library),
                 keywords: Some("1800-2017".parse().unwrap()),
+                default_timescale: Some("1ns/1ps".parse().unwrap()),
                 encoding: Some(Encoding::Latin1),
                 sv_libraries: None,
             }
@@ -1634,6 +1658,7 @@ sv-libraries = ["A", "vunit_lib"]
                 ]),
                 compilation_unit: Some(CompilationUnit::File),
                 keywords: Some("1364-2005".parse().unwrap()),
+                default_timescale: Some("10ns/10ns".parse().unwrap()),
                 encoding: Some(Encoding::Utf8),
                 sv_libraries: Some(vec!["A".to_owned(), "vunit_lib".to_owned()]),
             }
@@ -1642,10 +1667,46 @@ sv-libraries = ["A", "vunit_lib"]
         assert!(!library_names(&spec).contains(&"vunit_lib"));
     }
 
+    #[test]
+    fn default_timescale_of_a_library_replaces_the_projects() {
+        let config = parse_str(
+            r#"
+[options]
+default-timescale = "1 ns / 1 ps"
+
+[libraries.a]
+files = []
+
+[libraries.b]
+files = []
+options = { default-timescale = "10ns/10ns" }
+"#,
+        );
+        assert_eq!(config.diagnostics, []);
+        let spec = config.spec.unwrap();
+        let time_scale = |library| {
+            spec.options
+                .for_library(own_options(&spec, library))
+                .default_timescale
+                .map(|time_scale| time_scale.to_string())
+        };
+        assert_eq!(time_scale("a").as_deref(), Some("1ns/1ps"));
+        assert_eq!(time_scale("b").as_deref(), Some("10ns/10ns"));
+        assert_eq!(spec.options.analyze_args(), ["--default-timescale=1ns/1ps"]);
+    }
+
     fn keywords_message(table: &str, value: &str) -> String {
         format!(
             "'keywords' in {table} is a version of IEEE 1800 22.14, one of: {}; not {value}",
             KEYWORD_VERSIONS.join(", ")
+        )
+    }
+
+    fn default_timescale_message(table: &str, value: &str) -> String {
+        format!(
+            "'default-timescale' in {table} is a time unit and precision such as \"1ns/1ps\", \
+             each 1, 10, or 100 s, ms, us, ns, ps, or fs, the precision not coarser than the \
+             unit; not {value}"
         )
     }
 
@@ -1658,10 +1719,12 @@ include-dirs = "inc"
 defines = ["WIDTH=8"]
 compilation-unit = "unit"
 keywords = "1800-2020"
+default-timescale = "2ns/1ns"
 encoding = "latin1"
 "#,
         );
         let keywords = keywords_message("[options]", "\"1800-2020\"");
+        let time_scale = default_timescale_message("[options]", "\"2ns/1ns\"");
         assert_eq!(
             messages(&config),
             [
@@ -1689,8 +1752,13 @@ encoding = "latin1"
                 ),
                 (
                     Severity::Error,
+                    time_scale.as_str(),
+                    Some(Position::new(7, 21))
+                ),
+                (
+                    Severity::Error,
                     "'encoding' in [options] is \"utf-8\" or \"latin-1\", not \"latin1\"",
-                    Some(Position::new(7, 12))
+                    Some(Position::new(8, 12))
                 ),
             ]
         );
@@ -1708,11 +1776,13 @@ include-dirs = ["inc", 1]
 defines = 1
 compilation-unit = 1
 keywords = 2017
+default-timescale = 5
 encoding = true
 sv-libraries = "other"
 "#,
         );
         let keywords = keywords_message("[libraries.lib.options]", "2017");
+        let time_scale = default_timescale_message("[libraries.lib.options]", "5");
         assert_eq!(
             messages(&config),
             [
@@ -1740,14 +1810,19 @@ sv-libraries = "other"
                 ),
                 (
                     Severity::Error,
+                    time_scale.as_str(),
+                    Some(Position::new(9, 21))
+                ),
+                (
+                    Severity::Error,
                     "'encoding' in [libraries.lib.options] is \"utf-8\" or \"latin-1\", not true",
-                    Some(Position::new(9, 12))
+                    Some(Position::new(10, 12))
                 ),
                 (
                     Severity::Error,
                     "'sv-libraries' in [libraries.lib.options] is a list of library names, not \
                      \"other\"",
-                    Some(Position::new(10, 16))
+                    Some(Position::new(11, 16))
                 ),
             ]
         );
@@ -2358,7 +2433,8 @@ loops = "on"
                     Severity::Error,
                     "unknown option 'finish-after' in [options]; expected one of: relaxed, \
                      opt-level, opt, snapshots, snapshot-interval, snapshot-keep, \
-                     snapshot-memory, include-dirs, defines, compilation-unit, keywords, encoding",
+                     snapshot-memory, include-dirs, defines, compilation-unit, keywords, \
+                     default-timescale, encoding",
                     Some(Position::new(3, 1))
                 ),
                 (
