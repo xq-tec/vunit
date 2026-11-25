@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io;
 use std::process;
+use std::time::Duration;
 
 use camino::Utf8Path;
 use camino::Utf8PathBuf;
@@ -242,6 +243,10 @@ pub fn is_complete(dir: &Utf8Path) -> bool {
         .all(|file| dir.join(file.rel_path).is_file())
 }
 
+/// How long a temporary directory of [`extract`] is left alone, since another process may still
+/// write to it; an older one is left from a crash.
+const STALE_TEMP: Duration = Duration::from_secs(3600);
+
 /// Writes the builtin files to `builtins_root/<hash>/` unless that directory is
 /// [complete](is_complete), and deletes other entries of `builtins_root`.
 ///
@@ -250,6 +255,8 @@ pub fn is_complete(dir: &Utf8Path) -> bool {
 /// The files are written to a temporary directory first and then renamed, so a crash never
 /// leaves an incomplete directory behind.
 /// An incomplete directory is deleted first.
+/// Processes may extract into the same `builtins_root` at the same time: the temporary
+/// directories of the others are deleted only once they are [stale](STALE_TEMP).
 ///
 /// # Errors
 ///
@@ -283,7 +290,7 @@ pub fn extract(builtins_root: &Utf8Path) -> io::Result<Utf8PathBuf> {
 
     for entry in fs::read_dir(builtins_root)? {
         let entry = entry?;
-        if entry.file_name() == BUILTINS_HASH {
+        if entry.file_name() == BUILTINS_HASH || is_fresh_temp(&entry) {
             continue;
         }
         let path = entry.path();
@@ -297,6 +304,19 @@ pub fn extract(builtins_root: &Utf8Path) -> io::Result<Utf8PathBuf> {
         }
     }
     Ok(target)
+}
+
+/// Whether `entry` is a temporary directory of [`extract`] that isn't [stale](STALE_TEMP).
+fn is_fresh_temp(entry: &fs::DirEntry) -> bool {
+    entry.file_name().to_string_lossy().starts_with(".tmp-")
+        && entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| {
+                !modified
+                    .elapsed()
+                    .is_ok_and(|elapsed| elapsed >= STALE_TEMP)
+            })
 }
 
 #[cfg(test)]
@@ -485,5 +505,23 @@ mod tests {
         assert_eq!(extract(&root).unwrap(), target);
         assert!(is_complete(&target));
         assert_ne!(fs::read_to_string(&check).unwrap(), "changed");
+    }
+
+    #[test]
+    fn extract_leaves_the_temporary_directory_of_another_process() {
+        let temp = TempRoot::new();
+        let root = temp.root.join("builtins");
+        let other = root.join(format!(".tmp-{}-0", hash()));
+        fs::create_dir_all(&other).unwrap();
+        let stale = root.join(".tmp-stale-0");
+        fs::create_dir_all(&stale).unwrap();
+        fs::File::open(&stale)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - 2 * STALE_TEMP)
+            .unwrap();
+
+        extract(&root).unwrap();
+        assert!(other.is_dir());
+        assert!(!stale.exists());
     }
 }
