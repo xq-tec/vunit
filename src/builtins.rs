@@ -256,7 +256,7 @@ const STALE_TEMP: Duration = Duration::from_secs(3600);
 /// leaves an incomplete directory behind.
 /// An incomplete directory is deleted first.
 /// Processes may extract into the same `builtins_root` at the same time: the temporary
-/// directories of the others are deleted only once they are [stale](STALE_TEMP).
+/// directories of the others are deleted only once they are stale (an hour old).
 ///
 /// # Errors
 ///
