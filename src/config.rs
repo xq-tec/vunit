@@ -43,10 +43,10 @@
 //! `[options]` can also be written inline, `options = { relaxed = true }`, which stays correct
 //! anywhere above the tables.
 //! It becomes [`ProjectSpec::options`] for analysis, and the run options `relaxed`, `opt-level`,
-//! `snapshots`, `snapshot-interval`, `snapshot-keep`, `snapshot-memory`, and `opt.<name>` of every
-//! simulation ([`SimOptions::run_options`]); the run options of a
+//! `snapshots`, `snapshot-interval`, `snapshot-keep`, `snapshot-memory`, `unbuffered-reads`, and
+//! `opt.<name>` of every simulation ([`SimOptions::run_options`]); the run options of a
 //! configuration go over them ([`SimOptions::overridden_by`]).
-//! `relaxed = false` is the same as no key.
+//! `relaxed = false` and `unbuffered-reads = false` are the same as no key.
 //!
 //! `include-dirs`, `defines`, `compilation-unit`, `keywords`, `default-timescale`, and `encoding`
 //! can be set in `[libraries.NAME.options]` too, where they go over the project's
@@ -139,8 +139,8 @@ pub struct ReadError {
 /// Reads and parses the configuration file at `path`.
 ///
 /// `check_run_options` checks the run options of its `[options]` table (`relaxed`,
-/// `opt-level`, `opt`, and the snapshot keys), one key at a time; a key that it rejects is an
-/// error and isn't applied.
+/// `opt-level`, `opt`, the snapshot keys, and `unbuffered-reads`), one key at a time; a key that
+/// it rejects is an error and isn't applied.
 ///
 /// # Errors
 ///
@@ -187,7 +187,7 @@ pub fn parse(path: &Utf8Path, content: &str, check_run_options: Option<CheckRunO
 }
 
 /// The keys of `[options]` that are project level only: the run options.
-const PROJECT_KEYS: [&str; 7] = [
+const PROJECT_KEYS: [&str; 8] = [
     "relaxed",
     "opt-level",
     "opt",
@@ -195,6 +195,7 @@ const PROJECT_KEYS: [&str; 7] = [
     "snapshot-interval",
     "snapshot-keep",
     "snapshot-memory",
+    "unbuffered-reads",
 ];
 
 /// The keys of `[options]` that a library can set too.
@@ -508,23 +509,11 @@ impl Parser<'_> {
             let key_span = key_span(table, &path(&key));
             let value_span = value_span(table, &path(&key));
             match key.as_str() {
-                "relaxed" => match entry {
-                    toml::Value::Boolean(true) => {
-                        options.relaxed = self.run_option(
-                            "relaxed".to_owned(),
-                            serde_json::Value::Bool(true),
-                            "'relaxed' in [options]",
-                            value_span,
-                            run_options,
-                        );
-                    },
-                    // The same as no key, so that it can't mask a configuration's `relaxed`.
-                    toml::Value::Boolean(false) => {},
-                    other => {
-                        let message =
-                            format!("'relaxed' in [options] is true or false, not {other}");
-                        self.diagnostic(Severity::Error, message, value_span);
-                    },
+                "relaxed" => {
+                    options.relaxed = self.flag_option(key, &entry, value_span, run_options);
+                },
+                "unbuffered-reads" => {
+                    self.flag_option(key, &entry, value_span, run_options);
                 },
                 "opt-level" => {
                     let level = match entry {
@@ -577,6 +566,32 @@ impl Parser<'_> {
             }
         }
         options
+    }
+
+    /// Adds the boolean key `key` of `[options]` with the value `entry` at `span` to
+    /// `run_options` as the run option of the same name if it is `true` and the check accepts it,
+    /// and returns whether it did.
+    ///
+    /// `false` is the same as no key, so that it can't mask the key of a configuration.
+    fn flag_option(
+        &mut self,
+        key: String,
+        entry: &toml::Value,
+        span: Option<ops::Range<usize>>,
+        run_options: &mut RunOptions,
+    ) -> bool {
+        let what = format!("'{key}' in [options]");
+        match entry {
+            toml::Value::Boolean(true) => {
+                self.run_option(key, serde_json::Value::Bool(true), &what, span, run_options)
+            },
+            toml::Value::Boolean(false) => false,
+            other => {
+                let message = format!("{what} is true or false, not {other}");
+                self.diagnostic(Severity::Error, message, span);
+                false
+            },
+        }
     }
 
     /// Adds the snapshot key `key` of `[options]` with the value `entry` at `span` to
@@ -1288,6 +1303,7 @@ files = ["sim/model/*.vhd", "tb/*.vhd"]
             ("snapshot-interval".to_owned(), 0.5.into()),
             ("snapshot-keep".to_owned(), 4.into()),
             ("snapshot-memory".to_owned(), 64.into()),
+            ("unbuffered-reads".to_owned(), true.into()),
             ("opt.wake-guards".to_owned(), "off".into()),
             ("opt.mir.cse".to_owned(), "off".into()),
         ]);
@@ -1300,6 +1316,7 @@ snapshots = "on"
 snapshot-interval = 0.5
 snapshot-keep = 4
 snapshot-memory = 64
+unbuffered-reads = true
 
 [options.opt]
 wake-guards = "off"
@@ -1332,8 +1349,8 @@ libraries.lib.files = ["*.vhd"]
     }
 
     #[test]
-    fn relaxed_false_is_like_no_key() {
-        let config = parse_str("options = { relaxed = false }\n");
+    fn relaxed_and_unbuffered_reads_false_are_like_no_key() {
+        let config = parse_str("options = { relaxed = false, unbuffered-reads = false }\n");
         assert_eq!(messages(&config), []);
         assert_eq!(config.spec, parse_str("").spec);
     }
@@ -1348,6 +1365,7 @@ colour = 1
 top = "tb"
 relaxed = "yes"
 opt-level = true
+unbuffered-reads = "yes"
 [options.opt]
 wake-guards = 1
 "mir.cse" = "off"
@@ -1362,16 +1380,16 @@ files = []
                     Severity::Error,
                     "unknown option 'colour' in [options]; expected one of: relaxed, opt-level, \
                      opt, snapshots, snapshot-interval, snapshot-keep, snapshot-memory, \
-                     include-dirs, defines, compilation-unit, keywords, default-timescale, \
-                     encoding",
+                     unbuffered-reads, include-dirs, defines, compilation-unit, keywords, \
+                     default-timescale, encoding",
                     Some(Position::new(2, 1))
                 ),
                 (
                     Severity::Error,
                     "unknown option 'top' in [options]; expected one of: relaxed, opt-level, \
                      opt, snapshots, snapshot-interval, snapshot-keep, snapshot-memory, \
-                     include-dirs, defines, compilation-unit, keywords, default-timescale, \
-                     encoding",
+                     unbuffered-reads, include-dirs, defines, compilation-unit, keywords, \
+                     default-timescale, encoding",
                     Some(Position::new(3, 1))
                 ),
                 (
@@ -1386,9 +1404,14 @@ files = []
                 ),
                 (
                     Severity::Error,
+                    "'unbuffered-reads' in [options] is true or false, not \"yes\"",
+                    Some(Position::new(6, 20))
+                ),
+                (
+                    Severity::Error,
                     "the mode of 'wake-guards' in [options.opt] is a string, such as \"on\" or \
                      \"off\", not 1",
-                    Some(Position::new(7, 15))
+                    Some(Position::new(8, 15))
                 ),
             ]
         );
@@ -1462,9 +1485,9 @@ files = []
                 Severity::Error,
                 "unknown option 'libraries' in [options]; expected one of: relaxed, opt-level, \
                  opt, snapshots, snapshot-interval, snapshot-keep, snapshot-memory, \
-                 include-dirs, defines, compilation-unit, keywords, default-timescale, \
-                 encoding; keys after the [options] header belong to it, so put them above \
-                 the header, or write options = { … }",
+                 unbuffered-reads, include-dirs, defines, compilation-unit, keywords, \
+                 default-timescale, encoding; keys after the [options] header belong to it, so \
+                 put them above the header, or write options = { … }",
                 Some(Position::new(3, 1))
             )]
         );
@@ -2433,8 +2456,8 @@ loops = "on"
                     Severity::Error,
                     "unknown option 'finish-after' in [options]; expected one of: relaxed, \
                      opt-level, opt, snapshots, snapshot-interval, snapshot-keep, \
-                     snapshot-memory, include-dirs, defines, compilation-unit, keywords, \
-                     default-timescale, encoding",
+                     snapshot-memory, unbuffered-reads, include-dirs, defines, \
+                     compilation-unit, keywords, default-timescale, encoding",
                     Some(Position::new(3, 1))
                 ),
                 (
